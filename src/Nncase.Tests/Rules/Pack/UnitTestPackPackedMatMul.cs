@@ -100,6 +100,11 @@ public class UnitTestVectorizeVectorizedMatMul : TransformTestBase
         Assert.Equal(expr.CheckedType, post.CheckedType);
         Assert.Contains("PackedQKVParallelLinear", printed, System.StringComparison.Ordinal);
         Assert.DoesNotContain("PackedMatMul", printed, System.StringComparison.Ordinal);
+        var combine = Assert.Single(
+            ExprCollector.Collect(post).OfType<Call>().Where(
+                call => call.Target is IR.NTT.PackedQKVParallelLinearCombine));
+        Assert.IsType<IR.NTT.PackedQKVParallelLinear>(
+            Assert.IsType<Call>(combine.Arguments[IR.NTT.PackedQKVParallelLinearCombine.QKV.Index]).Target);
     }
 
     [Fact]
@@ -141,6 +146,13 @@ public class UnitTestVectorizeVectorizedMatMul : TransformTestBase
             ExprCollector.Collect(post).OfType<Call>().Where(
                 call => call.Target is IR.NTT.PackedQKVParallelLinear));
         var packedOp = Assert.IsType<IR.NTT.PackedQKVParallelLinear>(packedCall.Target);
+        var combineCall = Assert.Single(
+            ExprCollector.Collect(post).OfType<Call>().Where(
+                call => call.Target is IR.NTT.PackedQKVParallelLinearCombine));
+        Assert.Same(packedCall, combineCall.Arguments[IR.NTT.PackedQKVParallelLinearCombine.QKV.Index]);
+        Assert.Equal(
+            packedCall.CheckedType,
+            Assert.IsType<IR.NTT.PackedQKVParallelLinearCombine>(combineCall.Target).OutputType);
         var expectedWeightType = new VectorType(DataTypes.BFloat16, [8, 2, 8]);
         var expectedOutputType = new VectorType(DataTypes.BFloat16, [8]);
 

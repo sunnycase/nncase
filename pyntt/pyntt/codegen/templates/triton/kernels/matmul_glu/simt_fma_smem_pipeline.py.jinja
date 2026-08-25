@@ -1,8 +1,9 @@
 {% macro pipeline_setup(stage) -%}
 {% set stage_model = stage["Model"] %}
 {% set stage_ctx = packed_matmul_glu_gemv_pipeline_context(stage_model) %}
-{% set shared_buffer_shape = [stage_ctx["num_stages"]] + (stage_ctx["shared_stage_shape"] | list) %}
-{{ stage["StageName"] }}__rhs_stages = tle.gpu.alloc(
+{% set shared_buffer_shape = [stage_ctx["logical_num_stages"]] + (stage_ctx["shared_stage_shape"] | list) %}
+{% for projection in stage_ctx["projections"] %}
+{{ stage["StageName"] }}__{{ projection["lower"] }}_stages = tle.gpu.alloc(
     [{{ shared_buffer_shape | join(", ") }}],
     dtype={{ stage_model["WeightTritonDType"] }},
     layout=tle.gpu.nv_tma_shared_layout(
@@ -17,13 +18,28 @@
     ),
     scope=tle.gpu.smem,
     alias=pyntt_shared_arena,
-    alias_offset_bytes={{ stage["SharedWorkspaceOffsets"]["rhs_stage"] }},
+    alias_offset_bytes=({{ stage["SharedWorkspaceOffsets"]["rhs_stage"] }}) + {{ loop.index0 * stage_ctx["projection_shared_bytes"] }},
 )
+{% endfor %}
+{% if stage_ctx["use_complete_consumer_lhs_stage"] %}
+{% set lhs_workspace = stage["ConsumerSharedWorkspaces"][0] %}
+{{ lhs_workspace["VariableName"] }} = tle.gpu.alloc(
+    [1, {{ stage_ctx["lhs_stage_extent"] }}],
+    dtype={{ stage_model["InputTritonDType"] }},
+    layout=None,
+    scope=tle.gpu.smem,
+    alias=pyntt_shared_arena,
+    alias_offset_bytes={{ lhs_workspace["SharedWorkspaceOffset"] }},
+    nv_mma_shared_layout=True,
+)
+{% endif %}
 {{ stage["PipeName"] }} = tle.pipe(
-    capacity={{ stage_ctx["num_stages"] }},
+    capacity={{ stage_ctx["logical_num_stages"] }},
     scope="cta",
     name="{{ stage["StageName"] }}_weight",
-    weight={{ stage["StageName"] }}__rhs_stages,
+{% for projection in stage_ctx["projections"] %}
+    {{ projection["lower"] }}={{ stage["StageName"] }}__{{ projection["lower"] }}_stages,
+{% endfor %}
 )
 {%- endmacro %}
 {% if model is defined %}
@@ -51,6 +67,16 @@
         {{ ctx["consumer_weight_layout_name"] }}.value,
     )
 )
+{% if ctx["use_complete_consumer_lhs_stage"] %}
+{{ ctx["consumer_input_copy_layout_name"] }} = tl.constexpr(
+    tle.gpu.BlockEncoding(
+        [1, {{ ctx["input_copy_size_per_thread"] }}],
+        [1, {{ model["TargetWorkerWidth"] }}],
+        [1, {{ model["NumWarps"] }}],
+        [0, 1],
+    )
+)
+{% endif %}
 
 
 {{ "@triton.jit(noinline=True)" if model["NoInline"] else "@triton.jit" }}
@@ -68,47 +94,46 @@ def {{ model["FunctionName"] }}__producer(writer, {{ helper_parameters(model) }}
     active_n = {{ dim(ctx["n"]) }}
     for n_tile in tl.range(0, {{ ctx["runtime_num_n_tiles"] }}):
         for k_tile in tl.range(0, {{ ctx["num_k_tiles"] }}):
-{% for projection in ctx["projections"] %}
-            {{ projection["lower"] }}_sequence = (
-                (n_tile * {{ ctx["num_k_tiles"] }} + k_tile)
-                * {{ ctx["projection_count"] }}
-                + {{ projection["sequence_offset"] }}
+            sequence = (
+                n_tile * {{ ctx["num_k_tiles"] }} + k_tile
             ).to(tl.int32)
-            {{ projection["lower"] }}_slot = writer.acquire(
-                {{ projection["lower"] }}_sequence
-            )
+            slot = writer.acquire(sequence)
+{% for projection in ctx["projections"] %}
             {{ projection["lower"] }}_descriptor = tle.gpu.reinterpret_tensor_map(
                 {{ projection["lower"] }}_descriptor_entry,
-                {{ projection["lower"] }}_slot.weight,
+                slot.{{ projection["lower"] }},
             )
             tle.gpu.copy(
                 {{ projection["lower"] }}_descriptor,
-                {{ projection["lower"] }}_slot.weight,
+                slot.{{ projection["lower"] }},
                 [{{ ctx["tma_block_shape"] | join(", ") }}],
                 offsets=[
 {% for offset in projection["descriptor_offsets"] %}
                     {{ tma_offset(offset) }},
 {% endfor %}
                 ],
-                eviction_policy="evict_last",
+                eviction_policy="evict_first",
             )
-            writer.commit({{ projection["lower"] }}_sequence)
 {% endfor %}
+            writer.commit(sequence)
     writer.close(
         (
             {{ ctx["runtime_num_n_tiles"] }}
             * {{ ctx["num_k_tiles"] }}
-            * {{ ctx["projection_count"] }}
         ).to(tl.int32)
     )
 
 
 {% if ctx["outline_consumer_stage"] %}
-{{ "@triton.jit(noinline=True)" if model["NoInline"] else "@triton.jit" }}
+@triton.jit(noinline=True)
 def {{ model["FunctionName"] }}__consumer_stage(
     gate_weight_stage,
     up_weight_stage,
+{% if ctx["use_complete_consumer_lhs_stage"] %}
+    lhs_stage,
+{% else %}
     input0,
+{% endif %}
     k_tile,
 ):
     local_n_source = tl.arange(0, {{ ctx["block_n"] }})
@@ -167,6 +192,25 @@ def {{ model["FunctionName"] }}__consumer_stage(
             {{ ctx["consumer_weight_layout_name"] }},
         )
 {% endfor %}
+{% if ctx["use_complete_consumer_lhs_stage"] %}
+        input_row_vector = tle.encoding(
+            tl.zeros(({{ ctx["reduction_group"] }},), tl.int32),
+            {{ ctx["consumer_lhs_layout_name"] }},
+        )
+        input_ptr = tle.gpu.local_ptr(
+            lhs_stage,
+            (
+                input_row_vector,
+                k_tile * {{ ctx["block_k"] }}
+                + k_group * {{ ctx["reduction_group"] }}
+                + local_k_vector,
+            ),
+        )
+        input_value = tle.encoding(
+            tl.load(input_ptr),
+            {{ ctx["consumer_lhs_layout_name"] }},
+        )
+{% else %}
         pipeline_offs_k = (
             k_tile * {{ ctx["block_k"] }}
             + k_group * {{ ctx["reduction_group"] }}
@@ -176,6 +220,7 @@ def {{ model["FunctionName"] }}__consumer_stage(
             tl.load({{ access_pointer(model, "Input", "input0", ctx["pipeline_input_access"]) }}),
             {{ ctx["consumer_lhs_layout_name"] }},
         )
+{% endif %}
         input_value = tle.encoding(
             input_value[None, :],
             {{ ctx["consumer_weight_layout_name"] }},
@@ -191,7 +236,7 @@ def {{ model["FunctionName"] }}__consumer_stage(
 
 
 {{ "@triton.jit(noinline=True)" if model["NoInline"] else "@triton.jit" }}
-def {{ model["FunctionName"] }}__consumer(reader, {{ helper_parameters(model) }}):
+def {{ model["FunctionName"] }}__consumer(reader, {% if ctx["use_complete_consumer_lhs_stage"] %}lhs_stage, {% endif %}{{ helper_parameters(model) }}):
 {{ common.mesh_coordinates(model["MeshAxes"]) }}
 {% set pointer_keys = namespace(values=[model["Input"], model["Output"]]) %}
 {% for prefix in ("Gate", "Up") %}
@@ -221,6 +266,36 @@ def {{ model["FunctionName"] }}__consumer(reader, {{ helper_parameters(model) }}
         {{ ctx["consumer_weight_layout_name"] }},
     )
 {% endif %}
+{% if ctx["use_complete_consumer_lhs_stage"] %}
+{% for segment in ctx["lhs_copy_segments"] %}
+    input_copy_offset_{{ loop.index0 }} = tle.encoding(
+        tl.arange(0, {{ segment["extent"] }})[None, :],
+        {{ ctx["consumer_input_copy_layout_name"] }},
+    )
+{% endfor %}
+{% if not ctx["outline_consumer_stage"] %}
+    input_row_vector = tle.encoding(
+        tl.zeros(({{ ctx["reduction_group"] }},), tl.int32),
+        {{ ctx["consumer_lhs_layout_name"] }},
+    )
+{% endif %}
+{% for segment in ctx["lhs_copy_segments"] %}
+    pipeline_input_copy_k = {{ segment["offset"] }} + input_copy_offset_{{ loop.index0 }}
+    tle.gpu.copy(
+        {{ access_pointer(model, "Input", "input0", segment["access"]) }},
+        lhs_stage.subslice(
+            [0, {{ segment["offset"] }}],
+            [1, {{ segment["extent"] }}],
+        ),
+        [1, {{ segment["extent"] }}],
+        is_async=True,
+        eviction_policy="evict_last",
+    )
+{% endfor %}
+    tle.gpu.async_commit_group()
+    tle.gpu.async_wait_group(0)
+    tl.debug_barrier()
+{% endif %}
     active_n = {{ dim(ctx["n"]) }}
     for n_tile in tl.range(0, {{ ctx["runtime_num_n_tiles"] }}):
         n_start = n_tile * {{ ctx["block_n"] }}
@@ -234,22 +309,20 @@ def {{ model["FunctionName"] }}__consumer(reader, {{ helper_parameters(model) }}
         )
 {% endfor %}
         for k_tile in tl.range(0, {{ ctx["num_k_tiles"] }}):
-{% for projection in ctx["projections"] %}
-            {{ projection["lower"] }}_sequence = (
-                (n_tile * {{ ctx["num_k_tiles"] }} + k_tile)
-                * {{ ctx["projection_count"] }}
-                + {{ projection["sequence_offset"] }}
+            sequence = (
+                n_tile * {{ ctx["num_k_tiles"] }} + k_tile
             ).to(tl.int32)
-            {{ projection["lower"] }}_ready = reader.wait(
-                {{ projection["lower"] }}_sequence
-            )
-{% endfor %}
+            ready = reader.wait(sequence)
 {% if ctx["outline_consumer_stage"] %}
             gate_stage_partial, up_stage_partial = (
                 {{ model["FunctionName"] }}__consumer_stage(
-                    gate_ready.slot.weight,
-                    up_ready.slot.weight,
+                    ready.slot.gate,
+                    ready.slot.up,
+{% if ctx["use_complete_consumer_lhs_stage"] %}
+                    lhs_stage,
+{% else %}
                     input0,
+{% endif %}
                     k_tile,
                 )
             )
@@ -265,7 +338,7 @@ def {{ model["FunctionName"] }}__consumer(reader, {{ helper_parameters(model) }}
                 )
 {% for projection in ctx["projections"] %}
                 {{ projection["lower"] }}_weight_ptr = tle.gpu.local_ptr(
-                    {{ projection["lower"] }}_ready.slot.weight,
+                    ready.slot.{{ projection["lower"] }},
                     (
 {% for index in ctx["shared_weight_indices"] %}
                         tle.encoding(
@@ -289,6 +362,21 @@ def {{ model["FunctionName"] }}__consumer(reader, {{ helper_parameters(model) }}
                     {{ ctx["consumer_weight_layout_name"] }},
                 )
 {% endfor %}
+{% if ctx["use_complete_consumer_lhs_stage"] %}
+                input_ptr = tle.gpu.local_ptr(
+                    lhs_stage,
+                    (
+                        input_row_vector,
+                        k_tile * {{ ctx["block_k"] }}
+                        + k_group * {{ ctx["reduction_group"] }}
+                        + local_k_vector,
+                    ),
+                )
+                input_value = tle.encoding(
+                    tl.load(input_ptr),
+                    {{ ctx["consumer_lhs_layout_name"] }},
+                )
+{% else %}
                 pipeline_offs_k = (
                     k_tile * {{ ctx["block_k"] }}
                     + k_group * {{ ctx["reduction_group"] }}
@@ -298,6 +386,7 @@ def {{ model["FunctionName"] }}__consumer(reader, {{ helper_parameters(model) }}
                     tl.load({{ access_pointer(model, "Input", "input0", ctx["pipeline_input_access"]) }}),
                     {{ ctx["consumer_lhs_layout_name"] }},
                 )
+{% endif %}
                 input_value = tle.encoding(
                     input_value[None, :],
                     {{ ctx["consumer_weight_layout_name"] }},
@@ -309,9 +398,7 @@ def {{ model["FunctionName"] }}__consumer(reader, {{ helper_parameters(model) }}
                 )
 {% endfor %}
 {% endif %}
-{% for projection in ctx["projections"] %}
-            reader.release({{ projection["lower"] }}_sequence)
-{% endfor %}
+            reader.release(sequence)
 
 {% for projection in ctx["projections"] %}
         {{ projection["lower"] }}_acc = tl.sum(

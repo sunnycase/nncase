@@ -1,4 +1,4 @@
-// Copyright (c) Canaan Inc. All rights reserved.
+﻿// Copyright (c) Canaan Inc. All rights reserved.
 // Licensed under the Apache license. See LICENSE file in the project root for full license information.
 
 using System;
@@ -24,6 +24,9 @@ namespace Nncase.Passes.Transforms;
 /// the collective and NormApply in the same PrimFunction. For the first call in
 /// a recurrent chain, <see cref="BindNormStats"/> supplies the semantic relation
 /// needed to compute partial statistics from the callee-selected local view.
+/// Call sites with different partial signatures use distinct callee variants;
+/// every variant retains an exact distributed input type and materializes the
+/// statistics inside its own body.
 /// The function result ABI and the entry ABI remain unchanged.
 /// </remarks>
 public sealed class SinkNormStatsBoxingAcrossFunctionBoundariesPass : ModulePass
@@ -48,10 +51,9 @@ public sealed class SinkNormStatsBoxingAcrossFunctionBoundariesPass : ModulePass
                 continue;
             }
 
-            var parameterPlans = CollectParameterPlans(function, calls);
-            if (parameterPlans.Count != 0)
+            if (CreateFunctionPlan(function, calls) is { } plan)
             {
-                plans.Add(function, new FunctionPlan(parameterPlans));
+                plans.Add(function, plan);
             }
         }
 
@@ -60,96 +62,95 @@ public sealed class SinkNormStatsBoxingAcrossFunctionBoundariesPass : ModulePass
             return Task.FromResult(input);
         }
 
+        var plannedCalls = new Dictionary<Call, PlannedCall>(ReferenceEqualityComparer.Instance);
+        foreach (var plan in plans.Values)
+        {
+            foreach (var variant in plan.Variants)
+            {
+                foreach (var (call, arguments) in variant.CallArguments)
+                {
+                    plannedCalls.Add(call, new PlannedCall(variant, arguments));
+                }
+            }
+        }
+
         var replacements = new Dictionary<Function, Function>(ReferenceEqualityComparer.Instance);
+        var additionalVariants = new Dictionary<Function, IReadOnlyList<Function>>(ReferenceEqualityComparer.Instance);
         foreach (var function in FunctionCallGraphUtility.GetCalleeFirstOrder(functions))
         {
             plans.TryGetValue(function, out var plan);
-            var parameters = function.Parameters.ToArray();
-            var rewrittenParameters = new IVar[parameters.Length];
-            var mappedParameters = new Dictionary<Var, Var>(ReferenceEqualityComparer.Instance);
-            var substitutions = new Dictionary<BaseExpr, BaseExpr>(ReferenceEqualityComparer.Instance);
-
-            for (int index = 0; index < parameters.Length; index++)
+            var variants = new List<Function>();
+            var nextVariantIndex = 1;
+            Function? primary = null;
+            if (plan is null || plan.PlannedCallCount != callSites[function].Count)
             {
-                if (parameters[index] is not Var parameter)
+                primary = CreateFunctionVariant(
+                    function,
+                    function.Name,
+                    new Dictionary<int, ParameterPlan>(),
+                    replacements,
+                    plannedCalls);
+            }
+
+            if (plan is not null)
+            {
+                foreach (var variant in plan.Variants)
                 {
-                    if (plan?.Parameters.ContainsKey(index) == true)
+                    var name = primary is null
+                        ? function.Name
+                        : $"{function.Name}_norm_stats_layout_{nextVariantIndex}";
+                    var specialized = CreateFunctionVariant(
+                        function,
+                        name,
+                        variant.Parameters,
+                        replacements,
+                        plannedCalls);
+                    variant.Function = specialized;
+                    if (primary is null)
                     {
-                        throw new InvalidOperationException(
-                            $"NormStats boxing plan for {function.Name} references non-tensor parameter {index}.");
+                        primary = specialized;
                     }
-
-                    rewrittenParameters[index] = parameters[index];
-                    substitutions.Add((BaseExpr)parameters[index], (BaseExpr)parameters[index]);
-                    continue;
-                }
-
-                if (plan is not null && plan.Parameters.TryGetValue(index, out var parameterPlan))
-                {
-                    var rewrittenParameter = parameter.With(typeAnnotation: parameterPlan.PartialType);
-                    var materializedStats = IR.F.Distributed.Boxing(
-                        rewrittenParameter,
-                        parameterPlan.MaterializedType);
-                    Infer(materializedStats, $"sinking normalization-statistics boxing into {function.Name}");
-
-                    rewrittenParameters[index] = rewrittenParameter;
-                    mappedParameters.Add(parameter, rewrittenParameter);
-                    substitutions.Add(parameter, materializedStats);
-                }
-                else
-                {
-                    rewrittenParameters[index] = parameter;
-                    mappedParameters.Add(parameter, parameter);
-                    substitutions.Add(parameter, parameter);
+                    else
+                    {
+                        variants.Add(specialized);
+                        nextVariantIndex++;
+                    }
                 }
             }
 
-            var cloner = new FunctionBodyCloner(replacements, plans);
-            foreach (var (source, replacement) in substitutions)
-            {
-                cloner.ExprMemo.Add(source, replacement);
-            }
-
-            var body = cloner.Clone(function.Body, Unit.Default);
-            if (plan is null && ReferenceEquals(body, function.Body))
-            {
-                replacements.Add(function, function);
-                continue;
-            }
-
-            var replacementFunction = new Function(
-                function.Name,
-                function.ModuleKind,
-                body,
-                rewrittenParameters,
-                RewriteVarMap(function.VarMap, mappedParameters))
-            {
-                Role = function.Role,
-                Metadata = function.Metadata.Clone(),
-            };
-            Infer(replacementFunction, $"rewriting normalization-statistics boundary of {function.Name}");
-            replacements.Add(function, replacementFunction);
+            replacements.Add(function, primary ?? throw new InvalidOperationException($"No replacement was created for {function.Name}."));
+            additionalVariants.Add(function, variants);
         }
 
         var result = new IRModule();
         foreach (var function in input.Functions)
         {
-            result.Add(function is Function highLevel ? replacements[highLevel] : function);
+            if (function is not Function highLevel)
+            {
+                result.Add(function);
+                continue;
+            }
+
+            result.Add(replacements[highLevel]);
+            foreach (var variant in additionalVariants[highLevel])
+            {
+                result.Add(variant);
+            }
         }
 
         result.Entry = input.Entry is Function entry ? replacements[entry] : input.Entry;
         return Task.FromResult(result);
     }
 
-    private static IReadOnlyDictionary<int, ParameterPlan> CollectParameterPlans(
+    private static FunctionPlan? CreateFunctionPlan(
         Function function,
         IReadOnlyList<Call> callSites)
     {
-        var result = new Dictionary<int, ParameterPlan>();
         var bodyNodes = new HashSet<BaseExpr>(
             ExprCollector.Collect(function.Body).Append(function.Body),
             ReferenceEqualityComparer.Instance);
         var parameters = function.Parameters.ToArray();
+        var candidates = new Dictionary<int, ParameterCandidate>();
         for (int parameterIndex = 0; parameterIndex < parameters.Length; parameterIndex++)
         {
             if (parameters[parameterIndex] is not Var parameter
@@ -159,7 +160,6 @@ public sealed class SinkNormStatsBoxingAcrossFunctionBoundariesPass : ModulePass
                 continue;
             }
 
-            DistributedType? expectedPartialType = null;
             if (consumer.Binding is not null)
             {
                 var localStatsType = NormStatsEvaluator.InferType(
@@ -170,41 +170,81 @@ public sealed class SinkNormStatsBoxingAcrossFunctionBoundariesPass : ModulePass
                 {
                     continue;
                 }
-
-                expectedPartialType = distributedStatsType;
             }
 
-            var callArguments = new Dictionary<Call, Expr>(ReferenceEqualityComparer.Instance);
-            var valid = true;
-            foreach (var callSite in callSites)
+            candidates.Add(parameterIndex, new ParameterCandidate(materializedType, consumer));
+        }
+
+        if (candidates.Count == 0)
+        {
+            return null;
+        }
+
+        var variants = new List<FunctionVariantPlan>();
+        foreach (var callSite in callSites)
+        {
+            if (callSite.Arguments.Length != parameters.Length)
             {
-                if (callSite.Arguments.Length != parameters.Length
-                    || !TryGetPartialCallArgument(
+                continue;
+            }
+
+            var parameterPlans = new Dictionary<int, ParameterPlan>();
+            var callArguments = new Dictionary<int, Expr>();
+            foreach (var (parameterIndex, candidate) in candidates)
+            {
+                if (!TryGetPartialCallArgument(
                         callSite,
                         parameterIndex,
-                        materializedType,
-                        consumer,
+                        candidate.MaterializedType,
+                        candidate.Consumer,
                         out var partialStats,
-                        out var callPartialType)
-                    || (expectedPartialType is not null && !Equals(expectedPartialType, callPartialType)))
+                        out var partialType))
                 {
-                    valid = false;
-                    break;
+                    continue;
                 }
 
-                expectedPartialType ??= callPartialType;
-                callArguments.Add(callSite, partialStats);
+                parameterPlans.Add(
+                    parameterIndex,
+                    new ParameterPlan(partialType, candidate.MaterializedType));
+                callArguments.Add(parameterIndex, partialStats);
             }
 
-            if (valid && expectedPartialType is not null)
+            if (parameterPlans.Count == 0)
             {
-                result.Add(
-                    parameterIndex,
-                    new ParameterPlan(expectedPartialType, materializedType, callArguments));
+                continue;
+            }
+
+            var variant = variants.FirstOrDefault(candidate => ParameterPlansEqual(candidate.Parameters, parameterPlans));
+            if (variant is null)
+            {
+                variant = new FunctionVariantPlan(parameterPlans);
+                variants.Add(variant);
+            }
+
+            variant.CallArguments.Add(callSite, callArguments);
+        }
+
+        return variants.Count == 0 ? null : new FunctionPlan(variants);
+    }
+
+    private static bool ParameterPlansEqual(
+        IReadOnlyDictionary<int, ParameterPlan> left,
+        IReadOnlyDictionary<int, ParameterPlan> right)
+    {
+        if (left.Count != right.Count)
+        {
+            return false;
+        }
+
+        foreach (var (index, leftPlan) in left)
+        {
+            if (!right.TryGetValue(index, out var rightPlan) || leftPlan != rightPlan)
+            {
+                return false;
             }
         }
 
-        return result;
+        return true;
     }
 
     private static bool TryGetNormStatsConsumer(
@@ -401,6 +441,80 @@ public sealed class SinkNormStatsBoxingAcrossFunctionBoundariesPass : ModulePass
             && Equals(partialType.TensorType, materializedType.TensorType)
             && Equals(partialType.Placement, materializedType.Placement);
 
+    private static Function CreateFunctionVariant(
+        Function function,
+        string name,
+        IReadOnlyDictionary<int, ParameterPlan> parameterPlans,
+        IReadOnlyDictionary<Function, Function> replacements,
+        IReadOnlyDictionary<Call, PlannedCall> plannedCalls)
+    {
+        var parameters = function.Parameters.ToArray();
+        var rewrittenParameters = new IVar[parameters.Length];
+        var mappedParameters = new Dictionary<Var, Var>(ReferenceEqualityComparer.Instance);
+        var substitutions = new Dictionary<BaseExpr, BaseExpr>(ReferenceEqualityComparer.Instance);
+        for (int index = 0; index < parameters.Length; index++)
+        {
+            if (parameters[index] is not Var parameter)
+            {
+                if (parameterPlans.ContainsKey(index))
+                {
+                    throw new InvalidOperationException(
+                        $"NormStats boxing plan for {function.Name} references non-tensor parameter {index}.");
+                }
+
+                rewrittenParameters[index] = parameters[index];
+                substitutions.Add((BaseExpr)parameters[index], (BaseExpr)parameters[index]);
+                continue;
+            }
+
+            if (parameterPlans.TryGetValue(index, out var parameterPlan))
+            {
+                var rewrittenParameter = parameter.With(typeAnnotation: parameterPlan.PartialType);
+                var materializedStats = IR.F.Distributed.Boxing(
+                    rewrittenParameter,
+                    parameterPlan.MaterializedType);
+                Infer(materializedStats, $"sinking normalization-statistics boxing into {name}");
+
+                rewrittenParameters[index] = rewrittenParameter;
+                mappedParameters.Add(parameter, rewrittenParameter);
+                substitutions.Add(parameter, materializedStats);
+            }
+            else
+            {
+                rewrittenParameters[index] = parameter;
+                mappedParameters.Add(parameter, parameter);
+                substitutions.Add(parameter, parameter);
+            }
+        }
+
+        var cloner = new FunctionBodyCloner(replacements, plannedCalls);
+        foreach (var (source, replacement) in substitutions)
+        {
+            cloner.ExprMemo.Add(source, replacement);
+        }
+
+        var body = cloner.Clone(function.Body, Unit.Default);
+        if (parameterPlans.Count == 0
+            && name == function.Name
+            && ReferenceEquals(body, function.Body))
+        {
+            return function;
+        }
+
+        var variant = new Function(
+            name,
+            function.ModuleKind,
+            body,
+            rewrittenParameters,
+            RewriteVarMap(function.VarMap, mappedParameters))
+        {
+            Role = function.Role,
+            Metadata = function.Metadata.Clone(),
+        };
+        Infer(variant, $"rewriting normalization-statistics boundary of {function.Name} as {name}");
+        return variant;
+    }
+
     private static Dictionary<IVar, Dimension[]> RewriteVarMap(
         Dictionary<IVar, Dimension[]>? source,
         IReadOnlyDictionary<Var, Var> mappedParameters)
@@ -440,25 +554,56 @@ public sealed class SinkNormStatsBoxingAcrossFunctionBoundariesPass : ModulePass
         int Axis,
         bool UseMean);
 
+    private sealed record ParameterCandidate(
+        DistributedType MaterializedType,
+        NormStatsConsumer Consumer);
+
     private sealed record ParameterPlan(
         DistributedType PartialType,
-        DistributedType MaterializedType,
-        IReadOnlyDictionary<Call, Expr> CallArguments);
+        DistributedType MaterializedType);
 
-    private sealed record FunctionPlan(IReadOnlyDictionary<int, ParameterPlan> Parameters);
+    private sealed class FunctionVariantPlan
+    {
+        public FunctionVariantPlan(IReadOnlyDictionary<int, ParameterPlan> parameters)
+        {
+            Parameters = parameters;
+        }
+
+        public IReadOnlyDictionary<int, ParameterPlan> Parameters { get; }
+
+        public Dictionary<Call, IReadOnlyDictionary<int, Expr>> CallArguments { get; } = new(ReferenceEqualityComparer.Instance);
+
+        public Function? Function { get; set; }
+    }
+
+    private sealed class FunctionPlan
+    {
+        public FunctionPlan(IReadOnlyList<FunctionVariantPlan> variants)
+        {
+            Variants = variants;
+        }
+
+        public IReadOnlyList<FunctionVariantPlan> Variants { get; }
+
+        public int PlannedCallCount => Variants.Sum(variant => variant.CallArguments.Count);
+    }
+
+    private sealed record PlannedCall(
+        FunctionVariantPlan Variant,
+        IReadOnlyDictionary<int, Expr> Arguments);
 
     private sealed class FunctionBodyCloner : ExprCloner<Unit>
     {
         private readonly IReadOnlyDictionary<Function, Function> _replacements;
-        private readonly IReadOnlyDictionary<Function, FunctionPlan> _plans;
+        private readonly IReadOnlyDictionary<Call, PlannedCall> _plannedCalls;
 
         public FunctionBodyCloner(
             IReadOnlyDictionary<Function, Function> replacements,
-            IReadOnlyDictionary<Function, FunctionPlan> plans)
+            IReadOnlyDictionary<Call, PlannedCall> plannedCalls)
             : base(cloneOtherFunctions: false)
         {
             _replacements = replacements;
-            _plans = plans;
+            _plannedCalls = plannedCalls;
             CloneUnmutated = false;
         }
 
@@ -474,16 +619,19 @@ public sealed class SinkNormStatsBoxingAcrossFunctionBoundariesPass : ModulePass
 
         protected override BaseExpr VisitLeafCall(Call expr, Unit context)
         {
-            var target = Clone(expr.Target, context);
             var arguments = new BaseExpr[expr.Arguments.Length];
+            Expr target;
             if (expr.Target is Function originalTarget
-                && _plans.TryGetValue(originalTarget, out var calleePlan))
+                && _plannedCalls.TryGetValue(expr, out var plannedCall))
             {
+                target = plannedCall.Variant.Function
+                    ?? throw new InvalidOperationException(
+                        $"Normalization-statistics callee variant for {originalTarget.Name} was not materialized before its caller.");
                 for (int index = 0; index < arguments.Length; index++)
                 {
-                    if (calleePlan.Parameters.TryGetValue(index, out var parameterPlan))
+                    if (plannedCall.Arguments.TryGetValue(index, out var partialStats))
                     {
-                        if (!parameterPlan.CallArguments.TryGetValue(expr, out var partialStats)
+                        if (!plannedCall.Variant.Parameters.TryGetValue(index, out var parameterPlan)
                             || !Equals(partialStats.CheckedType, parameterPlan.PartialType))
                         {
                             throw new InvalidOperationException(
@@ -500,6 +648,7 @@ public sealed class SinkNormStatsBoxingAcrossFunctionBoundariesPass : ModulePass
             }
             else
             {
+                target = (Expr)Clone(expr.Target, context);
                 arguments = CloneArray(expr.Arguments, context);
             }
 

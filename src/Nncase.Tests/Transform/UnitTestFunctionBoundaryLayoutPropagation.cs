@@ -110,6 +110,295 @@ public sealed class UnitTestFunctionBoundaryLayoutPropagation : TestClassBase
     }
 
     [Fact]
+    public async Task TestCallerOutputReshardDemandBecomesInternalShardedView()
+    {
+        CompileOptions.TargetOptions = new Nncase.Targets.PyNTTTargetOptions();
+        var tensorType = new TensorType(DataTypes.Float32, new RankedShape(1, 64));
+        var placement = new Placement(new[] { 2, 4 }, "yx", "bb");
+        var sourceType = new DistributedType(
+            tensorType,
+            new SBP[] { SBP.B, SBP.SContiguous([0, 1]) },
+            placement);
+        var targetType = new DistributedType(
+            tensorType,
+            new SBP[] { SBP.B, SBP.SContiguous([0]) },
+            placement);
+        var layerInput = new Var("layer_input", sourceType);
+        var layer = new Function("layer", IR.F.Math.Abs(layerInput), layerInput);
+        Assert.True(layer.InferenceType());
+
+        var input = new Var("input", sourceType);
+        var layerCall = new Call(layer, input);
+        var resharded = IR.F.Distributed.Boxing(layerCall, targetType);
+        var main = new Function("main", IR.F.Math.Abs(resharded), input);
+        Assert.True(main.InferenceType());
+
+        var module = new IRModule(main);
+        module.Add(layer);
+        var passManager = CompileSession.CreatePassManager("PostDistributedBoundaryOutputDemand");
+        passManager.Add<FunctionBoundaryLayoutPropagationPass>();
+        passManager.AddWithName<DataflowPass>("FoldBoundaryBoxing").Configure(p =>
+        {
+            p.Add<Passes.Rules.FoldBoxingBoxing>();
+            p.Add<Passes.Rules.FoldBoxingShardedView>();
+        });
+        await passManager.RunAsync(module);
+
+        var specialized = GetFunction(module, "layer");
+        var shardedView = Assert.Single(
+            ExprCollector.Collect(specialized.Body)
+                .OfType<Call>()
+                .Where(call => call.Target is ShardedView));
+        Assert.Equal(targetType, shardedView.CheckedType);
+        Assert.DoesNotContain(
+            ExprCollector.Collect(specialized.Body).OfType<Call>(),
+            call => call.Target is Boxing);
+        Assert.DoesNotContain(
+            ExprCollector.Collect(main.Body).OfType<Call>(),
+            call => call.Target is Boxing);
+        var specializedCall = Assert.Single(
+            ExprCollector.Collect(main.Body)
+                .OfType<Call>()
+                .Where(call => ReferenceEquals(call.Target, specialized)));
+        Assert.Equal(targetType, specializedCall.CheckedType);
+    }
+
+    [Fact]
+    public async Task TestMixedCallerOutputReshardDemandUsesPerCallShardedViews()
+    {
+        CompileOptions.TargetOptions = new Nncase.Targets.PyNTTTargetOptions();
+        var tensorType = new TensorType(DataTypes.Float32, new RankedShape(1, 64));
+        var placement = new Placement(new[] { 2, 4 }, "yx", "bb");
+        var sourceType = new DistributedType(
+            tensorType,
+            new SBP[] { SBP.B, SBP.SContiguous([0, 1]) },
+            placement);
+        var targetType = new DistributedType(
+            tensorType,
+            new SBP[] { SBP.B, SBP.B },
+            placement);
+        var layerInput = new Var("layer_input", sourceType);
+        var layer = new Function("layer", IR.F.Math.Abs(layerInput), layerInput);
+        Assert.True(layer.InferenceType());
+
+        var input = new Var("input", sourceType);
+        var demandedCall = new Call(layer, input);
+        var sourceLayoutCall = new Call(layer, input);
+        var main = new Function(
+            "main",
+            new IR.Tuple(
+                IR.F.Distributed.Boxing(demandedCall, targetType),
+                sourceLayoutCall),
+            input);
+        Assert.True(main.InferenceType());
+
+        var module = new IRModule(main);
+        module.Add(layer);
+        var passManager = CompileSession.CreatePassManager("MixedPostDistributedBoundaryOutputDemand");
+        passManager.Add<FunctionBoundaryLayoutPropagationPass>();
+        passManager.AddWithName<DataflowPass>("FoldBoundaryBoxing").Configure(p =>
+        {
+            p.Add<Passes.Rules.FoldBoxingBoxing>();
+            p.Add<Passes.Rules.FoldBoxingShardedView>();
+        });
+        await passManager.RunAsync(module);
+
+        var specialized = GetFunction(module, "layer");
+        var internalView = Assert.Single(
+            ExprCollector.Collect(specialized.Body)
+                .OfType<Call>()
+                .Where(call => call.Target is ShardedView));
+        Assert.Equal(targetType, internalView.CheckedType);
+        Assert.DoesNotContain(
+            ExprCollector.Collect(main.Body).OfType<Call>(),
+            call => call.Target is Boxing);
+
+        var mainTuple = Assert.IsType<IR.Tuple>(main.Body);
+        var directCall = Assert.IsType<Call>(mainTuple[0]);
+        Assert.Same(specialized, directCall.Target);
+        Assert.Equal(targetType, directCall.CheckedType);
+        var restoredView = Assert.IsType<Call>(mainTuple[1]);
+        Assert.IsType<ShardedView>(restoredView.Target);
+        Assert.Equal(sourceType, restoredView.CheckedType);
+        var restoredCall = Assert.IsType<Call>(restoredView[ShardedView.Input]);
+        Assert.Same(specialized, restoredCall.Target);
+        Assert.Equal(targetType, restoredCall.CheckedType);
+    }
+
+    [Fact]
+    public async Task TestTupleCallerOutputReshardDemandFoldsRestoredView()
+    {
+        CompileOptions.TargetOptions = new Nncase.Targets.PyNTTTargetOptions();
+        var tensorType = new TensorType(DataTypes.Float32, new RankedShape(1, 64));
+        var placement = new Placement(new[] { 2, 4 }, "yx", "bb");
+        var sourceType = new DistributedType(
+            tensorType,
+            new SBP[] { SBP.B, SBP.SContiguous([0, 1]) },
+            placement);
+        var targetType = new DistributedType(
+            tensorType,
+            new SBP[] { SBP.B, SBP.B },
+            placement);
+        var layerInput = new Var("layer_input", sourceType);
+        var layer = new Function(
+            "layer",
+            new IR.Tuple(IR.F.Math.Abs(layerInput), IR.F.Math.Neg(layerInput)),
+            layerInput);
+        Assert.True(layer.InferenceType());
+
+        var input = new Var("input", sourceType);
+        var layerCall = new Call(layer, input);
+        var demandedOutput = IR.F.Distributed.Boxing(GetItem(layerCall, 0), targetType);
+        var main = new Function("main", demandedOutput, input);
+        Assert.True(main.InferenceType());
+
+        var module = new IRModule(main);
+        module.Add(layer);
+        var passManager = CompileSession.CreatePassManager("TuplePostDistributedBoundaryOutputDemand");
+        passManager.Add<FunctionBoundaryLayoutPropagationPass>();
+        passManager.AddWithName<DataflowPass>("FoldBoundaryBoxing").Configure(p =>
+        {
+            p.Add<Passes.Rules.Neutral.FoldGetItemTuple>();
+            p.Add<Passes.Rules.FoldBoxingBoxing>();
+            p.Add<Passes.Rules.FoldBoxingShardedView>();
+        });
+        await passManager.RunAsync(module);
+
+        var specialized = GetFunction(module, "layer");
+        var outputType = Assert.IsType<TupleType>(specialized.Body.CheckedType);
+        Assert.Equal(targetType, outputType[0]);
+        Assert.DoesNotContain(
+            ExprCollector.Collect(main.Body).OfType<Call>(),
+            call => call.Target is Boxing);
+        var projectedCall = Assert.IsType<Call>(main.Body);
+        Assert.IsType<IR.Tensors.GetItem>(projectedCall.Target);
+        var rawCall = Assert.IsType<Call>(projectedCall[IR.Tensors.GetItem.Input]);
+        Assert.Same(specialized, rawCall.Target);
+    }
+
+    [Fact]
+    public async Task TestCallerOutputDemandKeepsUndemandedCollectiveInCallee()
+    {
+        CompileOptions.TargetOptions = new Nncase.Targets.PyNTTTargetOptions();
+        var placement = new Placement(new[] { 2, 4 }, "yx", "bb");
+        var hiddenTensorType = new TensorType(DataTypes.Float32, new RankedShape(1, 64));
+        var hiddenType = new DistributedType(
+            hiddenTensorType,
+            new SBP[] { SBP.B, SBP.B },
+            placement);
+        var demandedHiddenType = new DistributedType(
+            hiddenTensorType,
+            new SBP[] { SBP.B, SBP.SContiguous([0, 1]) },
+            placement);
+        var statsTensorType = new TensorType(DataTypes.Float32, new RankedShape(1, 1, 1));
+        var materializedStatsType = new DistributedType(
+            statsTensorType,
+            new SBP[] { SBP.B, SBP.B, SBP.B },
+            placement);
+        var partialStatsType = materializedStatsType with
+        {
+            Partial = SBP.P([0, 1], ReduceOp.Sum),
+        };
+
+        var layerInput = new Var("layer_input", hiddenType);
+        var layerStats = new Var("layer_stats", partialStatsType);
+        var layer = new Function(
+            "layer",
+            new IR.Tuple(
+                IR.F.Math.Abs(layerInput),
+                IR.F.Distributed.Boxing(layerStats, materializedStatsType)),
+            layerInput,
+            layerStats);
+        Assert.True(layer.InferenceType());
+
+        var input = new Var("input", hiddenType);
+        var stats = new Var("stats", partialStatsType);
+        var layerCall = new Call(layer, input, stats);
+        var main = new Function(
+            "main",
+            new IR.Tuple(
+                IR.F.Distributed.Boxing(GetItem(layerCall, 0), demandedHiddenType),
+                GetItem(layerCall, 1)),
+            input,
+            stats);
+        Assert.True(main.InferenceType());
+
+        var module = new IRModule(main);
+        module.Add(layer);
+        var passManager = CompileSession.CreatePassManager("DemandedOutputsOnlyBoundaryLayout");
+        passManager.AddWithName<FunctionBoundaryLayoutPropagationPass>(
+            "DemandedOutputsOnlyBoundaryLayout",
+            true,
+            false);
+        passManager.AddWithName<DataflowPass>("FoldBoundaryBoxing").Configure(p =>
+        {
+            p.Add<Passes.Rules.Neutral.FoldGetItemTuple>();
+            p.Add<Passes.Rules.FoldBoxingBoxing>();
+            p.Add<Passes.Rules.FoldBoxingShardedView>();
+        });
+        await passManager.RunAsync(module);
+
+        var specialized = GetFunction(module, "layer");
+        var bodyCalls = ExprCollector.Collect(specialized.Body).OfType<Call>().ToArray();
+        Assert.Single(bodyCalls.Where(call => call.Target is ShardedView));
+        var statsBoxing = Assert.Single(bodyCalls.Where(call => call.Target is Boxing));
+        Assert.Equal(materializedStatsType, statsBoxing.CheckedType);
+        Assert.DoesNotContain(
+            ExprCollector.Collect(main.Body).OfType<Call>(),
+            call => call.Target is Boxing);
+    }
+
+    [Fact]
+    public async Task TestWrappedCallerOutputReshardDemandIsDiscovered()
+    {
+        CompileOptions.TargetOptions = new Nncase.Targets.PyNTTTargetOptions();
+        var tensorType = new TensorType(DataTypes.Float32, new RankedShape(1, 64));
+        var placement = new Placement(new[] { 2, 4 }, "yx", "bb");
+        var sourceType = new DistributedType(
+            tensorType,
+            new SBP[] { SBP.B, SBP.SContiguous([0, 1]) },
+            placement);
+        var targetType = new DistributedType(
+            tensorType,
+            new SBP[] { SBP.B, SBP.B },
+            placement);
+        var layerInput = new Var("layer_input", sourceType);
+        var layer = new Function("layer", IR.F.Math.Abs(layerInput), layerInput);
+        var wrapper = new FunctionWrapper("layer_wrapper", "pyntt", layer, returnOutput: true);
+        Assert.True(layer.InferenceType());
+        Assert.True(wrapper.InferenceType());
+
+        var input = new Var("input", sourceType);
+        var wrappedCall = new Call(wrapper, input);
+        var main = new Function(
+            "main",
+            IR.F.Distributed.Boxing(wrappedCall, targetType),
+            input);
+        Assert.True(main.InferenceType());
+
+        var module = new IRModule(main);
+        module.Add(layer);
+        module.Add(wrapper);
+        var passManager = CompileSession.CreatePassManager("WrappedPostDistributedBoundaryOutputDemand");
+        passManager.Add<FunctionBoundaryLayoutPropagationPass>();
+        passManager.AddWithName<DataflowPass>("FoldBoundaryBoxing").Configure(p =>
+        {
+            p.Add<Passes.Rules.FoldBoxingBoxing>();
+            p.Add<Passes.Rules.FoldBoxingShardedView>();
+        });
+        await passManager.RunAsync(module);
+
+        var specialized = GetFunction(module, "layer");
+        Assert.Equal(targetType, specialized.Body.CheckedType);
+        Assert.DoesNotContain(
+            ExprCollector.Collect(main.Body).OfType<Call>(),
+            call => call.Target is Boxing);
+        var finalCall = Assert.IsType<Call>(main.Body);
+        var finalWrapper = Assert.IsType<FunctionWrapper>(finalCall.Target);
+        Assert.Same(specialized, finalWrapper.Target);
+    }
+
+    [Fact]
     public async Task TestDynamicDimensionIdentityIsPreservedInSpecializedBody()
     {
         var n = new DimVar("n");
@@ -648,7 +937,7 @@ public sealed class UnitTestFunctionBoundaryLayoutPropagation : TestClassBase
         var calleeAbi = calleeWrapper.Target.GetAbiView();
         var input = Assert.Single(calleeAbi.Inputs.OfType<BufferVar>());
         Assert.Equal(
-            DistributedBufferStorageKind.CompactLocal,
+            DistributedBufferStorageKind.CanonicalGlobal,
             input.LayoutAnnotation.DistributedStorageKind);
         var output = Assert.Single(calleeAbi.OutputParameters);
         Assert.Equal(
@@ -742,6 +1031,63 @@ public sealed class UnitTestFunctionBoundaryLayoutPropagation : TestClassBase
             call => Assert.Equal(
                 DistributedBufferStorageKind.CompactPerOwner,
                 Assert.IsType<TIR.Buffer>(call.Arguments[0]).DistributedStorageKind));
+    }
+
+    [Fact]
+    public async Task TestTIRSelectionUsesMaterializedStorageForTupleBoxingOutputAtCaller()
+    {
+        CompileOptions.TargetOptions = new Nncase.Targets.PyNTTTargetOptions();
+        var placement = new Placement([4, 8], "yx", "bb");
+        var inputType = new DistributedType(
+            new TensorType(DataTypes.Float32, new long[] { 1, 128 }),
+            [SBP.B, SBP.SContiguous([0, 1], 4)],
+            placement);
+        var input = new Var("input", inputType);
+        var stats = IR.F.NN.NormStats(1, input, useMean: false);
+        var partialStatsType = Assert.IsType<DistributedType>(stats.CheckedType);
+        var broadcastStatsType = partialStatsType with { Partial = null };
+        var boxedTuple = IR.F.Distributed.Boxing(
+            new IR.Tuple(input, stats),
+            new TupleType(new IRType[] { inputType, broadcastStatsType }));
+        var callee = new Function(
+            "callee",
+            new IR.Tuple(GetItem(boxedTuple, 0), GetItem(boxedTuple, 1)),
+            input);
+        Assert.True(callee.InferenceType());
+
+        var mainInput = new Var("main_input", inputType);
+        var calleeCall = new Call(callee, mainInput);
+        var main = new Function(
+            "main",
+            IR.F.Distributed.Boxing(GetItem(calleeCall, 1), partialStatsType.TensorType),
+            mainInput);
+        Assert.True(main.InferenceType());
+
+        var module = new IRModule(main);
+        module.Add(callee);
+        var passManager = CompileSession.CreatePassManager("TIRSelectionCompactTupleBoxingOutput");
+        passManager.Add<NTTTIRSelectionPass>();
+        await passManager.RunAsync(module);
+
+        var calleeWrapper = Assert.Single(module.Functions.OfType<PrimFunctionWrapper>());
+        var calleeAbi = calleeWrapper.Target.GetAbiView();
+        var statsOutput = Assert.Single(calleeAbi.OutputParameters);
+        Assert.Equal(
+            DistributedBufferStorageKind.CompactLocal,
+            statsOutput.LayoutAnnotation.DistributedStorageKind);
+
+        var mainPrim = Assert.IsType<PrimFunction>(module.Entry);
+        var selectedCall = Assert.Single(
+            ExprCollector.Collect(mainPrim.Body)
+                .OfType<Call>()
+                .Where(call => ReferenceEquals(call.Target, calleeWrapper.Target)));
+        var statsParameterIndex = Array.FindIndex(
+            calleeWrapper.Target.Parameters.ToArray(),
+            parameter => ReferenceEquals(parameter, statsOutput));
+        var callerStats = Assert.IsType<TIR.Buffer>(selectedCall.Arguments[statsParameterIndex]);
+        Assert.Equal(MemoryLocation.Data, callerStats.MemSpan.Buffer.Location);
+        Assert.Equal(DistributedBufferStorageKind.CompactLocal, callerStats.DistributedStorageKind);
+        Assert.Equal(callerStats.MemSpan.Size.FixedValue, callerStats.MemSpan.Buffer.Size.FixedValue);
     }
 
     [Fact]

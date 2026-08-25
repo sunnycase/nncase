@@ -20,6 +20,26 @@ public sealed class BoxingEvaluator : ITypeInferencer<Boxing>, ICostEvaluator<Bo
 
     public static IRType VisitType(IRType inType, IRType outType, bool isReshape = false)
     {
+        IRType VisitTuple(TupleType inv, TupleType outv)
+        {
+            if (inv.Count != outv.Count || inv.IsVariadic != outv.IsVariadic)
+            {
+                return new InvalidType($"Tuple boxing requires matching tuple structures, but got {inv} -> {outv}");
+            }
+
+            var fields = new IRType[inv.Count];
+            for (int i = 0; i < inv.Count; i++)
+            {
+                fields[i] = inv[i] == outv[i] ? outv[i] : VisitType(inv[i], outv[i], isReshape);
+                if (fields[i] is InvalidType invalid)
+                {
+                    return new InvalidType($"Invalid tuple boxing field {i}: {invalid.Reason}");
+                }
+            }
+
+            return outv;
+        }
+
         IRType VisitD2D(DistributedType inv, DistributedType outv)
         {
             if (inv.TensorType != outv.TensorType)
@@ -112,6 +132,8 @@ public sealed class BoxingEvaluator : ITypeInferencer<Boxing>, ICostEvaluator<Bo
         {
             (InvalidType inv, _) => inv,
             (_, InvalidType inv) => inv,
+            (TupleType t, TupleType t1) when t != t1 => VisitTuple(t, t1),
+            (TupleType _, TupleType _) => new InvalidType("Same TupleType"),
             (DistributedType d, DistributedType d1) => VisitD2D(d, d1),
             (TensorType t, DistributedType d) => VisitT2D(t, d),
             (DistributedType d, TensorType t) => VisitD2T(d, t),
@@ -128,179 +150,253 @@ public sealed class BoxingEvaluator : ITypeInferencer<Boxing>, ICostEvaluator<Bo
     {
         var inType = context.GetArgumentType<IRType>(target, Boxing.Input);
         var returnType = context.GetReturnType<IRType>();
-        if (TryGetTargetBoxingCost(context.TargetCostModel, inType, returnType, out var targetCost))
+        return VisitCost(inType, returnType);
+
+        Cost VisitCost(IRType inputType, IRType outputType)
         {
-            return targetCost;
+            if (inputType is TupleType inputTuple && outputType is TupleType outputTuple)
+            {
+                if (inputTuple.Count != outputTuple.Count || inputTuple.IsVariadic != outputTuple.IsVariadic)
+                {
+                    throw new InvalidOperationException($"Tuple boxing requires matching tuple structures, but got {inputTuple} -> {outputTuple}");
+                }
+
+                var tupleCost = Cost.Zero;
+                UInt128 synchronizationCount = 0;
+                for (int i = 0; i < inputTuple.Count; i++)
+                {
+                    if (inputTuple[i] == outputTuple[i])
+                    {
+                        continue;
+                    }
+
+                    var fieldCost = VisitCost(inputTuple[i], outputTuple[i]);
+                    if (fieldCost.Factors.TryGetValue(CostFactorNames.GridSynchronization, out var fieldSynchronizationCount))
+                    {
+                        synchronizationCount = UInt128.Max(synchronizationCount, fieldSynchronizationCount);
+                        fieldCost = new Cost
+                        {
+                            Factors = fieldCost.Factors
+                                .Where(pair => pair.Key != CostFactorNames.GridSynchronization)
+                                .ToDictionary(pair => pair.Key, pair => pair.Value),
+                        };
+                    }
+
+                    tupleCost += fieldCost;
+                }
+
+                if (synchronizationCount > 0)
+                {
+                    tupleCost += new Cost { [CostFactorNames.GridSynchronization] = synchronizationCount };
+                }
+
+                return tupleCost;
+            }
+
+            return VisitLeafCost(inputType, outputType);
         }
 
-        var cost = new Cost() { [CostFactorNames.CPUCycles] = 1, [CostFactorNames.ChipGlobalMemoryLoadBytes] = 0, [CostFactorNames.ChipGlobalMemoryStoreBytes] = 0, [CostFactorNames.GridSynchronization] = SynchronizationEventCount };
-        switch (inType, returnType)
+        Cost VisitLeafCost(IRType inputType, IRType outputType)
         {
-            case (TensorType _, DistributedType distributedType):
-                switch (context.CompileOptions.TargetOptions)
-                {
-                    default:
-                        cost = new Cost()
+            if (TryGetTargetBoxingCost(context.TargetCostModel, inputType, outputType, out var targetCost))
+            {
+                return targetCost;
+            }
+
+            var cost = new Cost() { [CostFactorNames.CPUCycles] = 1, [CostFactorNames.ChipGlobalMemoryLoadBytes] = 0, [CostFactorNames.ChipGlobalMemoryStoreBytes] = 0, [CostFactorNames.GridSynchronization] = SynchronizationEventCount };
+            switch (inputType, outputType)
+            {
+                case (TensorType _, DistributedType distributedType):
+                    switch (context.CompileOptions.TargetOptions)
+                    {
+                        default:
+                            cost = new Cost()
+                            {
+                                [CostFactorNames.ChipGlobalMemoryLoadBytes] = CostUtility.GetMemoryAccess(distributedType),
+                                [CostFactorNames.ChipGlobalMemoryStoreBytes] = CostUtility.GetMemoryAccess(distributedType),
+                            };
+                            break;
+                    }
+
+                    break;
+                case (DistributedType distributedType, TensorType _):
+                    switch (context.CompileOptions.TargetOptions)
+                    {
+                        default:
+                            cost = new Cost()
+                            {
+                                [CostFactorNames.ChipGlobalMemoryLoadBytes] = CostUtility.GetMemoryAccess(distributedType),
+                                [CostFactorNames.ChipGlobalMemoryStoreBytes] = CostUtility.GetMemoryAccess(distributedType),
+                            };
+                            break;
+                    }
+
+                    break;
+
+                case (DistributedType a, DistributedType b) when a.TensorType == b.TensorType && a.Placement == b.Placement && a.AxisPolicies != b.AxisPolicies:
+                    {
+                        var fullLoadStore = new Cost()
                         {
-                            [CostFactorNames.ChipGlobalMemoryLoadBytes] = CostUtility.GetMemoryAccess(distributedType),
-                            [CostFactorNames.ChipGlobalMemoryStoreBytes] = CostUtility.GetMemoryAccess(distributedType),
+                            [CostFactorNames.ChipGlobalMemoryStoreBytes] = CostUtility.GetMemoryAccess(a),
+                            [CostFactorNames.ChipGlobalMemoryLoadBytes] = CostUtility.GetMemoryAccess(b),
+                            [CostFactorNames.GridSynchronization] = SynchronizationEventCount,
                         };
-                        break;
-                }
 
-                break;
-            case (DistributedType distributedType, TensorType _):
-                switch (context.CompileOptions.TargetOptions)
-                {
-                    default:
-                        cost = new Cost()
+                        float gatherPart = 1;
+                        float scatterPart = 1;
+                        var hierarchyPenalty = Enumerable.Range(1, a.Placement.Hierarchy.Count).Reverse().ToArray();
+                        for (int i = 0; i < a.AxisPolicies.Count; i++)
                         {
-                            [CostFactorNames.ChipGlobalMemoryLoadBytes] = CostUtility.GetMemoryAccess(distributedType),
-                            [CostFactorNames.ChipGlobalMemoryStoreBytes] = CostUtility.GetMemoryAccess(distributedType),
-                        };
-                        break;
-                }
+                            switch (a.AxisPolicies[i], b.AxisPolicies[i])
+                            {
+                                case (SBPSplit splitIn, SBP sbpout):
+                                    switch (sbpout)
+                                    {
+                                        case SBPSplit splitOut:
+                                            {
+                                                var setA = new HashSet<int>(splitIn.HierarchyAxes);
+                                                var setB = new HashSet<int>(splitOut.HierarchyAxes);
+                                                var aContainsB = setA.IsSupersetOf(setB);
+                                                var bContainsA = setB.IsSupersetOf(setA);
+                                                if (bContainsA && aContainsB)
+                                                {
+                                                    cost += new Cost()
+                                                    {
+                                                        [CostFactorNames.CPUCycles] = 1,
+                                                    };
+                                                }
+                                                else if (bContainsA)
+                                                {
+                                                    var diff = setB.Except(setA).ToArray();
+                                                    if (diff.All(d => d > splitIn.HierarchyAxes[^1]))
+                                                    {
+                                                        diff.ForEach(s => scatterPart *= hierarchyPenalty[s]);
+                                                    }
+                                                    else
+                                                    {
+                                                        return fullLoadStore;
+                                                    }
+                                                }
+                                                else if (aContainsB)
+                                                {
+                                                    setA.Except(setB).ToArray().ForEach(s => gatherPart *= hierarchyPenalty[s]);
+                                                }
+                                                else
+                                                {
+                                                    // when split different axis, need global load store.
+                                                    return fullLoadStore;
+                                                }
+                                            }
 
-                break;
+                                            break;
+                                        case SBPBroadCast:
+                                            // scatterPart *= a.Placement.Hierarchy[i];
+                                            splitIn.HierarchyAxes.ToArray().ForEach(s => gatherPart *= hierarchyPenalty[s]);
+                                            break;
+                                        default:
+                                            throw new NotSupportedException("split to partial");
+                                    }
 
-            case (DistributedType a, DistributedType b) when a.TensorType == b.TensorType && a.Placement == b.Placement && a.AxisPolicies != b.AxisPolicies:
-                {
-                    var fullLoadStore = new Cost()
+                                    break;
+                                case (SBPBroadCast, SBPBroadCast):
+                                    // no cost.
+                                    cost += new Cost()
+                                    {
+                                        [CostFactorNames.CPUCycles] = 1,
+                                    };
+                                    break;
+                                case (SBPBroadCast, SBPSplit splitOut):
+                                    splitOut.HierarchyAxes.ToArray().ForEach(s => scatterPart *= hierarchyPenalty[s]);
+                                    break;
+                                case (SBPPartial, SBPSplit splitOut):
+                                    // actually partial to split needs gather.
+                                    break;
+                                case (SBPPartial sBPPartial, SBPBroadCast):
+                                    sBPPartial.Axes.ToArray().ForEach(s => gatherPart *= hierarchyPenalty[s]);
+                                    break;
+                                default:
+                                    throw new NotSupportedException($"{a} to {b}");
+                            }
+                        }
+
+                        if (gatherPart > 1f)
+                        {
+                            cost += new Cost()
+                            {
+                                [CostFactorNames.ChipGlobalMemoryStoreBytes] = (UInt128)((gatherPart - 1) / scatterPart * (float)CostUtility.GetMemoryAccess(DistributedUtility.GetDividedTensorType(a))),
+                            };
+                        }
+                    }
+
+                    break;
+                case (DistributedType a, DistributedType b) when a.TensorType != b.TensorType && a.Placement == b.Placement:
+                    cost = new Cost()
                     {
                         [CostFactorNames.ChipGlobalMemoryStoreBytes] = CostUtility.GetMemoryAccess(a),
                         [CostFactorNames.ChipGlobalMemoryLoadBytes] = CostUtility.GetMemoryAccess(b),
                         [CostFactorNames.GridSynchronization] = SynchronizationEventCount,
                     };
-
-                    float gatherPart = 1;
-                    float scatterPart = 1;
-                    var hierarchyPenalty = Enumerable.Range(1, a.Placement.Hierarchy.Count).Reverse().ToArray();
-                    for (int i = 0; i < a.AxisPolicies.Count; i++)
+                    break;
+                case (DistributedType a, DistributedType b) when a.Placement != b.Placement:
+                    cost = new Cost()
                     {
-                        switch (a.AxisPolicies[i], b.AxisPolicies[i])
-                        {
-                            case (SBPSplit splitIn, SBP sbpout):
-                                switch (sbpout)
-                                {
-                                    case SBPSplit splitOut:
-                                        {
-                                            var setA = new HashSet<int>(splitIn.HierarchyAxes);
-                                            var setB = new HashSet<int>(splitOut.HierarchyAxes);
-                                            var aContainsB = setA.IsSupersetOf(setB);
-                                            var bContainsA = setB.IsSupersetOf(setA);
-                                            if (bContainsA && aContainsB)
-                                            {
-                                                cost += new Cost()
-                                                {
-                                                    [CostFactorNames.CPUCycles] = 1,
-                                                };
-                                            }
-                                            else if (bContainsA)
-                                            {
-                                                var diff = setB.Except(setA).ToArray();
-                                                if (diff.All(d => d > splitIn.HierarchyAxes[^1]))
-                                                {
-                                                    diff.ForEach(s => scatterPart *= hierarchyPenalty[s]);
-                                                }
-                                                else
-                                                {
-                                                    return fullLoadStore;
-                                                }
-                                            }
-                                            else if (aContainsB)
-                                            {
-                                                setA.Except(setB).ToArray().ForEach(s => gatherPart *= hierarchyPenalty[s]);
-                                            }
-                                            else
-                                            {
-                                                // when split different axis, need global load store.
-                                                return fullLoadStore;
-                                            }
-                                        }
-
-                                        break;
-                                    case SBPBroadCast:
-                                        // scatterPart *= a.Placement.Hierarchy[i];
-                                        splitIn.HierarchyAxes.ToArray().ForEach(s => gatherPart *= hierarchyPenalty[s]);
-                                        break;
-                                    default:
-                                        throw new NotSupportedException("split to partial");
-                                }
-
-                                break;
-                            case (SBPBroadCast, SBPBroadCast):
-                                // no cost.
-                                cost += new Cost()
-                                {
-                                    [CostFactorNames.CPUCycles] = 1,
-                                };
-                                break;
-                            case (SBPBroadCast, SBPSplit splitOut):
-                                splitOut.HierarchyAxes.ToArray().ForEach(s => scatterPart *= hierarchyPenalty[s]);
-                                break;
-                            case (SBPPartial, SBPSplit splitOut):
-                                // actually partial to split needs gather.
-                                break;
-                            case (SBPPartial sBPPartial, SBPBroadCast):
-                                sBPPartial.Axes.ToArray().ForEach(s => gatherPart *= hierarchyPenalty[s]);
-                                break;
-                            default:
-                                throw new NotSupportedException($"{a} to {b}");
-                        }
-                    }
-
-                    if (gatherPart > 1f)
+                        [CostFactorNames.ChipGlobalMemoryStoreBytes] = CostUtility.GetMemoryAccess(a),
+                        [CostFactorNames.ChipGlobalMemoryLoadBytes] = CostUtility.GetMemoryAccess(b),
+                        [CostFactorNames.GridSynchronization] = SynchronizationEventCount,
+                    };
+                    break;
+                case (DistributedType a, DistributedType b) when a.Partial != b.Partial:
+                    cost = new Cost()
                     {
-                        cost += new Cost()
-                        {
-                            [CostFactorNames.ChipGlobalMemoryStoreBytes] = (UInt128)((gatherPart - 1) / scatterPart * (float)CostUtility.GetMemoryAccess(DistributedUtility.GetDividedTensorType(a))),
-                        };
-                    }
-                }
+                        [CostFactorNames.ChipGlobalMemoryStoreBytes] = CostUtility.GetMemoryAccess(a),
+                        [CostFactorNames.ChipGlobalMemoryLoadBytes] = CostUtility.GetMemoryAccess(b),
+                        [CostFactorNames.GridSynchronization] = SynchronizationEventCount,
+                    };
+                    break;
+                case (DistributedType a, DistributedType b) when a == b:
+                    throw new InvalidOperationException($"the boxing inType == outType");
+                default:
+                    throw new NotSupportedException($"{inputType} {outputType}");
+            }
 
-                break;
-            case (DistributedType a, DistributedType b) when a.TensorType != b.TensorType && a.Placement == b.Placement:
-                cost = new Cost()
-                {
-                    [CostFactorNames.ChipGlobalMemoryStoreBytes] = CostUtility.GetMemoryAccess(a),
-                    [CostFactorNames.ChipGlobalMemoryLoadBytes] = CostUtility.GetMemoryAccess(b),
-                    [CostFactorNames.GridSynchronization] = SynchronizationEventCount,
-                };
-                break;
-            case (DistributedType a, DistributedType b) when a.Placement != b.Placement:
-                cost = new Cost()
-                {
-                    [CostFactorNames.ChipGlobalMemoryStoreBytes] = CostUtility.GetMemoryAccess(a),
-                    [CostFactorNames.ChipGlobalMemoryLoadBytes] = CostUtility.GetMemoryAccess(b),
-                    [CostFactorNames.GridSynchronization] = SynchronizationEventCount,
-                };
-                break;
-            case (DistributedType a, DistributedType b) when a.Partial != b.Partial:
-                cost = new Cost()
-                {
-                    [CostFactorNames.ChipGlobalMemoryStoreBytes] = CostUtility.GetMemoryAccess(a),
-                    [CostFactorNames.ChipGlobalMemoryLoadBytes] = CostUtility.GetMemoryAccess(b),
-                    [CostFactorNames.GridSynchronization] = SynchronizationEventCount,
-                };
-                break;
-            case (DistributedType a, DistributedType b) when a == b:
-                throw new InvalidOperationException($"the boxing inType == outType");
-            default:
-                throw new NotSupportedException($"{inType} {returnType}");
+            return cost;
         }
-
-        return cost;
     }
 
     public IValue Visit(IEvaluateContext context, Boxing target)
     {
-        var input = context.GetArgumentValueAsTensor(target, Boxing.Input);
-        return target.NewType switch
+        return ConvertValue(context.GetArgumentValue(target, Boxing.Input), target.NewType);
+
+        static IValue ConvertValue(IValue input, IRType outputType)
         {
-            TensorType t => Value.FromTensor(Tensor.FromBytes(input.ElementType, input.BytesBuffer.ToArray(), (RankedShape)t.Shape)),
-            DistributedType d => Value.FromTensor(Tensor.FromBytes(input.ElementType, input.BytesBuffer.ToArray(), (RankedShape)d.TensorType.Shape), d.AxisPolicies, d.Placement),
-            _ => Value.FromTensor(input),
-        };
+            if (outputType is TupleType outputTuple)
+            {
+                if (input is not TupleValue inputTuple || inputTuple.Count != outputTuple.Count)
+                {
+                    throw new InvalidOperationException($"Tuple boxing value requires {outputTuple.Count} fields, but got {input.Type}");
+                }
+
+                var fields = new IValue[outputTuple.Count];
+                for (int i = 0; i < fields.Length; i++)
+                {
+                    fields[i] = inputTuple[i].Type == outputTuple[i]
+                        ? inputTuple[i]
+                        : ConvertValue(inputTuple[i], outputTuple[i]);
+                }
+
+                return new TupleValue(fields);
+            }
+
+            var inputTensor = input.AsTensor();
+            var outputTensorType = outputType switch
+            {
+                TensorType tensorType => tensorType,
+                DistributedType distributedType => distributedType.TensorType,
+                _ => throw new NotSupportedException($"Cannot box value from {input.Type} to {outputType}"),
+            };
+            var outputTensor = Tensor.FromBytes(inputTensor.ElementType, inputTensor.BytesBuffer.ToArray(), (RankedShape)outputTensorType.Shape);
+            return Value.FromTensorLike(outputTensor, outputType);
+        }
     }
 
     private static bool TryGetTargetBoxingCost(ITargetOpCostModel targetCostModel, IRType inputType, IRType outputType, out Cost cost)

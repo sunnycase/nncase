@@ -17,6 +17,11 @@ public partial class Distributed
         return new Call(new Boxing(type), input);
     }
 
+    public static Call Boxing(BaseExpr input, IRType type)
+    {
+        return new Call(new Boxing(type), input);
+    }
+
     public static Call ShardedView(Expr input, DistributedType type)
     {
         return new Call(new ShardedView(type), input);

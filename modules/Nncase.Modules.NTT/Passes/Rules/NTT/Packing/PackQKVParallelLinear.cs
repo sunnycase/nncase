@@ -93,7 +93,7 @@ public sealed partial class PackQKVParallelLinearByN : RewriteRule<Pattern>
             return null;
         }
 
-        var packed = IR.F.NTT.PackedQKVParallelLinear(
+        var projection = IR.F.NTT.PackedQKVParallelLinear(
             input,
             packedQWeight,
             packedKWeight,
@@ -110,6 +110,12 @@ public sealed partial class PackQKVParallelLinearByN : RewriteRule<Pattern>
             qkv.NumHeads,
             qkv.NumKvHeads,
             qkv.OutputDataType);
+        if (projection.CheckedType is not TupleType { Count: 3 } packedType)
+        {
+            return null;
+        }
+
+        var packed = IR.F.NTT.PackedQKVParallelLinearCombine(projection, packedType);
 
         return new IR.Tuple(
             UnpackOutput(packed, 0, GetRank(tupleType.Fields[0]), laneCount),
@@ -287,7 +293,7 @@ public sealed partial class PackQKVParallelLinearRhsKMajor : RewriteRule<Pattern
             return null;
         }
 
-        var packed = IR.F.NTT.PackedQKVParallelLinear(
+        var projection = IR.F.NTT.PackedQKVParallelLinear(
             input,
             packedQWeight,
             packedKWeight,
@@ -305,6 +311,12 @@ public sealed partial class PackQKVParallelLinearRhsKMajor : RewriteRule<Pattern
             qkv.NumKvHeads,
             qkv.OutputDataType,
             rhsLayout: IR.NTT.PackedMatMulRhsLayout.KMajor);
+        if (projection.CheckedType is not TupleType { Count: 3 } packedType)
+        {
+            return null;
+        }
+
+        var packed = IR.F.NTT.PackedQKVParallelLinearCombine(projection, packedType);
 
         return new IR.Tuple(
             UnpackOutput(packed, 0, GetRank(tupleType.Fields[0]), nVectorLanes),

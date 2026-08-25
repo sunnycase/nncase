@@ -780,7 +780,7 @@ internal sealed class PyNTTKernelSourceConvertVisitor : ExprFunctor<Unit, Unit>
             return new(
                 new DeviceFunctionRenderSpec(
                     name,
-                    NoInline: true,
+                    NoInline: false,
                     _helpers.ToArray(),
                     bodySource,
                     parameterOverrides,
@@ -1484,6 +1484,12 @@ internal sealed class PyNTTKernelSourceConvertVisitor : ExprFunctor<Unit, Unit>
                 case Nncase.TIR.NTT.GatherReduceNormApply gatherReduceNormApply:
                     VisitGatherReduceNormApply(gatherReduceNormApply, args);
                     break;
+                case Nncase.TIR.NTT.GatherReduceAddNormStats gatherReduceAddNormStats:
+                    VisitGatherReduceAddNormStats(gatherReduceAddNormStats, args);
+                    break;
+                case Nncase.TIR.NTT.GatherReduceAddNormApply gatherReduceAddNormApply:
+                    VisitGatherReduceAddNormApply(gatherReduceAddNormApply, args);
+                    break;
                 case Nncase.TIR.NTT.Pad pad:
                     VisitPad(pad, args);
                     break;
@@ -1556,6 +1562,12 @@ internal sealed class PyNTTKernelSourceConvertVisitor : ExprFunctor<Unit, Unit>
                         args,
                         RequireMicroKernel(microKernel, nvfp4Matmul));
                     break;
+                case Nncase.TIR.NTT.PagedAttentionMergePackedMatMul fused:
+                    VisitPagedAttentionMergePackedMatMul(
+                        fused,
+                        args,
+                        RequireMicroKernel(microKernel, fused));
+                    break;
                 case Nncase.TIR.NTT.PackedMatMulNormStats packedMatmulNormStats:
                     VisitPackedMatmulNormStats(
                         packedMatmulNormStats,
@@ -1619,6 +1631,9 @@ internal sealed class PyNTTKernelSourceConvertVisitor : ExprFunctor<Unit, Unit>
                         gatedDeltaNetRecurrent,
                         args,
                         RequireMicroKernel(microKernel, gatedDeltaNetRecurrent));
+                    break;
+                case Nncase.TIR.NTT.GatherReduceQKVRoPEWithCache gatherReduceQKVRoPEWithCache:
+                    VisitGatherReduceQKVRoPEWithCache(gatherReduceQKVRoPEWithCache, args);
                     break;
                 case Nncase.TIR.NTT.PagedAttention pagedAttention:
                     VisitPagedAttention(pagedAttention, args);
@@ -1753,13 +1768,18 @@ internal sealed class PyNTTKernelSourceConvertVisitor : ExprFunctor<Unit, Unit>
                         .Select(index => selection.SharedWorkspaces[index].Name)
                         .ToArray()))
                 .ToArray() ?? Array.Empty<PyNTTTransferPipelineChannelTemplateModel>();
+            var consumerSharedWorkspaceNames = selection.TransferPipeline?
+                .ConsumerSharedWorkspaceIndices
+                .Select(index => selection.SharedWorkspaces[index].Name)
+                .ToArray() ?? Array.Empty<string>();
             return new(
                 selection.Family,
                 selection.Variant,
                 selection.Parameters,
                 offsets,
                 shapes,
-                transferChannels);
+                transferChannels,
+                consumerSharedWorkspaceNames);
         }
 
         private long GetFixedSharedWorkspaceOffsetBytes(
@@ -4855,7 +4875,8 @@ internal sealed class PyNTTKernelSourceConvertVisitor : ExprFunctor<Unit, Unit>
             TIR.Buffer? rhsScale = null,
             long weightBlockN = 0,
             long weightBlockK = 0,
-            int? outputNVectorLaneCount = null)
+            int? outputNVectorLaneCount = null,
+            Action<string, PyNTTMatmulTemplateModel>? emit = null)
         {
             if (matmul.FusedReduce)
             {
@@ -5118,11 +5139,13 @@ internal sealed class PyNTTKernelSourceConvertVisitor : ExprFunctor<Unit, Unit>
                     ? (useGemv ? "gemv_compute" : "matmul_compute")
                     : (useGemv ? "gemv_norm_stats_compute" : "matmul_norm_stats_compute"));
             var usesHostRhsDescriptor =
-                microKernel.Family == "triton.matmul" &&
-                microKernel.Variant is "simt_fma_smem_pipeline" or
-                    "simt_fp8_fma_smem_pipeline" or
-                    "simt_block_fp8_fma_smem_pipeline" or
-                    "mma_block_fp8_smem_pipeline";
+                (microKernel.Family == "triton.matmul" &&
+                 microKernel.Variant is "simt_fma_smem_pipeline" or
+                     "simt_fp8_fma_smem_pipeline" or
+                     "simt_block_fp8_fma_smem_pipeline" or
+                     "mma_block_fp8_smem_pipeline") ||
+                (microKernel.Family == "triton.paged_attention_merge_matmul" &&
+                 microKernel.Variant == "simt_fma_smem_pipeline");
             var rhsDescriptor = usesHostRhsDescriptor
                 ? RegisterHostTensorDescriptor(rhs, $"{helperName}__rhs_descriptor")
                 : null;
@@ -5189,10 +5212,17 @@ internal sealed class PyNTTKernelSourceConvertVisitor : ExprFunctor<Unit, Unit>
                 UseMean = useMean,
             };
 
-            WriteSelectedMicroKernelHelper(
-                microKernel,
-                templateModel,
-                helperName);
+            if (emit is null)
+            {
+                WriteSelectedMicroKernelHelper(
+                    microKernel,
+                    templateModel,
+                    helperName);
+            }
+            else
+            {
+                emit(helperName, templateModel);
+            }
         }
 
         private void VisitPackedScaledMatmul(
@@ -5859,7 +5889,9 @@ internal sealed class PyNTTKernelSourceConvertVisitor : ExprFunctor<Unit, Unit>
             var helperName = GetNextHelperName(useGemv ? "packed_qkv_gemv_compute" : "packed_qkv_matmul_compute");
             var usesHostWeightDescriptors =
                 microKernel.Family == "triton.qkv_parallel_linear" &&
-                microKernel.Variant is "simt_fma_smem_pipeline" or "simt_fp8_fma_smem_pipeline";
+                microKernel.Variant is "simt_fma_smem_pipeline" or
+                    "simt_fp8_fma_smem_pipeline" or
+                    "mma_smem_pipeline";
             var weightDescriptor = usesHostWeightDescriptors
                 ? RegisterHostTensorDescriptor(weight, $"{helperName}__weight_descriptor")
                 : null;
@@ -7136,12 +7168,14 @@ internal sealed class PyNTTKernelSourceConvertVisitor : ExprFunctor<Unit, Unit>
                 templatePath,
                 templateModel,
                 microKernel.TransferPipelineChannels,
+                microKernel.ConsumerSharedWorkspaceNames,
                 microKernel.SharedWorkspaceOffsets);
             WriteLine(
                 BuildHelperRoleCall(
                     helperName,
                     "consumer",
-                    stage.PipeStages.Select(pipeStage => pipeStage.ReaderName),
+                    stage.PipeStages.Select(pipeStage => pipeStage.ReaderName)
+                        .Concat(stage.ConsumerSharedWorkspaceNames),
                     recordMetadata: true));
         }
 
@@ -7154,11 +7188,13 @@ internal sealed class PyNTTKernelSourceConvertVisitor : ExprFunctor<Unit, Unit>
                 ("triton.matmul", "simt_block_fp8_fma_smem_pipeline") => "triton/kernels/matmul/simt_block_fp8_fma_smem_pipeline.py.jinja",
                 ("triton.matmul", "mma_block_fp8_smem_pipeline") => "triton/kernels/matmul/mma_block_fp8_smem_pipeline.py.jinja",
                 ("triton.nvfp4_matmul", "mma_tma_smem_pipeline") => "triton/kernels/nvfp4_matmul/mma_tma_smem_pipeline.py.jinja",
+                ("triton.paged_attention_merge_matmul", "simt_fma_smem_pipeline") => "triton/kernels/paged_attention_merge_matmul/simt_fma_smem_pipeline.py.jinja",
                 ("triton.matmul_sampling_partial", "simt_fma_smem_pipeline") => "triton/kernels/matmul_sampling_partial/simt_fma_smem_pipeline.py.jinja",
                 ("triton.matmul", "mma") => "triton/kernels/matmul/mma.py.jinja",
                 ("triton.qkv_parallel_linear", "simt_fma") => "triton/kernels/qkv_parallel_linear/simt_fma.py.jinja",
                 ("triton.qkv_parallel_linear", "simt_fma_smem_pipeline") => "triton/kernels/qkv_parallel_linear/simt_fma_smem_pipeline.py.jinja",
                 ("triton.qkv_parallel_linear", "simt_fp8_fma_smem_pipeline") => "triton/kernels/qkv_parallel_linear/simt_fp8_fma_smem_pipeline.py.jinja",
+                ("triton.qkv_parallel_linear", "mma_smem_pipeline") => "triton/kernels/qkv_parallel_linear/mma_smem_pipeline.py.jinja",
                 ("triton.qkv_parallel_linear", "mma") => "triton/kernels/qkv_parallel_linear/mma.py.jinja",
                 ("triton.matmul_glu", "simt_fma") => "triton/kernels/matmul_glu/simt_fma.py.jinja",
                 ("triton.matmul_glu", "simt_fma_smem_pipeline") => "triton/kernels/matmul_glu/simt_fma_smem_pipeline.py.jinja",
@@ -7622,6 +7658,317 @@ internal sealed class PyNTTKernelSourceConvertVisitor : ExprFunctor<Unit, Unit>
             MarkStoredOutput(output, context);
         }
 
+        private void VisitGatherReduceAddNormStats(
+            Nncase.TIR.NTT.GatherReduceAddNormStats op,
+            IReadOnlyList<BaseExpr> args)
+        {
+            const string context = "PyNTT GatherReduceAddNormStats";
+            if (args.Count < 5)
+            {
+                throw new NotSupportedException($"{context} expects input, collective, addend, value, and statistics buffers.");
+            }
+
+            var input = GetBufferOperand(args[0], $"{context} input");
+            var collective = GetBufferOperand(args[1], $"{context} collective");
+            var addend = GetBufferOperand(args[2], $"{context} addend");
+            var valueOutput = GetBufferOperand(args[3], $"{context} value output");
+            var statsOutput = GetBufferOperand(args[4], $"{context} statistics output");
+            var helperName = GetNextHelperName("gather_reduce_add_norm_stats_compute");
+            var reshard = BuildGatherReduceScatterTemplateModel(
+                helperName,
+                input,
+                collective,
+                op.InType,
+                op.OutType,
+                context);
+            ValidateGatherReduceAddNormValueBuffers(context, collective, addend, valueOutput);
+            var normStats = BuildNormStatsTemplateModel(
+                helperName,
+                valueOutput,
+                statsOutput,
+                op.Axis,
+                op.UseMean,
+                context);
+            WriteGatherReduceAddNormHelper(
+                helperName,
+                reshard,
+                addend,
+                normStats,
+                null,
+                op.UseMean,
+                context);
+            MarkStoredOutput(valueOutput, context);
+            MarkStoredOutput(statsOutput, context);
+        }
+
+        private void VisitGatherReduceAddNormApply(
+            Nncase.TIR.NTT.GatherReduceAddNormApply op,
+            IReadOnlyList<BaseExpr> args)
+        {
+            const string context = "PyNTT GatherReduceAddNormApply";
+            if (args.Count < 8)
+            {
+                throw new NotSupportedException(
+                    $"{context} expects input, collective, addend, value, statistics workspace, scale, bias, and normalized output buffers.");
+            }
+
+            var input = GetBufferOperand(args[0], $"{context} input");
+            var collective = GetBufferOperand(args[1], $"{context} collective");
+            var addend = GetBufferOperand(args[2], $"{context} addend");
+            var valueOutput = GetBufferOperand(args[3], $"{context} value output");
+            var statsWorkspace = GetBufferOperand(args[4], $"{context} statistics workspace");
+            var scale = GetBufferOperand(args[5], $"{context} scale");
+            var bias = GetBufferOperand(args[6], $"{context} bias");
+            var normOutput = GetBufferOperand(args[7], $"{context} normalized output");
+            var helperName = GetNextHelperName("gather_reduce_add_norm_apply_compute");
+            var reshard = BuildGatherReduceScatterTemplateModel(
+                helperName,
+                input,
+                collective,
+                op.InType,
+                op.OutType,
+                context);
+            ValidateGatherReduceAddNormValueBuffers(context, collective, addend, valueOutput);
+            var normStats = BuildNormStatsTemplateModel(
+                helperName,
+                valueOutput,
+                statsWorkspace,
+                op.Axis,
+                op.UseMean,
+                context);
+            var normApply = BuildNormApplyTemplateModel(
+                helperName,
+                op.Axis,
+                op.Epsilon,
+                op.UseMean,
+                valueOutput,
+                statsWorkspace,
+                scale,
+                bias,
+                normOutput,
+                context);
+            WriteGatherReduceAddNormHelper(
+                helperName,
+                reshard,
+                addend,
+                normStats,
+                normApply,
+                op.UseMean,
+                context);
+            MarkStoredOutput(valueOutput, context);
+            MarkStoredOutput(normOutput, context);
+        }
+
+        private void WriteGatherReduceAddNormHelper(
+            string helperName,
+            PyNTTReshardTemplateModel reshard,
+            TIR.Buffer addend,
+            PyNTTNormStatsTemplateModel normStats,
+            PyNTTNormApplyTemplateModel? normApply,
+            bool useMean,
+            string context)
+        {
+            SetComputeOp(normApply is null
+                ? (useMean ? "gather_reduce_add_norm_stats" : "gather_reduce_add_rms_norm_stats")
+                : (useMean ? "gather_reduce_add_norm_apply" : "gather_reduce_add_rms_norm_apply"));
+            _attrs["requires_grid_barrier"] = true;
+            _attrs["op"] = normApply is null
+                ? (useMean ? "gather_reduce_add_norm_stats" : "gather_reduce_add_rms_norm_stats")
+                : (useMean ? "gather_reduce_add_norm_apply" : "gather_reduce_add_rms_norm_apply");
+            _attrs["dtype"] = normStats.InputDType;
+            _attrs["shape"] = GetLogicalVectorShape(normStats.InputShape, normStats.InputVectorLaneCount);
+            _attrs["axis"] = normStats.Axis;
+            _attrs["use_mean"] = useMean;
+            if (normApply is not null)
+            {
+                _attrs["epsilon"] = normApply.Epsilon;
+            }
+
+            WriteHelperTemplate(
+                "triton/kernels/GatherReduceAddNorm.py.jinja",
+                new PyNTTGatherReduceAddNormTemplateModel(
+                    helperName,
+                    reshard,
+                    GetBufferScalarPointer(addend),
+                    normStats,
+                    normApply,
+                    context));
+            WriteHelperInvocation(helperName);
+        }
+
+        private PyNTTNormStatsTemplateModel BuildNormStatsTemplateModel(
+            string helperName,
+            TIR.Buffer input,
+            TIR.Buffer output,
+            int axis,
+            bool useMean,
+            string context)
+        {
+            var inputShape = GetBufferActiveShape(input);
+            var outputShape = GetBufferActiveShape(output);
+            var normalizedAxis = NormalizeAxis(axis, inputShape.Length, context);
+            var inputVectorLaneCount = GetSingleVectorLaneCount(input.ElemType, $"{context} input");
+            var outputVectorLaneCount = GetSingleVectorLaneCount(output.ElemType, $"{context} statistics output");
+            if (outputVectorLaneCount != 1)
+            {
+                throw new NotSupportedException($"{context} expects scalar statistics output dtype.");
+            }
+
+            ValidateNormStatsShape(context, inputShape, outputShape, normalizedAxis, useMean);
+            return new PyNTTNormStatsTemplateModel(
+                helperName,
+                GetBufferScalarPointer(input),
+                GetBufferScalarPointer(output),
+                GetPyNTTScalarDTypeName(input.ElemType),
+                GetPyNTTScalarDTypeName(output.ElemType),
+                GetScalarTritonDType(input.ElemType),
+                GetScalarTritonDType(output.ElemType),
+                inputShape,
+                outputShape,
+                GetBufferStrides(input),
+                GetBufferStrides(output),
+                inputVectorLaneCount,
+                outputVectorLaneCount,
+                GetVectorLanes(input.ElemType),
+                GetVectorLanes(output.ElemType),
+                normalizedAxis,
+                useMean,
+                $"{input.Name} -> {output.Name}");
+        }
+
+        private void ValidateGatherReduceAddNormValueBuffers(
+            string context,
+            TIR.Buffer collective,
+            TIR.Buffer addend,
+            TIR.Buffer valueOutput)
+        {
+            var collectiveShape = collective.DistributedStorageKind == DistributedBufferStorageKind.CanonicalGlobal
+                ? GetBufferGlobalShape(collective)
+                : GetBufferActiveShape(collective);
+            ValidateSameShape($"{context} collective/addend", collectiveShape, GetBufferActiveShape(addend));
+            ValidateSameShape($"{context} collective/value", collectiveShape, GetBufferActiveShape(valueOutput));
+            ValidateSameShape($"{context} collective/addend strides", GetBufferStrides(collective), GetBufferStrides(addend));
+            ValidateSameShape($"{context} collective/value strides", GetBufferStrides(collective), GetBufferStrides(valueOutput));
+            var dtypes = new[] { collective, addend, valueOutput }
+                .Select(buffer => GetPyNTTScalarDTypeName(buffer.ElemType))
+                .Distinct(StringComparer.Ordinal)
+                .ToArray();
+            var lanes = new[] { collective, addend, valueOutput }
+                .Select(buffer => GetVectorLaneElementCount(buffer.ElemType))
+                .Distinct()
+                .ToArray();
+            if (dtypes.Length != 1 || lanes.Length != 1)
+            {
+                throw new NotSupportedException(
+                    $"{context} collective, addend, and value output must have matching scalar dtype and vector lanes.");
+            }
+        }
+
+        private PyNTTReshardTemplateModel BuildGatherReduceScatterTemplateModel(
+            string helperName,
+            TIR.Buffer input,
+            TIR.Buffer output,
+            DistributedType inType,
+            DistributedType outType,
+            string context)
+        {
+            if (!inType.Placement.Hierarchy.SequenceEqual(outType.Placement.Hierarchy) ||
+                inType.TensorType != outType.TensorType)
+            {
+                throw new NotSupportedException(
+                    $"{context} expects input and output to share one placement and logical tensor type.");
+            }
+
+            if (inType.AxisPolicies.Any(policy => policy is SBPPartial) ||
+                outType.AxisPolicies.Any(policy => policy is SBPPartial) ||
+                outType.Partial is not null ||
+                inType.Partial is not { Op: ReduceOp.Sum } partial)
+            {
+                throw new NotSupportedException(
+                    $"{context} expects DistributedType.Partial Sum input materialized to a non-partial output.");
+            }
+
+            var hierarchy = outType.Placement.Hierarchy.ToArray();
+            var partialAxes = partial.Axes.ToArray();
+            if (partialAxes.Length == 0 ||
+                partialAxes.Distinct().Count() != partialAxes.Length ||
+                partialAxes.Any(axis => axis < 0 || axis >= hierarchy.Length))
+            {
+                throw new NotSupportedException(
+                    $"{context} has invalid partial axes [{string.Join(",", partialAxes)}].");
+            }
+
+            var inputShardAxes = GetShardAxes(inType);
+            var conflictingAxes = inputShardAxes
+                .SelectMany(axis => axis.Stages)
+                .SelectMany(stage => stage.HierarchyAxes)
+                .Intersect(partialAxes)
+                .Distinct()
+                .ToArray();
+            if (conflictingAxes.Length > 0)
+            {
+                throw new NotSupportedException(
+                    $"{context} placement axes cannot be both split and partial: [{string.Join(",", conflictingAxes)}].");
+            }
+
+            if (input.DistributedStorageKind != DistributedBufferStorageKind.CompactPerOwner ||
+                !IsCompactPerOwnerBacking(input.MemSpan.Buffer))
+            {
+                throw new NotSupportedException(
+                    $"{context} partial input {input.Name} must use compact per-owner chip-visible storage.");
+            }
+
+            var inputRef = ResolveByteAddressedBufferRef(input);
+            if (IsZeroOffset(inputRef.PoolStrideBytes))
+            {
+                throw new NotSupportedException(
+                    $"{context} partial input {input.Name} requires distinct per-owner storage.");
+            }
+
+            var inputShape = GetBufferShape(input);
+            var inputActiveShape = GetBufferActiveShape(input);
+            var outputShape = GetBufferShape(output);
+            var globalShape = GetRankedShapeDimensions(outType.TensorType.Shape, $"{context} global shape")
+                .Select(GetDimensionExpression)
+                .ToArray();
+            ValidateSameRank($"{context} input", inputShape, globalShape);
+            ValidateSameRank($"{context} output", outputShape, globalShape);
+            var inputVectorLaneCount = GetVectorLaneElementCount(input.ElemType);
+            var outputVectorLaneCount = GetVectorLaneElementCount(output.ElemType);
+            var inputScalarDType = GetPyNTTScalarDTypeName(input.ElemType);
+            var outputScalarDType = GetPyNTTScalarDTypeName(output.ElemType);
+            if (inputVectorLaneCount != outputVectorLaneCount || inputScalarDType != outputScalarDType)
+            {
+                throw new NotSupportedException(
+                    $"{context} input/output dtype or vector lanes do not match.");
+            }
+
+            return new PyNTTReshardTemplateModel(
+                helperName,
+                GetBufferScalarPointer(input),
+                GetBufferScalarPointer(output),
+                GetPooledByteAddressTemplateModel(inputRef),
+                GetPooledByteAddressTemplateModel(ResolveByteAddressedBufferRef(output)),
+                GetScalarElementSizeBytes(output.ElemType),
+                outputScalarDType,
+                GetScalarTritonDType(output.ElemType),
+                globalShape,
+                inputShape,
+                inputActiveShape,
+                GetBufferGlobalOffsets(input),
+                outputShape,
+                GetBufferStrides(input),
+                GetBufferStrides(output),
+                inputVectorLaneCount,
+                GetVectorLanes(input.ElemType),
+                hierarchy,
+                inputShardAxes,
+                partialAxes,
+                GetShardAxes(outType),
+                "tile_scatter",
+                $"{input.Name} -> {output.Name}");
+        }
+
         private PyNTTNormApplyTemplateModel BuildNormApplyTemplateModel(
             string helperName,
             int axis,
@@ -7834,9 +8181,133 @@ internal sealed class PyNTTKernelSourceConvertVisitor : ExprFunctor<Unit, Unit>
                     "PyNTT QKVRoPEWithCache codegen expects Q/K/V, Q/K scale/bias, cos/sin, kv-cache, layer id, and Q output operands.");
             }
 
-            var q = GetBufferOperand(args[0], "PyNTT QKVRoPEWithCache Q");
-            var k = GetBufferOperand(args[1], "PyNTT QKVRoPEWithCache K");
-            var v = GetBufferOperand(args[2], "PyNTT QKVRoPEWithCache V");
+            BuildQKVRoPEWithCache(
+                args,
+                GetBufferOperand(args[0], "PyNTT QKVRoPEWithCache Q"),
+                GetBufferOperand(args[1], "PyNTT QKVRoPEWithCache K"),
+                GetBufferOperand(args[2], "PyNTT QKVRoPEWithCache V"),
+                fused.QAxis,
+                fused.QEpsilon,
+                fused.QUseMean,
+                fused.KAxis,
+                fused.KEpsilon,
+                fused.KUseMean,
+                fused.QKVLayout,
+                fused.AttentionLayout,
+                null,
+                null,
+                null,
+                "qkv_rope_with_cache");
+        }
+
+        private void VisitGatherReduceQKVRoPEWithCache(
+            Nncase.TIR.NTT.GatherReduceQKVRoPEWithCache fused,
+            IReadOnlyList<BaseExpr> args)
+        {
+            if (args.Count < 12)
+            {
+                throw new NotSupportedException(
+                    "PyNTT GatherReduceQKVRoPEWithCache codegen expects partial Q/K/V, Q/K scale/bias, cos/sin, kv-cache, layer id, and Q output operands.");
+            }
+
+            var qPartial = GetBufferOperand(args[0], "PyNTT GatherReduceQKVRoPEWithCache Q partial");
+            var kPartial = GetBufferOperand(args[1], "PyNTT GatherReduceQKVRoPEWithCache K partial");
+            var vPartial = GetBufferOperand(args[2], "PyNTT GatherReduceQKVRoPEWithCache V partial");
+            var q = CreateFusedLogicalView(qPartial, fused.QLogicalType, fused.QShape, fused.QStrides, "q_combined_view");
+            var k = CreateFusedLogicalView(kPartial, fused.KLogicalType, fused.KShape, fused.KStrides, "k_combined_view");
+            var v = CreateFusedLogicalView(vPartial, fused.VLogicalType, fused.VShape, fused.VStrides, "v_combined_view");
+            BuildQKVRoPEWithCache(
+                args,
+                q,
+                k,
+                v,
+                fused.QAxis,
+                fused.QEpsilon,
+                fused.QUseMean,
+                fused.KAxis,
+                fused.KEpsilon,
+                fused.KUseMean,
+                fused.QKVLayout,
+                fused.AttentionLayout,
+                BuildQKVPartialInputTemplateModel(qPartial, fused.QInType, "Q"),
+                BuildQKVPartialInputTemplateModel(kPartial, fused.KInType, "K"),
+                BuildQKVPartialInputTemplateModel(vPartial, fused.VInType, "V"),
+                "gather_reduce_qkv_rope_with_cache");
+        }
+
+        private TIR.Buffer CreateFusedLogicalView(
+            TIR.Buffer partial,
+            DistributedType combinedType,
+            IRArray<Dimension> shape,
+            IRArray<Dimension> strides,
+            string suffix)
+            => new(
+                $"{partial.Name}_{suffix}",
+                partial.ElemType,
+                partial.MemSpan,
+                shape.ToArray(),
+                strides.ToArray(),
+                combinedType,
+                distributedStorageKind: DistributedBufferStorageKind.CanonicalGlobal);
+
+        private PyNTTQKVPartialInputTemplateModel BuildQKVPartialInputTemplateModel(
+            TIR.Buffer input,
+            DistributedType inType,
+            string field)
+        {
+            if (inType.Partial is not { Op: ReduceOp.Sum } partial || partial.Axes.Count == 0)
+            {
+                throw new NotSupportedException(
+                    $"PyNTT GatherReduceQKVRoPEWithCache {field} input must carry a non-empty Sum partial reduction.");
+            }
+
+            if (input.DistributedStorageKind != DistributedBufferStorageKind.CompactPerOwner ||
+                !IsCompactPerOwnerBacking(input.MemSpan.Buffer))
+            {
+                throw new NotSupportedException(
+                    $"PyNTT GatherReduceQKVRoPEWithCache {field} input must use compact per-owner storage.");
+            }
+
+            var address = ResolveByteAddressedBufferRef(input);
+            if (IsZeroOffset(address.PoolStrideBytes))
+            {
+                throw new NotSupportedException(
+                    $"PyNTT GatherReduceQKVRoPEWithCache {field} input requires distinct per-owner storage.");
+            }
+
+            return new PyNTTQKVPartialInputTemplateModel(
+                GetPooledByteAddressTemplateModel(address),
+                GetScalarElementSizeBytes(input.ElemType),
+                GetPyNTTScalarDTypeName(input.ElemType),
+                GetScalarTritonDType(input.ElemType),
+                GetBufferGlobalShape(input),
+                GetBufferActiveShape(input),
+                GetBufferStrides(input),
+                GetVectorLaneElementCount(input.ElemType),
+                GetVectorLanes(input.ElemType),
+                GetHierarchy(input),
+                GetShardAxes(inType),
+                partial.Axes.OrderBy(axis => axis).ToArray());
+        }
+
+        private void BuildQKVRoPEWithCache(
+            IReadOnlyList<BaseExpr> args,
+            TIR.Buffer q,
+            TIR.Buffer k,
+            TIR.Buffer v,
+            int qAxis,
+            float qEpsilon,
+            bool qUseMean,
+            int kAxis,
+            float kEpsilon,
+            bool kUseMean,
+            IRArray<AttentionDimKind> qkvLayout,
+            IRArray<AttentionDimKind> attentionLayout,
+            PyNTTQKVPartialInputTemplateModel? qPartial,
+            PyNTTQKVPartialInputTemplateModel? kPartial,
+            PyNTTQKVPartialInputTemplateModel? vPartial,
+            string opName)
+        {
             var qScale = GetBufferOperand(args[3], "PyNTT QKVRoPEWithCache Q scale");
             var kScale = GetBufferOperand(args[4], "PyNTT QKVRoPEWithCache K scale");
             var qBias = GetBufferOperand(args[5], "PyNTT QKVRoPEWithCache Q bias");
@@ -7844,24 +8315,25 @@ internal sealed class PyNTTKernelSourceConvertVisitor : ExprFunctor<Unit, Unit>
             var cos = GetBufferOperand(args[7], "PyNTT QKVRoPEWithCache cos");
             var sin = GetBufferOperand(args[8], "PyNTT QKVRoPEWithCache sin");
             var qOutput = GetBufferOperand(args[11], "PyNTT QKVRoPEWithCache Q output");
+            var qOutputAddress = ResolveByteAddressedBufferRef(qOutput);
             var helperName = GetNextHelperName("qkv_rope_with_cache");
             var qNorm = BuildQKVRoPENormTemplateModel(
                 $"{helperName}_q_norm",
                 q,
                 qScale,
                 qBias,
-                fused.QAxis,
-                fused.QEpsilon,
-                fused.QUseMean,
+                qAxis,
+                qEpsilon,
+                qUseMean,
                 "PyNTT QKVRoPEWithCache Q NormApply");
             var kNorm = BuildQKVRoPENormTemplateModel(
                 $"{helperName}_k_norm",
                 k,
                 kScale,
                 kBias,
-                fused.KAxis,
-                fused.KEpsilon,
-                fused.KUseMean,
+                kAxis,
+                kEpsilon,
+                kUseMean,
                 "PyNTT QKVRoPEWithCache K NormApply");
             var qRoPE = BuildRoPETemplateModel(
                 $"{helperName}_q_rope",
@@ -7879,14 +8351,14 @@ internal sealed class PyNTTKernelSourceConvertVisitor : ExprFunctor<Unit, Unit>
                 "PyNTT QKVRoPEWithCache K RoPE");
             var (kUpdate, kLeadingArguments) = BuildUpdatePagedAttentionKVCacheTemplateModel(
                 $"{helperName}_k_update",
-                new Nncase.TIR.NTT.UpdatePagedAttentionKVCache(AttentionCacheKind.Key, fused.QKVLayout),
+                new Nncase.TIR.NTT.UpdatePagedAttentionKVCache(AttentionCacheKind.Key, qkvLayout),
                 k,
                 args[9],
                 args[10],
                 "PyNTT QKVRoPEWithCache K update");
             var (vUpdate, vLeadingArguments) = BuildUpdatePagedAttentionKVCacheTemplateModel(
                 $"{helperName}_v_update",
-                new Nncase.TIR.NTT.UpdatePagedAttentionKVCache(AttentionCacheKind.Value, fused.QKVLayout),
+                new Nncase.TIR.NTT.UpdatePagedAttentionKVCache(AttentionCacheKind.Value, qkvLayout),
                 v,
                 args[9],
                 args[10],
@@ -7897,8 +8369,8 @@ internal sealed class PyNTTKernelSourceConvertVisitor : ExprFunctor<Unit, Unit>
                     "PyNTT QKVRoPEWithCache K/V updates resolved different kv-cache runtime arguments.");
             }
 
-            SetComputeOp("qkv_rope_with_cache");
-            _attrs["op"] = "qkv_rope_with_cache";
+            SetComputeOp(opName);
+            _attrs["op"] = opName;
             _attrs["dtype"] = GetPyNTTScalarDTypeName(qOutput.ElemType);
             _attrs["shape"] = GetLogicalVectorShape(
                 GetBufferShape(qOutput),
@@ -7913,14 +8385,18 @@ internal sealed class PyNTTKernelSourceConvertVisitor : ExprFunctor<Unit, Unit>
                 kUpdate,
                 vUpdate,
                 GetBufferScalarPointer(qOutput),
+                GetPooledByteAddressTemplateModel(qOutputAddress),
                 GetPyNTTScalarDTypeName(qOutput.ElemType),
                 GetScalarTritonDType(qOutput.ElemType),
                 GetBufferShape(qOutput),
                 GetBufferStrides(qOutput),
                 GetVectorLaneElementCount(qOutput.ElemType),
                 GetVectorLanes(qOutput.ElemType),
-                fused.QKVLayout.Select(axis => (int)axis).ToArray(),
-                fused.AttentionLayout.Select(axis => (int)axis).ToArray(),
+                qkvLayout.Select(axis => (int)axis).ToArray(),
+                attentionLayout.Select(axis => (int)axis).ToArray(),
+                qPartial,
+                kPartial,
+                vPartial,
                 $"{q.Name}, {k.Name}, {v.Name} -> {qOutput.Name}, kv-cache");
             WriteHelperTemplate("triton/kernels/QKVRoPEWithCache.py.jinja", templateModel);
             WriteLine(BuildHelperCall(helperName, kLeadingArguments));
@@ -8268,7 +8744,8 @@ internal sealed class PyNTTKernelSourceConvertVisitor : ExprFunctor<Unit, Unit>
 
         private void VisitPagedAttentionMerge(
             Nncase.TIR.NTT.PagedAttentionMerge pagedAttention,
-            IReadOnlyList<BaseExpr> args)
+            IReadOnlyList<BaseExpr> args,
+            Action<string, PyNTTPagedAttentionMergeTemplateModel>? emit = null)
         {
             if (args.Count < 4 ||
                 args[0] is not TIR.Buffer maxState ||
@@ -8349,9 +8826,7 @@ internal sealed class PyNTTKernelSourceConvertVisitor : ExprFunctor<Unit, Unit>
             _attrs["split_hierarchy_axis"] = pagedAttention.SplitHierarchyAxis;
             _attrs["split_count"] = pagedAttention.SplitCount;
             var helperName = GetNextHelperName("paged_attention_merge");
-            WriteHelperTemplate(
-                "triton/kernels/PagedAttentionMerge.py.jinja",
-                new PyNTTPagedAttentionMergeTemplateModel(
+            var templateModel = new PyNTTPagedAttentionMergeTemplateModel(
                     helperName,
                     GetBufferScalarPointer(maxState),
                     GetPooledByteAddressTemplateModel(maxStateRef),
@@ -8383,9 +8858,91 @@ internal sealed class PyNTTKernelSourceConvertVisitor : ExprFunctor<Unit, Unit>
                     pagedAttention.HiddenSize / headDimension,
                     pagedAttention.SplitHierarchyAxis,
                     pagedAttention.SplitCount,
-                    $"{maxState.Name}, {sumState.Name}, {accState.Name} -> {output.Name}"));
-            WriteLine(BuildHelperCall(helperName));
-            MarkStoredOutput(output, "PyNTT PagedAttentionMerge");
+                    $"{maxState.Name}, {sumState.Name}, {accState.Name} -> {output.Name}");
+            if (emit is null)
+            {
+                WriteHelperTemplate(
+                    "triton/kernels/PagedAttentionMerge.py.jinja",
+                    templateModel);
+                WriteLine(BuildHelperCall(helperName));
+                MarkStoredOutput(output, "PyNTT PagedAttentionMerge");
+            }
+            else
+            {
+                emit(helperName, templateModel);
+            }
+        }
+
+        private void VisitPagedAttentionMergePackedMatMul(
+            Nncase.TIR.NTT.PagedAttentionMergePackedMatMul fused,
+            IReadOnlyList<BaseExpr> args,
+            PyNTTMicroKernelTemplateModel microKernel)
+        {
+            if (args.Count < 10 ||
+                args[0] is not TIR.Buffer maxState ||
+                args[1] is not TIR.Buffer sumState ||
+                args[2] is not TIR.Buffer accState ||
+                args[3] is not TIR.Buffer mergeOutputLayout ||
+                args[4] is not TIR.Buffer mergedLhs ||
+                args[5] is not TIR.Buffer rhs ||
+                args[6] is not TIR.Buffer output)
+            {
+                throw new NotSupportedException(
+                    "PyNTT PagedAttentionMergePackedMatMul expects three partial states, " +
+                    "a metadata-only merged lhs view, rhs, and output buffers.");
+            }
+
+            if (microKernel.Family != "triton.paged_attention_merge_matmul" ||
+                microKernel.Variant != "simt_fma_smem_pipeline")
+            {
+                throw new NotSupportedException(
+                    $"PyNTT fused paged-attention merge currently requires the shared-staged " +
+                    $"SIMT GEMV microkernel, got {microKernel.Family}/{microKernel.Variant}.");
+            }
+
+            PyNTTPagedAttentionMergeTemplateModel? mergeModel = null;
+            VisitPagedAttentionMerge(
+                new Nncase.TIR.NTT.PagedAttentionMerge(
+                    fused.Layout,
+                    fused.HiddenSize,
+                    fused.SplitHierarchyAxis,
+                    fused.SplitCount),
+                new BaseExpr[] { maxState, sumState, accState, mergeOutputLayout },
+                (_, model) => mergeModel = model);
+
+            PyNTTMatmulTemplateModel? matmulModel = null;
+            string? helperName = null;
+            VisitPackedMatmul(
+                new Nncase.TIR.NTT.PackedMatMul(false, fused.RhsLayout),
+                new BaseExpr[] { mergedLhs, rhs, output, args[7], args[8], args[9] },
+                microKernel,
+                emit: (name, model) =>
+                {
+                    helperName = name;
+                    matmulModel = model;
+                });
+
+            if (mergeModel is null || matmulModel is null || helperName is null)
+            {
+                throw new InvalidOperationException(
+                    "PyNTT failed to construct fused paged-attention merge/GEMV template metadata.");
+            }
+
+            mergeModel = mergeModel with { FunctionName = helperName };
+            SetComputeOp("paged_attention_merge_packed_matmul");
+            _attrs["op"] = "paged_attention_merge_packed_matmul";
+            _attrs["hidden_size"] = fused.HiddenSize;
+            _attrs["split_hierarchy_axis"] = fused.SplitHierarchyAxis;
+            _attrs["split_count"] = fused.SplitCount;
+            WriteSelectedMicroKernelHelper(
+                microKernel,
+                new PyNTTPagedAttentionMergePackedMatMulTemplateModel(
+                    helperName,
+                    mergeModel,
+                    matmulModel,
+                    microKernel,
+                    $"{maxState.Name}, {sumState.Name}, {accState.Name}, {rhs.Name} -> {output.Name}"),
+                helperName);
         }
 
         private void VisitSoftmax(int axis, IRArray<int> vectorizedAxes, IReadOnlyList<BaseExpr> args, string opKind)
@@ -12991,6 +13548,9 @@ internal sealed class PyNTTKernelSourceConvertVisitor : ExprFunctor<Unit, Unit>
 
             public IReadOnlyList<string> ConsumerEndpointNames
                 => PipeStages.Select(stage => stage.ReaderName)
+                    .Concat(PipeStages
+                        .SelectMany(stage => stage.ConsumerSharedWorkspaces)
+                        .Select(workspace => workspace.VariableName))
                     .Concat(Handoffs.Select(handoff => handoff.WriterName))
                     .ToArray();
 
@@ -13086,6 +13646,12 @@ internal sealed class PyNTTKernelSourceConvertVisitor : ExprFunctor<Unit, Unit>
 
             public IReadOnlyList<PyNTTPipelineHandoffTemplateModel> Handoffs => _handoffs;
 
+            public IReadOnlyList<string> ConsumerSharedWorkspaceNames
+                => _pipeStages
+                    .SelectMany(stage => stage.ConsumerSharedWorkspaces)
+                    .Select(workspace => workspace.VariableName)
+                    .ToArray();
+
             public IReadOnlyList<string> ConsumerDrainEndpointNames => _consumerDrainEndpointNames;
 
             public IReadOnlyList<string> ProducerDrainEndpointNames => _producerDrainEndpointNames;
@@ -13114,6 +13680,7 @@ internal sealed class PyNTTKernelSourceConvertVisitor : ExprFunctor<Unit, Unit>
                 string template,
                 object model,
                 IReadOnlyList<PyNTTTransferPipelineChannelTemplateModel> channels,
+                IReadOnlyList<string> consumerSharedWorkspaceNames,
                 IReadOnlyDictionary<string, string> sharedWorkspaceOffsets)
             {
                 if (IsBound)
@@ -13129,7 +13696,16 @@ internal sealed class PyNTTKernelSourceConvertVisitor : ExprFunctor<Unit, Unit>
                         $"Transfer-pipelined helper {helperName} has no transfer channels.");
                 }
 
-                _pipeStages = channels.Select(channel =>
+                var consumerSharedWorkspaces = consumerSharedWorkspaceNames
+                    .Select(name => new PyNTTPipelineConsumerSharedWorkspaceTemplateModel(
+                        name,
+                        SanitizeBoundedPythonIdentifier($"{StageName}__consumer_{name}"),
+                        sharedWorkspaceOffsets.TryGetValue(name, out var offset)
+                            ? offset
+                            : throw new InvalidOperationException(
+                                $"Consumer workspace {name} for {helperName} references an unknown Shared workspace.")))
+                    .ToArray();
+                _pipeStages = channels.Select((channel, index) =>
                 {
                     var channelStageName = channels.Count == 1
                         ? StageName
@@ -13150,6 +13726,9 @@ internal sealed class PyNTTKernelSourceConvertVisitor : ExprFunctor<Unit, Unit>
                         template,
                         model,
                         channelOffsets,
+                        index == 0
+                            ? consumerSharedWorkspaces
+                            : Array.Empty<PyNTTPipelineConsumerSharedWorkspaceTemplateModel>(),
                         $"{channelStageName}__pipe",
                         $"{channelStageName}__reader",
                         $"{channelStageName}__writer");
@@ -13196,12 +13775,32 @@ internal sealed class PyNTTKernelSourceConvertVisitor : ExprFunctor<Unit, Unit>
                                 definition.SharedBaseOffsetParameter,
                                 actualSharedBaseOffset),
                             StringComparer.Ordinal),
+                        ConsumerSharedWorkspaces = formal.ConsumerSharedWorkspaces
+                            .Select(workspace => workspace with
+                            {
+                                VariableName = SanitizeBoundedPythonIdentifier(
+                                    $"{instanceName}__consumer_{workspace.Name}"),
+                                SharedWorkspaceOffset = SubstituteIdentifier(
+                                    workspace.SharedWorkspaceOffset,
+                                    definition.SharedBaseOffsetParameter,
+                                    actualSharedBaseOffset),
+                            })
+                            .ToArray(),
                         PipeName = $"{instanceName}__pipe",
                         ReaderName = $"{instanceName}__reader",
                         WriterName = $"{instanceName}__writer",
                     };
                     pipeStages.Add(instance);
                     consumerBindings.Add(formal.ReaderName, instance.ReaderName);
+                    foreach (var (formalWorkspace, actualWorkspace) in formal.ConsumerSharedWorkspaces.Zip(
+                                 instance.ConsumerSharedWorkspaces,
+                                 (formalWorkspace, actualWorkspace) => (formalWorkspace, actualWorkspace)))
+                    {
+                        consumerBindings.Add(
+                            formalWorkspace.VariableName,
+                            actualWorkspace.VariableName);
+                    }
+
                     producerBindings.Add(formal.WriterName, instance.WriterName);
                 }
 

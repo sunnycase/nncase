@@ -27,7 +27,10 @@ internal class NTTModule : IApplicationPart
         registrator.RegisterManyInterface<PackedNVFP4MatMulCandidateProvider>(reuse: Reuse.Singleton);
         registrator.RegisterManyInterface<PackedNVFP4MatMulGluCandidateProvider>(reuse: Reuse.Singleton);
         registrator.RegisterManyInterface<PackedMatMulNormStatsCandidateProvider>(reuse: Reuse.Singleton);
+        registrator.RegisterManyInterface<PackedMatMulNormStatsCombineCandidateProvider>(reuse: Reuse.Singleton);
         registrator.RegisterManyInterface<SamplingPartialCandidateProvider>(reuse: Reuse.Singleton);
         registrator.RegisterManyInterface<SamplingCombineCandidateProvider>(reuse: Reuse.Singleton);
+        registrator.RegisterManyInterface<PackedQKVParallelLinearCandidateProvider>(reuse: Reuse.Singleton);
+        registrator.RegisterManyInterface<PackedQKVParallelLinearCombineCandidateProvider>(reuse: Reuse.Singleton);
     }
 }

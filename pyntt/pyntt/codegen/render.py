@@ -891,6 +891,19 @@ def _pipeline_helper_descriptor_specs(
         )
     elif (
         template
+        == "triton/kernels/paged_attention_merge_matmul/simt_fma_smem_pipeline.py.jinja"
+    ):
+        matmul = model.get("Matmul")
+        if not isinstance(matmul, dict):
+            raise ValueError(
+                "PyNTT fused paged-attention merge/matmul is missing Matmul metadata."
+            )
+        descriptor_names = (matmul.get("RhsDescriptorName"),)
+        descriptor_specs = (
+            _paged_attention_merge_matmul_host_descriptor_spec,
+        )
+    elif (
+        template
         == "triton/kernels/matmul_sampling_partial/simt_fma_smem_pipeline.py.jinja"
     ):
         matmul = model.get("Matmul")
@@ -902,6 +915,7 @@ def _pipeline_helper_descriptor_specs(
         template in (
             "triton/kernels/qkv_parallel_linear/simt_fma_smem_pipeline.py.jinja",
             "triton/kernels/qkv_parallel_linear/simt_fp8_fma_smem_pipeline.py.jinja",
+            "triton/kernels/qkv_parallel_linear/mma_smem_pipeline.py.jinja",
         )
     ):
         descriptor_names = (model.get("WeightDescriptorName"),)
@@ -1764,6 +1778,29 @@ def _nvfp4_n_major_host_descriptor_spec(
     }
 
 
+def _paged_attention_merge_matmul_host_descriptor_spec(
+    model: dict[str, Any],
+    backing: dict[str, Any],
+) -> dict[str, Any]:
+    matmul = model.get("Matmul")
+    if not isinstance(matmul, dict):
+        raise ValueError(
+            "PyNTT fused paged-attention merge/matmul is missing Matmul metadata."
+        )
+    microkernel = _microkernel_context(
+        matmul,
+        "triton.paged_attention_merge_matmul",
+        "simt_fma_smem_pipeline",
+    )
+    return _k_major_gemv_host_descriptor_spec(
+        matmul,
+        backing,
+        block_n=microkernel["parameters"]["block_n"],
+        block_k=microkernel["parameters"]["block_k"],
+        pointer=matmul["Rhs"],
+    )
+
+
 def _packed_matmul_sampling_partial_host_descriptor_spec(
     model: dict[str, Any],
     backing: dict[str, Any],
@@ -1798,6 +1835,15 @@ def _packed_qkv_gemv_host_descriptor_spec(
         "triton.qkv_parallel_linear",
         str(model["MicroKernel"]["Variant"]),
     )
+    if microkernel["variant"] not in (
+        "simt_fma_smem_pipeline",
+        "simt_fp8_fma_smem_pipeline",
+        "mma_smem_pipeline",
+    ):
+        raise ValueError(
+            "PyNTT packed QKV host descriptor requires a shared-memory "
+            f"pipeline variant, got {microkernel['variant']!r}."
+        )
     return _k_major_gemv_host_descriptor_spec(
         model,
         backing,
@@ -1851,6 +1897,7 @@ def _packed_qkv_fixed_projection_ns(model: dict[str, Any]) -> dict[str, int]:
 def _packed_gemv_vector_lane_shape(variant: str) -> tuple[int, int, int]:
     shapes = {
         "simt_fma_smem_pipeline": (8, 2, 8),
+        "mma_smem_pipeline": (8, 2, 8),
         "simt_fp8_fma_smem_pipeline": (8, 2, 16),
         "simt_block_fp8_fma_smem_pipeline": (8, 2, 16),
     }
@@ -2096,7 +2143,7 @@ def _render_kernel(
     helper_sources = _render_helper_sources(
         env,
         kernel.get("helpers", ()),
-        noinline=True,
+        noinline=False,
         num_warps=num_warps,
         target_worker_width=target_worker_width,
         producer_warps=backend_config["producer_warps"],
@@ -2175,7 +2222,7 @@ def _render_device_function(
     helper_sources = _render_helper_sources(
         env,
         device_function.get("helpers", ()),
-        noinline=True,
+        noinline=False,
         num_warps=num_warps,
         target_worker_width=target_worker_width,
         producer_warps=producer_warps,
@@ -2190,6 +2237,14 @@ def _render_device_function(
     device_parameters = tuple(device_function["direct_parameters"]) + tuple(
         device_function["direct_extra_parameter_declarations"]
     )
+    dynamic_device_parameters = tuple(
+        name
+        for declaration, name in zip(
+            device_parameters,
+            _parameter_call_arguments(device_parameters),
+        )
+        if ": tl.constexpr" not in declaration
+    )
     body_source = _replace_device_function_calls(
         device_function["body_source"],
         device_functions_by_name,
@@ -2199,7 +2254,7 @@ def _render_device_function(
         .render(
             name=device_function["name"],
             parameters=", ".join(device_parameters),
-            do_not_specialize="",
+            do_not_specialize=repr(dynamic_device_parameters),
             body_source=body_source.rstrip(),
             mesh_axes=mesh_axes,
             shared_allocation_bytes=0,
@@ -2531,6 +2586,7 @@ def _make_env() -> Environment:
         gated_delta_net_recurrent_core_context=(
             _gated_delta_net_recurrent_core_template_context
         ),
+        gather_reduce_add_norm_context=_gather_reduce_add_norm_template_context,
         helper_argument_names=_helper_argument_names,
         helper_parameters=_helper_parameters,
         is_bool_dtype=_is_bool_dtype,
@@ -2557,6 +2613,9 @@ def _make_env() -> Environment:
         norm_stats_context=_norm_stats_template_context,
         paged_attention_context=_paged_attention_template_context,
         paged_attention_merge_context=_paged_attention_merge_template_context,
+        paged_attention_merge_matmul_context=(
+            _paged_attention_merge_matmul_template_context
+        ),
         paged_attention_partial_context=_paged_attention_partial_template_context,
         packed_gemv_pipeline_context=_packed_gemv_pipeline_template_context,
         packed_fp8_gemv_pipeline_context=(
@@ -2576,6 +2635,7 @@ def _make_env() -> Environment:
             _packed_fp8_qkv_gemv_pipeline_template_context
         ),
         pointer_local_to_global_coordinate=_pointer_local_to_global_coordinate,
+        packed_qkv_mma_pipeline_context=_packed_qkv_mma_pipeline_template_context,
         product=_product,
         qkv_rope_with_cache_context=_qkv_rope_with_cache_template_context,
         qkv_parallel_linear_context=_qkv_parallel_linear_template_context,
@@ -5469,13 +5529,39 @@ def _microkernel_context(
             )
             for axis, dimension in enumerate(dimensions)
         )
+    has_complete_consumer_lhs_stage = "lhs_stage_extent" in parameters
+    if has_complete_consumer_lhs_stage and not (
+        family in ("triton.matmul", "triton.matmul_glu")
+        and variant == "simt_fma_smem_pipeline"
+    ):
+        raise ValueError(
+            "microkernel.Parameters['lhs_stage_extent'] is only valid for "
+            "triton.matmul or triton.matmul_glu with "
+            "simt_fma_smem_pipeline."
+        )
     required_offsets = required_workspace_names
     if required_offsets is None:
         required_offsets = {
             "simt_fma": (),
-            "simt_fma_smem_pipeline": ("rhs_stage",),
-            "simt_fp8_fma_smem_pipeline": ("rhs_stage",),
-            "simt_block_fp8_fma_smem_pipeline": ("rhs_stage",),
+            "simt_fma_smem_pipeline": (
+                ("lhs_stage", "rhs_stage")
+                if family == "triton.qkv_parallel_linear"
+                or has_complete_consumer_lhs_stage
+                else ("rhs_stage",)
+            ),
+            "simt_fp8_fma_smem_pipeline": (
+                ("lhs_stage", "rhs_stage")
+                if family == "triton.qkv_parallel_linear"
+                or has_complete_consumer_lhs_stage
+                else ("rhs_stage",)
+            ),
+            "simt_block_fp8_fma_smem_pipeline": (
+                ("lhs_stage", "rhs_stage")
+                if family == "triton.qkv_parallel_linear"
+                or has_complete_consumer_lhs_stage
+                else ("rhs_stage",)
+            ),
+            "mma_smem_pipeline": ("lhs_stage", "rhs_stage"),
             "mma_block_fp8_smem_pipeline": (
                 "rhs_stage",
                 "lhs_quantized",
@@ -5503,12 +5589,48 @@ def _microkernel_context(
             f"actual={sorted(shapes)}."
         )
 
+    raw_consumer_workspaces = microkernel.get("ConsumerSharedWorkspaceNames")
+    if not isinstance(raw_consumer_workspaces, list) or any(
+        not isinstance(name, str) or not name
+        for name in raw_consumer_workspaces
+    ):
+        raise ValueError(
+            "microkernel.ConsumerSharedWorkspaceNames must be an array of "
+            "non-empty strings."
+        )
+    consumer_workspaces = tuple(raw_consumer_workspaces)
+    if len(set(consumer_workspaces)) != len(consumer_workspaces):
+        raise ValueError(
+            "microkernel.ConsumerSharedWorkspaceNames must be unique."
+        )
+    expected_consumer_workspaces = (
+        ("lhs_stage",)
+        if (
+            variant == "mma_smem_pipeline"
+            or (
+                variant == "simt_fma_smem_pipeline"
+                and (
+                    family == "triton.qkv_parallel_linear"
+                    or has_complete_consumer_lhs_stage
+                )
+            )
+        )
+        else ()
+    )
+    if consumer_workspaces != expected_consumer_workspaces:
+        raise ValueError(
+            "microkernel.ConsumerSharedWorkspaceNames does not match the "
+            f"selected algorithm: expected={list(expected_consumer_workspaces)}, "
+            f"actual={list(consumer_workspaces)}."
+        )
+
     return {
         "family": family,
         "variant": variant,
         "parameters": parameters,
         "shared_workspace_offsets": offsets,
         "shared_workspace_shapes": shapes,
+        "consumer_shared_workspace_names": consumer_workspaces,
     }
 
 
@@ -6786,6 +6908,22 @@ def _is_positive_power_of_two(value: int) -> bool:
     return value > 0 and value & (value - 1) == 0
 
 
+def _power_of_two_segments(value: int) -> tuple[tuple[int, int], ...]:
+    """Partition a positive extent into aligned descending power-of-two spans."""
+
+    if value <= 0:
+        raise ValueError(f"PyNTT segment extent must be positive, got {value}.")
+    segments: list[tuple[int, int]] = []
+    offset = 0
+    remaining = value
+    while remaining:
+        extent = 1 << (remaining.bit_length() - 1)
+        segments.append((offset, extent))
+        offset += extent
+        remaining -= extent
+    return tuple(segments)
+
+
 def _matmul_template_context(
     model: dict[str, Any],
     *,
@@ -7528,6 +7666,36 @@ def _sparse_experts_down_pipeline_template_context(
     }
 
 
+def _packed_gemv_rhs_physical_view(
+    model: dict[str, Any],
+) -> tuple[tuple[int, ...], tuple[int, ...]]:
+    """Return the fixed backing view addressed by a packed GEMV descriptor."""
+
+    rhs_pointer = model.get("Rhs")
+    if not isinstance(rhs_pointer, dict):
+        raise ValueError("PyNTT packed GEMV requires RHS pointer metadata.")
+    if rhs_pointer.get("DistributedStorageKind") == "CanonicalGlobal":
+        rhs_shape = rhs_pointer.get("GlobalShape")
+        rhs_strides = rhs_pointer.get("Strides")
+    else:
+        rhs_shape = model["RhsShape"]
+        rhs_strides = model["RhsStrides"]
+    if not isinstance(rhs_shape, list) or not isinstance(rhs_strides, list):
+        raise ValueError(
+            "PyNTT packed GEMV RHS physical shape/stride metadata is incomplete."
+        )
+    fixed_shape = tuple(_fixed(value) for value in rhs_shape)
+    fixed_strides = tuple(_fixed(value) for value in rhs_strides)
+    if any(value is None for value in fixed_shape + fixed_strides):
+        raise ValueError(
+            "PyNTT packed GEMV TMA requires fixed physical RHS shape and strides."
+        )
+    return (
+        tuple(int(value) for value in fixed_shape),
+        tuple(int(value) for value in fixed_strides),
+    )
+
+
 def _packed_gemv_pipeline_template_context(
     model: dict[str, Any],
     *,
@@ -7630,16 +7798,50 @@ def _packed_gemv_pipeline_template_context(
             "PyNTT packed GEMV pipeline requires equal fixed lhs/rhs K "
             f"dimensions, got lhs K={k} and rhs K={rhs_k}."
         )
-    rhs_physical_shape = tuple(_fixed(value) for value in model["RhsShape"])
-    rhs_physical_strides = tuple(_fixed(value) for value in model["RhsStrides"])
-    if any(value is None for value in rhs_physical_shape + rhs_physical_strides):
-        raise ValueError(
-            "PyNTT packed GEMV TMA requires fixed physical RHS shape and strides."
-        )
+    rhs_physical_shape, rhs_physical_strides = _packed_gemv_rhs_physical_view(model)
     normalized_rhs_strides = _normalize_singleton_strides(
-        tuple(int(value) for value in rhs_physical_shape),
-        tuple(int(value) for value in rhs_physical_strides),
+        rhs_physical_shape,
+        rhs_physical_strides,
     )
+    lhs_stage_extent = context["microkernel"]["parameters"].get(
+        "lhs_stage_extent"
+    )
+    use_complete_consumer_lhs_stage = lhs_stage_extent is not None
+    lhs_copy_segments: tuple[dict[str, Any], ...] = ()
+    if use_complete_consumer_lhs_stage:
+        if (
+            _fixed(model["LhsStrides"][-1]) != 1
+            or not _is_positive_power_of_two(lhs_stage_extent)
+            or lhs_stage_extent < k
+            or k < 4096
+            or k % 1024 != 0
+        ):
+            raise ValueError(
+                "PyNTT complete consumer LHS staging requires a contiguous "
+                "fixed K >= 4096 divisible by 1024 and a power-of-two Shared "
+                f"extent covering K; got K={k}, lhs_stage_extent="
+                f"{lhs_stage_extent}, lhs_stride={_fixed(model['LhsStrides'][-1])}."
+            )
+        raw_segments = _power_of_two_segments(k)
+        if any(extent < 1024 for _, extent in raw_segments):
+            raise ValueError(
+                "PyNTT complete consumer LHS staging requires every copy "
+                f"segment to cover at least 1024 elements, got {raw_segments}."
+            )
+        lhs_copy_segments = tuple(
+            {
+                "offset": offset,
+                "extent": extent,
+                "access": _matmul_lhs_access(
+                    model,
+                    output_batch_rank=0,
+                    m_expr="0",
+                    k_expr="pipeline_input_copy_k",
+                    coordinate_shape=_coordinate_shape((1, extent)),
+                ),
+            }
+            for offset, extent in raw_segments
+        )
     if (
         rhs_physical_shape[-2] != k // k_atom
         or normalized_rhs_strides[-1] != 1
@@ -7676,7 +7878,7 @@ def _packed_gemv_pipeline_template_context(
         )
     packed_k_outer = block_k // k_atom
     packed_n_outer = block_n // n_lane
-    rhs_pointer = model.get("Rhs")
+    rhs_pointer = model["Rhs"]
     rhs_k_transfer = _tma_local_axis_transfer(
         rhs_pointer,
         -2,
@@ -7748,6 +7950,10 @@ def _packed_gemv_pipeline_template_context(
         "packed_n_outer": packed_n_outer,
         "reduction_group": reduction_group,
         "reduction_groups_per_stage": block_k // reduction_group,
+        "outline_consumer_stage": _should_outline_packed_gemv_consumer_stage(
+            block_k=block_k,
+            reduction_group=reduction_group,
+        ),
         "shared_stage_shape": tma_block_shape,
         "tma_block_shape": tma_block_shape,
         "tma_contiguous_extent": tma_contiguous_extent,
@@ -7769,6 +7975,13 @@ def _packed_gemv_pipeline_template_context(
         "consumer_output_layout_name": (
             f"{model['FunctionName']}__output_layout"
         ),
+        "use_complete_consumer_lhs_stage": use_complete_consumer_lhs_stage,
+        "lhs_stage_extent": lhs_stage_extent,
+        "lhs_copy_segments": lhs_copy_segments,
+        "consumer_input_copy_layout_name": (
+            f"{model['FunctionName']}__input_copy_layout"
+        ),
+        "input_copy_size_per_thread": 4,
         "pipeline_lhs_access": _matmul_lhs_access(
             model,
             output_batch_rank=0,
@@ -7815,6 +8028,99 @@ def _packed_gemv_pipeline_template_context(
         ),
     }
     context.update(pipeline_context)
+    return context
+
+
+def _paged_attention_merge_matmul_template_context(
+    model: dict[str, Any],
+) -> dict[str, Any]:
+    """Prepare direct PagedAttentionMerge-to-packed-GEMV coordinates."""
+
+    matmul = model.get("Matmul")
+    merge = model.get("Merge")
+    if not isinstance(matmul, dict) or not isinstance(merge, dict):
+        raise ValueError(
+            "PyNTT fused paged-attention merge/matmul requires Merge and Matmul metadata."
+        )
+    matmul = dict(matmul)
+    for name in (
+        "KernelConfig",
+        "MeshAxes",
+        "NoInline",
+        "NumWarps",
+        "ProducerRegisters",
+        "ProducerWarps",
+        "RegisterGranularity",
+        "RegistersPerThreadLimit",
+        "TargetWorkerWidth",
+    ):
+        if name in model:
+            matmul[name] = model[name]
+    context = _packed_gemv_pipeline_template_context(
+        matmul,
+        expected_family="triton.paged_attention_merge_matmul",
+    )
+    merge_context = _paged_attention_merge_template_context(merge)
+    local_query_tokens = _fixed(merge_context["local_query_tokens"])
+    local_q_heads = _fixed(merge_context["local_q_heads"])
+    local_head_dimension = int(merge_context["local_head_dimension"])
+    lhs_k = _fixed(context["k"])
+    if local_query_tokens != 1 or local_q_heads != 1:
+        raise ValueError(
+            "PyNTT fused paged-attention merge/matmul currently requires one "
+            f"local query and head, got query={local_query_tokens}, heads={local_q_heads}."
+        )
+    if lhs_k != local_head_dimension:
+        raise ValueError(
+            "PyNTT fused paged-attention merge/matmul requires the merged head "
+            f"dimension to equal GEMV K, got head_dim={local_head_dimension}, K={lhs_k}."
+        )
+    if context["num_k_tiles"] != 1:
+        raise ValueError(
+            "PyNTT fused paged-attention merge/matmul requires one K tile so the "
+            "merged register value is consumed exactly once per output tile."
+        )
+    reduction_groups = int(context["reduction_groups_per_stage"])
+    if not _is_positive_power_of_two(reduction_groups):
+        raise ValueError(
+            "PyNTT fused paged-attention merge/matmul requires a power-of-two "
+            f"number of 32-element K groups, got {reduction_groups}."
+        )
+
+    split_steps: list[dict[str, Any]] = []
+    group_variables: list[str | None] = [None] * reduction_groups
+    pending = [("merged_lhs_groups", tuple(range(reduction_groups)))]
+    split_id = 0
+    while pending:
+        source, group_indices = pending.pop(0)
+        if len(group_indices) == 1:
+            group_variables[group_indices[0]] = source
+            continue
+        even = f"merged_lhs_split_{split_id}_even"
+        odd = f"merged_lhs_split_{split_id}_odd"
+        split_steps.append(
+            {
+                "source": source,
+                "even": even,
+                "odd": odd,
+                "reshape_extent": len(group_indices) // 2,
+                "needs_reshape": len(group_indices) > 2,
+            }
+        )
+        pending.append((even, group_indices[::2]))
+        pending.append((odd, group_indices[1::2]))
+        split_id += 1
+    if any(variable is None for variable in group_variables):
+        raise AssertionError("incomplete fused GEMV register split plan")
+
+    context.update(
+        matmul=matmul,
+        merge=merge,
+        merge_context=merge_context,
+        merged_lhs_group_variables=tuple(group_variables),
+        merged_lhs_split_steps=tuple(split_steps),
+        reduction_group_indices=tuple(range(reduction_groups)),
+    )
     return context
 
 
@@ -8258,16 +8564,21 @@ def _packed_qkv_gemv_pipeline_template_context(
         raise ValueError(
             "PyNTT packed QKV GEMV pipeline requires rank-2 operands."
         )
+    if _fixed(model["InputStrides"][-1]) != 1:
+        raise ValueError(
+            "PyNTT packed QKV GEMV consumer cp.async requires a contiguous K axis."
+        )
 
     block_n = microkernel["parameters"]["block_n"]
     block_k = microkernel["parameters"]["block_k"]
     num_stages = microkernel["parameters"]["num_stages"]
-    _validate_packed_gemv_pipeline_resource_contract(
-        algorithm="packed QKV GEMV pipeline",
-        block_n=block_n,
-        block_k=block_k,
-        num_stages=num_stages,
-    )
+    if expected_variant == "simt_fma_smem_pipeline":
+        _validate_packed_gemv_pipeline_resource_contract(
+            algorithm="packed QKV GEMV pipeline",
+            block_n=block_n,
+            block_k=block_k,
+            num_stages=num_stages,
+        )
 
     n_lane = int(model["NVectorLaneCount"])
     k_pack = int(model["KPackLaneCount"])
@@ -8443,6 +8754,11 @@ def _packed_qkv_gemv_pipeline_template_context(
         consumer_warps=int(model["NumWarps"]),
         target_worker_width=int(model["TargetWorkerWidth"]),
     )
+    input_copy_threads = int(model["NumWarps"]) * int(model["TargetWorkerWidth"])
+    input_copy_size_per_thread = max(
+        1,
+        (block_k + input_copy_threads - 1) // input_copy_threads,
+    )
     return {
         "microkernel": microkernel,
         "block_n": block_n,
@@ -8473,14 +8789,95 @@ def _packed_qkv_gemv_pipeline_template_context(
         "consumer_weight_layout_name": f"{model['FunctionName']}__weight_layout",
         "consumer_lhs_layout_name": f"{model['FunctionName']}__lhs_layout",
         "consumer_output_layout_name": f"{model['FunctionName']}__output_layout",
-        "pipeline_input_access": _qkv_input_access(
+        "consumer_input_copy_layout_name": (
+            f"{model['FunctionName']}__input_copy_layout"
+        ),
+        "input_copy_size_per_thread": input_copy_size_per_thread,
+        "pipeline_input_copy_access": _qkv_input_access(
             model,
             output_batch_rank=0,
             m_expr="0",
-            k_expr="pipeline_offs_k",
-            coordinate_shape=_coordinate_shape((reduction_group,)),
+            k_expr="pipeline_input_copy_k",
+            coordinate_shape=_coordinate_shape((1, block_k)),
         ),
     }
+
+
+def _packed_qkv_mma_pipeline_template_context(
+    model: dict[str, Any],
+) -> dict[str, Any]:
+    """Prepare a selected BF16 QKV tensor-core pipeline."""
+
+    context = _packed_qkv_gemv_pipeline_template_context(
+        model,
+        expected_variant="mma_smem_pipeline",
+    )
+    if any(bool(model[f"Has{prefix}Bias"]) for prefix in ("Q", "K", "V")):
+        raise ValueError(
+            "PyNTT packed QKV MMA pipeline does not support bias."
+        )
+    profile = (
+        context["block_n"],
+        context["block_k"],
+        context["num_stages"],
+        _fixed(context["k"]),
+        context["num_n_tiles"],
+        context["num_k_tiles"],
+    )
+    supported_profiles = {
+        (256, 64, 2, 256, 1, 4),
+        (32, 1024, 2, 2048, 1, 2),
+    }
+    if (
+        profile not in supported_profiles
+        or int(model["NumWarps"]) != 8
+        or int(model["TargetWorkerWidth"]) != 32
+    ):
+        raise ValueError(
+            "PyNTT packed QKV MMA pipeline requires a selected local profile "
+            "of (N=256, K=256, block_k=64, stages=2) or "
+            "(N=32, K=2048, block_k=1024, stages=2), with eight consumer "
+            "warps and 32 threads per warp."
+        )
+    k = _fixed(context["k"])
+    assert k is not None
+    expected_workspaces = {
+        "rhs_stage": (
+            context["num_stages"],
+            (context["block_k"] // 16) * (context["block_n"] // 8),
+            128,
+        ),
+        "lhs_stage": (1, k),
+    }
+    if context["microkernel"]["shared_workspace_shapes"] != expected_workspaces:
+        raise ValueError(
+            "PyNTT packed QKV MMA workspace contract mismatch: "
+            f"expected={expected_workspaces}, "
+            f"actual={context['microkernel']['shared_workspace_shapes']}."
+        )
+
+    function_name = model["FunctionName"]
+    context.update(
+        {
+            "mma_layout_name": f"{function_name}__mma_layout",
+            "mma_a_layout_name": f"{function_name}__mma_a_layout",
+            "mma_b_layout_name": f"{function_name}__mma_b_layout",
+            "mma_b_k_layout_name": f"{function_name}__mma_b_k_layout",
+            "mma_c_m_layout_name": f"{function_name}__mma_c_m_layout",
+            "mma_c_n_layout_name": f"{function_name}__mma_c_n_layout",
+            "mma_input_copy_layout_name": (
+                f"{function_name}__mma_input_copy_layout"
+            ),
+            "complete_input_copy_access": _qkv_input_access(
+                model,
+                output_batch_rank=0,
+                m_expr="0",
+                k_expr="pipeline_input_copy_k",
+                coordinate_shape=_coordinate_shape((1, k)),
+            ),
+        }
+    )
+    return context
 
 
 def _packed_fp8_qkv_gemv_pipeline_template_context(
@@ -8581,6 +8978,44 @@ def _packed_matmul_glu_gemv_pipeline_template_context(
         raise ValueError(
             "PyNTT packed MatMulGlu GEMV pipeline requires a fixed positive K "
             f"divisible by block_k={block_k}, got K={k}."
+        )
+    lhs_stage_extent = microkernel["parameters"].get("lhs_stage_extent")
+    use_complete_consumer_lhs_stage = lhs_stage_extent is not None
+    lhs_copy_segments: tuple[dict[str, Any], ...] = ()
+    if use_complete_consumer_lhs_stage:
+        if (
+            _fixed(model["InputStrides"][-1]) != 1
+            or not _is_positive_power_of_two(lhs_stage_extent)
+            or lhs_stage_extent < k
+            or k % 1024 != 0
+        ):
+            raise ValueError(
+                "PyNTT packed MatMulGlu complete consumer LHS staging requires "
+                "a contiguous fixed K divisible by 1024 and a power-of-two "
+                f"Shared extent covering K; got K={k}, lhs_stage_extent="
+                f"{lhs_stage_extent}, input_stride="
+                f"{_fixed(model['InputStrides'][-1])}."
+            )
+        raw_segments = _power_of_two_segments(k)
+        if any(extent < 1024 for _, extent in raw_segments):
+            raise ValueError(
+                "PyNTT packed MatMulGlu complete consumer LHS staging requires "
+                "every copy segment to cover at least 1024 elements, got "
+                f"{raw_segments}."
+            )
+        lhs_copy_segments = tuple(
+            {
+                "offset": offset,
+                "extent": extent,
+                "access": _matmul_glu_input_access(
+                    model,
+                    output_batch_rank=0,
+                    m_expr="0",
+                    k_expr="pipeline_input_copy_k",
+                    coordinate_shape=_coordinate_shape((1, extent)),
+                ),
+            }
+            for offset, extent in raw_segments
         )
     packed_k_outer = block_k // k_atom
     packed_n_outer = block_n // n_lane
@@ -8724,10 +9159,35 @@ def _packed_matmul_glu_gemv_pipeline_template_context(
     if tma_block_shape is None or shared_k_plan is None or shared_n_plan is None:
         raise ValueError("PyNTT packed MatMulGlu GEMV requires weight projections.")
 
+    logical_num_stages = num_stages // projection_count
+    if _product_int(list(tma_block_shape)) != block_n * block_k:
+        raise ValueError(
+            "PyNTT packed MatMulGlu GEMV staged RHS shape does not match its "
+            f"logical tile: shape={tma_block_shape}, block_n={block_n}, "
+            f"block_k={block_k}."
+        )
+    actual_rhs_workspace_shape = microkernel["shared_workspace_shapes"].get(
+        "rhs_stage"
+    )
+    expected_rhs_workspace_elements = num_stages * block_n * block_k
+    if (
+        actual_rhs_workspace_shape is None
+        or _product_int(list(actual_rhs_workspace_shape))
+        != expected_rhs_workspace_elements
+    ):
+        raise ValueError(
+            "PyNTT packed MatMulGlu GEMV RHS workspace capacity mismatch: "
+            f"expected_elements={expected_rhs_workspace_elements}, "
+            f"actual_shape={actual_rhs_workspace_shape}."
+        )
+    projection_shared_bytes = logical_num_stages * block_n * block_k * 2
+
     context.update(
         block_n=block_n,
         block_k=block_k,
         num_stages=num_stages,
+        logical_num_stages=logical_num_stages,
+        projection_shared_bytes=projection_shared_bytes,
         num_k_tiles=num_k_tiles,
         num_n_tiles=num_n_tiles,
         runtime_num_n_tiles=f"tl.cdiv(active_n, {block_n})",
@@ -8763,6 +9223,13 @@ def _packed_matmul_glu_gemv_pipeline_template_context(
         consumer_weight_layout_name=f"{model['FunctionName']}__weight_layout",
         consumer_lhs_layout_name=f"{model['FunctionName']}__lhs_layout",
         consumer_output_layout_name=f"{model['FunctionName']}__output_layout",
+        use_complete_consumer_lhs_stage=use_complete_consumer_lhs_stage,
+        lhs_stage_extent=lhs_stage_extent,
+        lhs_copy_segments=lhs_copy_segments,
+        consumer_input_copy_layout_name=(
+            f"{model['FunctionName']}__input_copy_layout"
+        ),
+        input_copy_size_per_thread=4,
         pipeline_input_access=_matmul_glu_input_access(
             model,
             output_batch_rank=0,
@@ -9186,6 +9653,21 @@ def _is_contiguous_reduction_suffix(
     return True
 
 
+def _has_block_cyclic_reduction_sharding(
+    pointer: Any, axis: int
+) -> bool:
+    if not isinstance(pointer, dict):
+        return False
+    shard_axes = pointer.get("ShardAxes")
+    if not isinstance(shard_axes, list):
+        return False
+    return any(
+        stage.get("Distribution") == "BlockCyclic"
+        for axis_mapping in shard_axes[axis:]
+        for stage in _shard_axis_stages(axis_mapping)
+    )
+
+
 def _norm_stats_template_context(model: dict[str, Any]) -> dict[str, Any]:
     rank = len(model["InputShape"])
     axis = int(model["Axis"])
@@ -9218,7 +9700,7 @@ def _norm_stats_template_context(model: dict[str, Any]) -> dict[str, Any]:
         model["InputShape"],
         model["InputStrides"],
         axis,
-    )
+    ) and not _has_block_cyclic_reduction_sharding(model.get("Input"), axis)
     flat_base_coordinates = tuple(
         f"outer_idx{index}" if index < axis else "0" for index in range(rank)
     )
@@ -9399,6 +9881,51 @@ def _gather_reduce_norm_apply_template_context(
         "zero": zero,
     }
     return context
+
+
+def _gather_reduce_add_norm_template_context(
+    model: dict[str, Any],
+) -> dict[str, Any]:
+    """Prepare a fused partial materialization, residual add, and normalization."""
+
+    reshard = _reshard_template_context(model["Reshard"])
+    stats = _norm_stats_template_context(model["NormStats"])
+    if reshard["partial"] is None:
+        raise ValueError("PyNTT GatherReduceAddNorm requires a partial input")
+    if not stats["flat_reduction"]:
+        raise ValueError(
+            "PyNTT GatherReduceAddNorm currently requires a contiguous normalization suffix"
+        )
+    axis = int(model["NormStats"]["Axis"])
+    if any(_fixed(dim) != 1 for dim in model["NormStats"]["InputShape"][:axis]):
+        raise ValueError(
+            "PyNTT GatherReduceAddNorm grid-cooperative statistics require "
+            "singleton dimensions before the normalization axis"
+        )
+    normalization_split_mesh_axes: set[int] = set()
+    for tensor_axis, shard_axis in enumerate(model["Reshard"]["InputShardAxes"]):
+        mesh_axes = set(_shard_axis_hierarchy_axes(shard_axis))
+        if tensor_axis < axis and mesh_axes:
+            raise ValueError(
+                "PyNTT GatherReduceAddNorm cannot form grid-cooperative statistics "
+                "when an outer tensor axis is split"
+            )
+        if tensor_axis >= axis:
+            normalization_split_mesh_axes.update(mesh_axes)
+    input_split_mesh_axes = set(reshard["input_split_mesh_axes"])
+    if normalization_split_mesh_axes != input_split_mesh_axes:
+        raise ValueError(
+            "PyNTT GatherReduceAddNorm requires every input split mesh axis to "
+            "partition the normalized suffix"
+        )
+
+    norm_model = model.get("NormApply")
+    norm = None if norm_model is None else _norm_apply_template_context(norm_model)
+    return {
+        "reshard": reshard,
+        "stats": stats,
+        "norm": norm,
+    }
 
 
 def _rope_template_context(model: dict[str, Any]) -> dict[str, Any]:
@@ -9844,7 +10371,515 @@ def _qkv_rope_with_cache_template_context(
         )
     )
     k_context["cache"] = k_cache_context
-    return {"q": q_context, "k": k_context, "v": v_cache_context}
+    partials = (model.get("QPartial"), model.get("KPartial"), model.get("VPartial"))
+    headwise_partial = False
+    if any(partial is not None for partial in partials):
+        if any(partial is None for partial in partials):
+            raise ValueError(
+                "PyNTT fused QKV gather-reduce requires Q, K, and V partial metadata"
+            )
+        q_partial, k_partial, v_partial = partials
+        q_context["partial_input"] = _qkv_partial_input_context(
+            q_partial,
+            model["QNorm"]["Input"],
+            q_context["input_access"],
+            1 + len(q_context["lane_shape"]),
+            qkv_layout,
+            "Q",
+        )
+        q_context["paired_partial_input"] = _qkv_partial_input_context(
+            q_partial,
+            model["QNorm"]["Input"],
+            q_context["paired_input_access"],
+            1 + len(q_context["lane_shape"]),
+            qkv_layout,
+            "Q paired",
+        )
+        q_context["reduction_context"]["partial_input"] = (
+            _qkv_partial_input_context(
+                q_partial,
+                model["QNorm"]["Input"],
+                q_context["reduction_context"]["input_access"],
+                1 + len(q_context["reduction_context"]["lane_shape"]),
+                qkv_layout,
+                "Q reduction",
+            )
+        )
+        k_context["partial_input"] = _qkv_partial_input_context(
+            k_partial,
+            model["KNorm"]["Input"],
+            k_context["input_access"],
+            1 + len(k_context["lane_shape"]),
+            qkv_layout,
+            "K",
+        )
+        k_context["paired_partial_input"] = _qkv_partial_input_context(
+            k_partial,
+            model["KNorm"]["Input"],
+            k_context["paired_input_access"],
+            1 + len(k_context["lane_shape"]),
+            qkv_layout,
+            "K paired",
+        )
+        k_context["reduction_context"]["partial_input"] = (
+            _qkv_partial_input_context(
+                k_partial,
+                model["KNorm"]["Input"],
+                k_context["reduction_context"]["input_access"],
+                1 + len(k_context["reduction_context"]["lane_shape"]),
+                qkv_layout,
+                "K reduction",
+            )
+        )
+        v_cache_context["partial_input"] = _qkv_partial_input_context(
+            v_partial,
+            model["VUpdate"]["Slots"],
+            v_cache_context["slots_access"],
+            1 + len(v_cache_context["lane_shape"]),
+            qkv_layout,
+            "V",
+        )
+        headwise_partial = _configure_qkv_partial_headwise_context(
+            model, q_context, k_context, v_cache_context
+        )
+        if not headwise_partial:
+            # The generic schedule writes only the current owner's Q buffer.
+            # Every replicated owner must therefore execute it; the headwise
+            # schedule instead computes Q once and explicitly fans the result
+            # out to all destination pools.
+            q_context["partial_input"]["active"] = "True"
+    return {
+        "q": q_context,
+        "k": k_context,
+        "v": v_cache_context,
+        "headwise_partial": headwise_partial,
+    }
+
+
+def _qkv_partial_input_context(
+    partial: dict[str, Any],
+    target: dict[str, Any],
+    target_access: dict[str, Any],
+    target_tile_rank: int,
+    qkv_layout: tuple[int, ...],
+    field: str,
+) -> dict[str, Any]:
+    """Map one logical Q/K/V access to compact per-owner partial storage."""
+
+    if len(qkv_layout) != 3 or len(target_access["TensorIndices"]) != 3:
+        raise ValueError(f"PyNTT fused {field} partial input requires rank-3 QKV")
+    if len(partial["GlobalShape"]) != 2 or len(partial["Strides"]) != 2:
+        raise ValueError(
+            f"PyNTT fused {field} partial projection must be a packed rank-2 tensor"
+        )
+    hierarchy = [int(extent) for extent in partial["Hierarchy"]]
+    if target.get("Hierarchy") != partial["Hierarchy"]:
+        raise ValueError(
+            f"PyNTT fused {field} partial and logical views must use one hierarchy"
+        )
+    partial_axes = tuple(sorted(int(axis) for axis in partial["PartialAxes"]))
+    if not partial_axes or any(axis < 0 or axis >= len(hierarchy) for axis in partial_axes):
+        raise ValueError(
+            f"PyNTT fused {field} partial axes are invalid: {partial_axes}"
+        )
+    split_axes = set(_shard_axes_hierarchy_axes(partial["ShardAxes"]))
+    if split_axes & set(partial_axes):
+        raise ValueError(
+            f"PyNTT fused {field} mesh axes cannot be both split and partial"
+        )
+
+    target_lane_shape = tuple(int(value) for value in target_access["LaneShape"])
+    target_lane_count = _product_int(list(target_lane_shape)) if target_lane_shape else 1
+    source_lane_shape = _validate_coordinate_lane_shape(
+        partial["VectorLaneShape"], f"PyNTT fused {field} partial"
+    )
+    source_lane_count = _product_int(list(source_lane_shape)) if source_lane_shape else 1
+    if source_lane_count != int(partial["VectorLaneCount"]):
+        raise ValueError(
+            f"PyNTT fused {field} partial lane metadata is inconsistent"
+        )
+
+    target_global = _distributed_local_to_global_coordinates(
+        tuple(target_access["TensorIndices"]),
+        target["GlobalShape"],
+        target["GlobalOffsets"],
+        target["ShardAxes"],
+        target["Hierarchy"],
+    )
+    seq_axis = qkv_layout.index(0)
+    head_axis = qkv_layout.index(1)
+    dim_axis = qkv_layout.index(2)
+    target_lane_flat = _flatten_coordinates(
+        tuple(target_access["LaneIndices"]), target_lane_shape
+    )
+    logical_dim = (
+        f"({target_global[dim_axis]}) * {target_lane_count} + ({target_lane_flat})"
+    )
+    logical_dim_extent = _multiply_dim(
+        target["GlobalShape"][dim_axis], target_lane_count
+    )
+    flat_projection = (
+        f"({target_global[head_axis]}) * ({_dim(logical_dim_extent)}) + "
+        f"({logical_dim})"
+    )
+    source_global = (
+        target_global[seq_axis],
+        f"({flat_projection}) // {source_lane_count}",
+    )
+    source_lane_flat = f"({flat_projection}) % {source_lane_count}"
+    source_lane_coordinates: list[str] = []
+    lane_stride = source_lane_count
+    for extent in source_lane_shape:
+        lane_stride //= extent
+        source_lane_coordinates.append(
+            f"(({source_lane_flat}) // {lane_stride}) % {extent}"
+            if lane_stride != 1
+            else f"({source_lane_flat}) % {extent}"
+        )
+
+    axis_plans = tuple(
+        _global_to_local_coordinate(
+            source_global[axis],
+            partial["GlobalShape"][axis],
+            partial["ShardAxes"][axis],
+            hierarchy,
+        )
+        for axis in range(2)
+    )
+    source_access = _tensor_access(
+        tuple(plan["local_coordinate"] for plan in axis_plans),
+        partial["Strides"],
+        tuple(source_lane_coordinates),
+        source_lane_shape,
+    )
+    owner_expressions: dict[int, str] = {}
+    for plan in axis_plans:
+        for axis, owner in plan["owners"].items():
+            previous = owner_expressions.setdefault(int(axis), owner)
+            if previous != owner:
+                raise ValueError(
+                    f"PyNTT fused {field} source mesh axis {axis} has conflicting owners"
+                )
+
+    reduction_extent = _product_int([hierarchy[axis] for axis in partial_axes])
+    axis_strides: dict[int, int] = {}
+    axis_stride = 1
+    for axis in reversed(partial_axes):
+        axis_strides[axis] = axis_stride
+        axis_stride *= hierarchy[axis]
+    target_split_axes = set(_shard_axes_hierarchy_axes(target["ShardAxes"]))
+    active = " & ".join(
+        f"(shard_coord{axis} == 0)"
+        for axis in range(len(hierarchy))
+        if axis not in target_split_axes
+    ) or "True"
+    dtype = partial["DType"]
+    if dtype in ("float16", "bfloat16", "float32"):
+        accumulator_dtype, zero = "tl.float32", "0.0"
+    elif dtype == "float64":
+        accumulator_dtype, zero = "tl.float64", "0.0"
+    else:
+        raise ValueError(
+            f"PyNTT fused {field} partial Sum does not support dtype {dtype}"
+        )
+
+    return {
+        "accumulator_dtype": accumulator_dtype,
+        "active": active,
+        "address": partial["Address"],
+        "axis_strides": axis_strides,
+        "hierarchy": hierarchy,
+        "owner_expressions": owner_expressions,
+        "partial_axes": partial_axes,
+        "pointer_type": _pointer_type(
+            partial["TritonDType"], partial["Address"]["AddressSpace"]
+        ),
+        "reduction_axis": target_tile_rank,
+        "reduction_extent": reduction_extent,
+        "reduction_lane_reshape": "["
+        + ", ".join(["None"] * target_tile_rank + [":"])
+        + "]",
+        "target_reduction_reshape": "["
+        + ", ".join([":"] * target_tile_rank + ["None"])
+        + "]",
+        "reduction_width": min(
+            1 << (reduction_extent - 1).bit_length(), reduction_extent
+        ),
+        "scalar_element_size_bytes": int(partial["ScalarElementSizeBytes"]),
+        "vector_lane_count": int(partial["VectorLaneCount"]),
+        "triton_dtype": partial["TritonDType"],
+        "source_access": source_access,
+        "source_pool_index": _pool_index_expression(
+            "source_shard_index", partial["Address"]["PoolScopeSize"]
+        ),
+        "source_pool_scope_size": partial["Address"]["PoolScopeSize"],
+        "source_shard_index": _split_linear_expression(
+            list(range(len(hierarchy))), hierarchy, "source_shard_coord"
+        ),
+        "zero": zero,
+    }
+
+
+def _qkv_headwise_partial_layout(
+    function_name: str,
+    field: str,
+    elements: int,
+    partial: dict[str, Any],
+    num_warps: int,
+    worker_width: int,
+) -> dict[str, Any] | None:
+    reduction_extent = int(partial["reduction_extent"])
+    vector_lane_count = int(partial["vector_lane_count"])
+    if (
+        num_warps <= 0
+        or num_warps & (num_warps - 1)
+        or worker_width <= 0
+        or worker_width & (worker_width - 1)
+        or reduction_extent <= 0
+        or reduction_extent & (reduction_extent - 1)
+        or vector_lane_count <= 0
+        or vector_lane_count & (vector_lane_count - 1)
+    ):
+        return None
+    vector_lane_count = min(elements, vector_lane_count)
+    hidden_threads = min(elements, worker_width)
+    active_warps = min(num_warps, max(1, elements // hidden_threads))
+    if (
+        hidden_threads <= 0
+        or hidden_threads & (hidden_threads - 1)
+        or active_warps <= 0
+        or active_warps & (active_warps - 1)
+        or elements % (hidden_threads * active_warps)
+    ):
+        return None
+    contiguous_elements = elements // (hidden_threads * active_warps)
+    alignment_bytes = min(
+        16, vector_lane_count * int(partial["scalar_element_size_bytes"])
+    )
+    try:
+        pool_stride_bytes = int(partial["address"]["PoolStrideBytes"])
+        offset_bytes = int(partial["address"]["OffsetBytes"])
+    except (KeyError, TypeError, ValueError):
+        return None
+    if (
+        alignment_bytes <= 0
+        or pool_stride_bytes % alignment_bytes
+        or offset_bytes % alignment_bytes
+    ):
+        return None
+    return {
+        "alignment_bytes": alignment_bytes,
+        "contiguous_elements": contiguous_elements,
+        "load_contiguous_elements": vector_lane_count,
+        "name": f"{function_name}__{field}_partial_layout",
+        "shape": (1, reduction_extent, elements),
+        # Keep the short split-K reduction thread-local. Spread the head over
+        # only the warps needed to cover it; surplus lanes and warps map to the
+        # unit row dimension and are naturally out of bounds.
+        "size_per_thread": (1, reduction_extent, contiguous_elements),
+        "threads_per_warp": (worker_width // hidden_threads, 1, hidden_threads),
+        "warps_per_cta": (num_warps // active_warps, 1, active_warps),
+        "order": (2, 1, 0),
+    }
+
+
+def _configure_qkv_partial_headwise_context(
+    model: dict[str, Any],
+    q_context: dict[str, Any],
+    k_context: dict[str, Any],
+    v_context: dict[str, Any],
+) -> bool:
+    """Configure the full-head register-reuse lowering when it is legal."""
+
+    def fixed_iteration_shape(context: dict[str, Any]) -> tuple[int, ...] | None:
+        major_extent = _fixed(context["major_extent"])
+        if major_extent is None:
+            return None
+        shape = (major_extent,) + tuple(int(value) for value in context["lane_shape"])
+        if any(value <= 0 or value & (value - 1) for value in shape):
+            return None
+        return shape
+
+    def has_unit_outer_domain(norm: dict[str, Any], context: dict[str, Any]) -> bool:
+        return all(
+            _fixed(norm["InputShape"][axis]) == 1
+            for axis in context["outer_axes"]
+        )
+
+    def coordinate_plan(context: dict[str, Any]) -> dict[str, Any]:
+        lane_shape = tuple(int(value) for value in context["lane_shape"])
+        lane_strides: list[int] = []
+        stride = _product_int(list(lane_shape)) if lane_shape else 1
+        major_stride = stride
+        for extent in lane_shape:
+            stride //= extent
+            lane_strides.append(stride)
+        return {
+            "lane_strides": tuple(lane_strides),
+            "major_stride": major_stride,
+        }
+
+    q_reduction_shape = fixed_iteration_shape(q_context["reduction_context"])
+    k_reduction_shape = fixed_iteration_shape(k_context["reduction_context"])
+    q_compute_shape = fixed_iteration_shape(q_context)
+    k_compute_shape = fixed_iteration_shape(k_context)
+    v_compute_shape = fixed_iteration_shape(v_context)
+    shapes = (
+        q_reduction_shape,
+        k_reduction_shape,
+        q_compute_shape,
+        k_compute_shape,
+        v_compute_shape,
+    )
+    if any(shape is None for shape in shapes):
+        return False
+    assert q_reduction_shape is not None
+    assert k_reduction_shape is not None
+    assert q_compute_shape is not None
+    assert k_compute_shape is not None
+    assert v_compute_shape is not None
+
+    q_elements = _product_int(list(q_reduction_shape))
+    k_elements = _product_int(list(k_reduction_shape))
+    if (
+        q_elements != _product_int(list(q_compute_shape))
+        or k_elements != _product_int(list(k_compute_shape))
+        or k_elements != _product_int(list(v_compute_shape))
+        or q_elements < 2
+        or k_elements < 2
+        or q_elements % 2 != 0
+        or k_elements % 2 != 0
+        or q_elements & (q_elements - 1)
+        or k_elements & (k_elements - 1)
+        or not has_unit_outer_domain(model["QNorm"], q_context)
+        or not has_unit_outer_domain(model["KNorm"], k_context)
+        or any(_fixed(v_context["tensor_shape"][axis]) != 1 for axis in v_context["loop_axes"])
+    ):
+        return False
+
+    q_partial_layout = _qkv_headwise_partial_layout(
+        model["FunctionName"],
+        "q",
+        q_elements,
+        q_context["reduction_context"]["partial_input"],
+        int(model["NumWarps"]),
+        int(model["TargetWorkerWidth"]),
+    )
+    k_partial_layout = _qkv_headwise_partial_layout(
+        model["FunctionName"],
+        "k",
+        k_elements,
+        k_context["reduction_context"]["partial_input"],
+        int(model["NumWarps"]),
+        int(model["TargetWorkerWidth"]),
+    )
+    v_partial_layout = _qkv_headwise_partial_layout(
+        model["FunctionName"],
+        "v",
+        k_elements,
+        v_context["partial_input"],
+        int(model["NumWarps"]),
+        int(model["TargetWorkerWidth"]),
+    )
+    if (
+        q_partial_layout is None
+        or k_partial_layout is None
+        or v_partial_layout is None
+    ):
+        return False
+
+    def sliced_head_layout(field: str, parent: dict[str, Any]) -> dict[str, Any]:
+        return {
+            "name": f"{model['FunctionName']}__{field}_head_layout",
+            "parent_name": parent["name"],
+            "sliced_dimension": 1,
+        }
+
+    q_head_layout = sliced_head_layout("q", q_partial_layout)
+    k_head_layout = sliced_head_layout("k", k_partial_layout)
+    v_head_layout = sliced_head_layout("v", v_partial_layout)
+
+    q_output = model.get("QOutput")
+    q_output_address = model.get("QOutputAddress")
+    if not isinstance(q_output, dict) or not isinstance(q_output_address, dict):
+        return False
+    hierarchy = [int(extent) for extent in q_context["partial_input"]["hierarchy"]]
+    if q_output.get("Hierarchy") != hierarchy:
+        return False
+    q_input_split_axes = set(
+        _shard_axes_hierarchy_axes(model["QNorm"]["Input"]["ShardAxes"])
+    )
+    q_output_split_axes = set(_shard_axes_hierarchy_axes(q_output["ShardAxes"]))
+    if q_input_split_axes != q_output_split_axes:
+        return False
+    q_broadcast_axes = tuple(
+        axis for axis in range(len(hierarchy)) if axis not in q_output_split_axes
+    )
+
+    q_context.update(
+        {
+            "headwise_compute_coordinates": coordinate_plan(q_context),
+            "headwise_compute_shape": (1, q_elements),
+            "headwise_elements": q_elements,
+            "headwise_layout": q_head_layout,
+            "headwise_pair_shape": (2, q_elements // 2),
+            "headwise_partial_layout": q_partial_layout,
+            "headwise_reduction_coordinates": coordinate_plan(
+                q_context["reduction_context"]
+            ),
+            "headwise_output": {
+                "address": q_output_address,
+                "broadcast_axes": q_broadcast_axes,
+                "destination_pool_index": _pool_index_expression(
+                    "destination_shard_index", q_output_address["PoolScopeSize"]
+                ),
+                "destination_shard_index": _split_linear_expression(
+                    list(range(len(hierarchy))),
+                    hierarchy,
+                    "destination_shard_coord",
+                ),
+                "hierarchy": hierarchy,
+                "pointer_type": _pointer_type(
+                    model["QOutputTritonDType"], q_output_address["AddressSpace"]
+                ),
+            },
+        }
+    )
+    k_context.update(
+        {
+            "headwise_compute_coordinates": coordinate_plan(k_context),
+            "headwise_compute_shape": (1, k_elements),
+            "headwise_elements": k_elements,
+            "headwise_layout": k_head_layout,
+            "headwise_pair_shape": (2, k_elements // 2),
+            "headwise_partial_layout": k_partial_layout,
+            "headwise_reduction_coordinates": coordinate_plan(
+                k_context["reduction_context"]
+            ),
+        }
+    )
+    v_context.update(
+        {
+            "headwise_compute_coordinates": coordinate_plan(v_context),
+            "headwise_compute_shape": (1, k_elements),
+            "headwise_elements": k_elements,
+            "headwise_layout": v_head_layout,
+            "headwise_partial_layout": v_partial_layout,
+        }
+    )
+
+    canonical_writer_axes = tuple(int(axis) for axis in v_context["canonical_writer_axes"])
+    writer_coordinates = {axis: 0 for axis in canonical_writer_axes}
+    if canonical_writer_axes:
+        split_axis = canonical_writer_axes[0]
+        if hierarchy[split_axis] > 1:
+            writer_coordinates[split_axis] = 1
+            v_context["partial_input"]["active"] = " & ".join(
+                f"(shard_coord{axis} == {writer_coordinates.get(axis, 0)})"
+                for axis in canonical_writer_axes
+            )
+    v_context["canonical_writer_coordinates"] = writer_coordinates
+    return True
 
 
 def _gather_template_context(model: dict[str, Any]) -> dict[str, Any]:

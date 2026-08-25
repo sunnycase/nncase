@@ -78,10 +78,137 @@ public sealed class UnitTestFuseGatherReduceNormApplyPass : TestClassBase
             call => call.Target is Nncase.TIR.NTT.GatherReduceNormApply);
     }
 
+    [Fact]
+    public async Task TestFuseAliasedStatisticsAcrossPreservedCodegenScope()
+    {
+        var (function, _, broadcastStats) = CreateFunction(
+            additionalStatsConsumer: false,
+            addInterveningNop: true,
+            aliasNormStats: true,
+            preserveProducerScope: true,
+            preserveConsumerScope: true);
+        var module = new IRModule(function);
+
+        await new FuseGatherReduceNormApplyPass(PyNTTTarget.Kind).RunAsync(module, new());
+
+        var rewritten = Assert.IsType<PrimFunction>(module.Entry);
+        var calls = ExprCollector.Collect(rewritten.Body).OfType<Call>().ToArray();
+        var fusedCall = Assert.Single(
+            calls,
+            call => call.Target is Nncase.TIR.NTT.GatherReduceNormApply);
+        Assert.DoesNotContain(
+            calls,
+            call => call.Target is Nncase.TIR.NTT.GatherReduceScatter or Nncase.TIR.NTT.NormApply);
+        Assert.DoesNotContain(
+            fusedCall.Arguments.ToArray(),
+            argument => ReferenceEquals(argument, broadcastStats));
+        Assert.Contains(
+            rewritten.Body.Fields.ToArray().OfType<Sequential>(),
+            sequential => sequential.TraceScopeName == "decoder_layer_callee" &&
+                sequential.PreserveCodegenBoundary);
+        Assert.Contains(
+            rewritten.Body.Fields.ToArray().OfType<Sequential>(),
+            sequential => sequential.TraceScopeName == "next_decoder_layer_callee" &&
+                sequential.PreserveCodegenBoundary);
+    }
+
+    [Fact]
+    public async Task TestKeepAliasedStatisticsWithAdditionalConsumer()
+    {
+        var (function, _, _) = CreateFunction(
+            additionalStatsConsumer: true,
+            addInterveningNop: false,
+            aliasNormStats: true,
+            preserveProducerScope: true,
+            preserveConsumerScope: true);
+        var module = new IRModule(function);
+
+        await new FuseGatherReduceNormApplyPass(PyNTTTarget.Kind).RunAsync(module, new());
+
+        var rewritten = Assert.IsType<PrimFunction>(module.Entry);
+        var calls = ExprCollector.Collect(rewritten).OfType<Call>().ToArray();
+        Assert.Contains(calls, call => call.Target is Nncase.TIR.NTT.GatherReduceScatter);
+        Assert.Contains(calls, call => call.Target is Nncase.TIR.NTT.NormApply);
+        Assert.DoesNotContain(calls, call => call.Target is Nncase.TIR.NTT.GatherReduceNormApply);
+    }
+
+    [Fact]
+    public async Task TestFuseChainedPreservedScopes()
+    {
+        var (baseFunction, partialStats, broadcastStats) = CreateFunction(
+            additionalStatsConsumer: false,
+            addInterveningNop: false,
+            aliasNormStats: true,
+            preserveProducerScope: true,
+            preserveConsumerScope: true);
+        var partialType = partialStats.DistributedType!;
+        var broadcastType = broadcastStats.DistributedType!;
+        var nextPartialStats = CreateBuffer(
+            "next_partial_stats",
+            DataTypes.Float32,
+            448,
+            [1, 1, 1],
+            [0, 0, 0],
+            partialType,
+            compactPerOwner: true);
+        var nextBroadcastStats = CreateBuffer(
+            "next_broadcast_stats",
+            DataTypes.Float32,
+            960,
+            [1, 1, 1],
+            [0, 0, 0],
+            broadcastType,
+            compactPerOwner: true);
+        var nextNormStats = CreateAliasedBuffer("next_norm_stats_alias", nextBroadcastStats);
+        var nextInput = CreateBuffer("next_input", DataTypes.Float32, 1472, [1, 8], [8, 1]);
+        var nextScale = CreateBuffer("next_scale", DataTypes.Float32, 1504, [8], [1]);
+        var nextBias = CreateBuffer("next_bias", DataTypes.Float32, 1536, [8], [1]);
+        var nextOutput = CreateBuffer("next_output", DataTypes.Float32, 1568, [1, 8], [8, 1]);
+
+        var fields = baseFunction.Body.Fields.ToArray();
+        var middleScope = Assert.IsType<Sequential>(fields[1]);
+        fields[1] = middleScope.With(
+            fields: middleScope.Fields.ToArray().Append(
+                Nncase.TIR.F.NTT.GatherReduceScatter(
+                    nextPartialStats,
+                    nextBroadcastStats,
+                    partialType,
+                    broadcastType)).ToArray());
+        var chainedFunction = new PrimFunction(
+            "chained_decoder_layers",
+            PyNTTTarget.Kind,
+            new Sequential(
+                fields.Append(
+                    Nncase.TIR.F.NTT.NormApply(
+                        nextInput,
+                        nextNormStats,
+                        nextScale,
+                        nextBias,
+                        nextOutput,
+                        1,
+                        1e-6f,
+                        useMean: false)).ToArray()),
+            Array.Empty<IVar>());
+        var module = new IRModule(chainedFunction);
+
+        await new FuseGatherReduceNormApplyPass(PyNTTTarget.Kind).RunAsync(module, new());
+
+        var calls = ExprCollector.Collect(module.Entry!).OfType<Call>().ToArray();
+        Assert.Equal(
+            2,
+            calls.Count(call => call.Target is Nncase.TIR.NTT.GatherReduceNormApply));
+        Assert.DoesNotContain(
+            calls,
+            call => call.Target is Nncase.TIR.NTT.GatherReduceScatter or Nncase.TIR.NTT.NormApply);
+    }
+
     private static (PrimFunction Function, Nncase.TIR.Buffer PartialStats, Nncase.TIR.Buffer BroadcastStats) CreateFunction(
         bool additionalStatsConsumer,
         bool addInterveningNop,
-        bool zeroBias = false)
+        bool zeroBias = false,
+        bool aliasNormStats = false,
+        bool preserveProducerScope = false,
+        bool preserveConsumerScope = false)
     {
         var placement = new Placement([4, 8], "yx", "bb");
         var statsTensorType = new TensorType(DataTypes.Float32, new[] { 1, 1, 1 });
@@ -123,20 +250,41 @@ public sealed class UnitTestFuseGatherReduceNormApplyPass : TestClassBase
         }
 
         var output = CreateBuffer("output", DataTypes.Float32, 352, [1, 8], [8, 1]);
-        var fields = new List<Expr>
+        var normStats = aliasNormStats
+            ? CreateAliasedBuffer("norm_stats_alias", broadcastStats)
+            : broadcastStats;
+        Expr gather = Nncase.TIR.F.NTT.GatherReduceScatter(partialStats, broadcastStats, partialType, broadcastType);
+        if (preserveProducerScope)
         {
-            Nncase.TIR.F.NTT.GatherReduceScatter(partialStats, broadcastStats, partialType, broadcastType),
-        };
+            gather = new Sequential(
+                [T.Nop(), gather, T.Nop()],
+                traceScopeName: "decoder_layer_callee",
+                preserveCodegenBoundary: true);
+        }
+
+        var fields = new List<Expr> { gather };
         if (addInterveningNop)
         {
             fields.Add(T.Nop());
         }
 
-        fields.Add(Nncase.TIR.F.NTT.NormApply(input, broadcastStats, scale, bias, output, 1, 1e-6f, useMean: false));
+        Expr normApply = Nncase.TIR.F.NTT.NormApply(input, normStats, scale, bias, output, 1, 1e-6f, useMean: false);
+        if (preserveConsumerScope)
+        {
+            normApply = new Sequential(
+                [T.Nop(), normApply, T.Nop()],
+                traceScopeName: "next_decoder_layer_callee",
+                preserveCodegenBoundary: true);
+        }
+
+        fields.Add(normApply);
         if (additionalStatsConsumer)
         {
             var copiedStats = CreateBuffer("copied_stats", DataTypes.Float32, 384, [1, 1, 1], [0, 0, 0]);
-            fields.Add(T.Memcopy(copiedStats, broadcastStats));
+            var copiedStatsSource = aliasNormStats
+                ? CreateAliasedBuffer("copied_stats_alias", broadcastStats)
+                : broadcastStats;
+            fields.Add(T.Memcopy(copiedStats, copiedStatsSource));
         }
 
         return (
@@ -147,6 +295,23 @@ public sealed class UnitTestFuseGatherReduceNormApplyPass : TestClassBase
                 Array.Empty<IVar>()),
             partialStats,
             broadcastStats);
+    }
+
+    private static Nncase.TIR.Buffer CreateAliasedBuffer(
+        string name,
+        Nncase.TIR.Buffer source)
+    {
+        var sourcePhysical = source.MemSpan.Buffer;
+        var aliasedPhysical = sourcePhysical.With(
+            start: sourcePhysical.Start,
+            size: sourcePhysical.Size);
+        return new Nncase.TIR.Buffer(
+            name,
+            source.ElemType,
+            source.MemSpan.With(buffer: aliasedPhysical),
+            source.Dimensions.ToArray(),
+            source.Strides.ToArray(),
+            source.DistributedType);
     }
 
     private static Nncase.TIR.Buffer CreateBuffer(

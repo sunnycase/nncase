@@ -11,11 +11,11 @@ namespace Nncase.TIR.NTT;
 /// </summary>
 public sealed partial class PagedAttentionMerge : NTTKernelOp
 {
-    public static readonly ParameterInfo MaxState = new(typeof(PagedAttentionMerge), 0, "maxState", memoryEffect: MemoryEffect.ChipRead);
+    public static readonly ParameterInfo MaxState = new(typeof(PagedAttentionMerge), 0, "maxState", memoryEffect: MemoryEffect.Read);
 
-    public static readonly ParameterInfo SumState = new(typeof(PagedAttentionMerge), 1, "sumState", memoryEffect: MemoryEffect.ChipRead);
+    public static readonly ParameterInfo SumState = new(typeof(PagedAttentionMerge), 1, "sumState", memoryEffect: MemoryEffect.Read);
 
-    public static readonly ParameterInfo AccState = new(typeof(PagedAttentionMerge), 2, "accState", memoryEffect: MemoryEffect.ChipRead);
+    public static readonly ParameterInfo AccState = new(typeof(PagedAttentionMerge), 2, "accState", memoryEffect: MemoryEffect.Read);
 
     public static readonly ParameterInfo Output = new(typeof(PagedAttentionMerge), 3, "output", memoryEffect: MemoryEffect.Write);
 

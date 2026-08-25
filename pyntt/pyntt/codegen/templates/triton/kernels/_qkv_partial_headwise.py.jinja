@@ -1,0 +1,197 @@
+{% import "triton/kernels/_paged_attention_kv_cache.py.jinja" as cache_io with context %}
+{% macro assign_coordinates(context, plan, linear, indent) %}
+{{ indent }}{{ context["major_variable"] }} = {{ linear }} // {{ plan["major_stride"] }}
+{% for lane_index in range(context["lane_shape"] | length) %}
+{{ indent }}{{ context["lane_coordinates"][lane_index] }} = ({{ linear }} // {{ plan["lane_strides"][lane_index] }}) % {{ context["lane_shape"][lane_index] }}
+{% endfor %}
+{% endmacro %}
+{% macro load_partial(partial, context, plan, value_name, partial_layout, head_layout, elements, indent) %}
+{{ indent }}source_head_linear = tle.encoding(
+{{ indent }}    tl.arange(0, 1)[:, None, None] * {{ elements }}
+{{ indent }}    + tl.arange(0, {{ partial["reduction_extent"] }})[None, :, None] * 0
+{{ indent }}    + tl.arange(0, {{ elements }})[None, None, :],
+{{ indent }}    {{ partial_layout["name"] }},
+{{ indent }})
+{{ indent }}partial_lane = tle.encoding(
+{{ indent }}    tl.arange(0, 1)[:, None, None] * 0
+{{ indent }}    + tl.arange(0, {{ partial["reduction_extent"] }})[None, :, None]
+{{ indent }}    + tl.arange(0, {{ elements }})[None, None, :] * 0,
+{{ indent }}    {{ partial_layout["name"] }},
+{{ indent }})
+{{ assign_coordinates(context, plan, "source_head_linear", indent) }}
+{{ indent }}source_mask = source_head_linear < {{ elements }}
+{{ indent }}source_mask = source_mask & ({{ context["major_variable"] }} < {{ context["major_extent"]["FixedValue"] }})
+{% for axis in range(partial["hierarchy"] | length) %}
+{% if axis in partial["partial_axes"] %}
+{{ indent }}source_shard_coord{{ axis }} = (partial_lane // {{ partial["axis_strides"][axis] }}) % {{ partial["hierarchy"][axis] }}
+{% elif axis in partial["owner_expressions"] %}
+{{ indent }}source_shard_coord{{ axis }} = ({{ partial["owner_expressions"][axis] }}) + ({{ partial["source_access"]["ScalarOffset"] }}) * 0
+{% else %}
+{{ indent }}source_shard_coord{{ axis }} = shard_coord{{ axis }} + partial_lane * 0
+{% endif %}
+{% endfor %}
+{{ indent }}source_shard_index = {{ partial["source_shard_index"] }}
+{{ indent }}source_pool_index = {{ partial["source_pool_index"] }}
+{{ indent }}source_byte_offset = source_pool_index * {{ partial["address"]["PoolStrideBytes"] }} + {{ partial["address"]["OffsetBytes"] }}
+{{ indent }}source = ({{ partial["address"]["BaseName"] }} + source_byte_offset).to({{ partial["pointer_type"] }})
+{{ indent }}source_offsets = {{ partial["source_access"]["ScalarOffset"] }}
+{{ indent }}source_ptr = source + source_offsets
+{{ indent }}source_ptr = tl.max_contiguous(source_ptr, [1, 1, {{ partial_layout["load_contiguous_elements"] }}])
+{{ indent }}source_ptr = tl.multiple_of(source_ptr, [1, 1, {{ partial_layout["alignment_bytes"] }}])
+{{ indent }}source_value = tle.encoding(
+{{ indent }}    tl.load(source_ptr, mask=source_mask, other={{ partial["zero"] }}),
+{{ indent }}    {{ partial_layout["name"] }},
+{{ indent }}).to({{ partial["accumulator_dtype"] }})
+{{ indent }}partial_acc = tle.encoding(
+{{ indent }}    tl.sum(source_value, axis=1),
+{{ indent }}    {{ head_layout["name"] }},
+{{ indent }}).to({{ partial["accumulator_dtype"] }})
+{{ indent }}{{ value_name }} = tle.encoding(
+{{ indent }}    partial_acc.to({{ partial["triton_dtype"] }}).to({{ partial["accumulator_dtype"] }}),
+{{ indent }}    {{ head_layout["name"] }},
+{{ indent }})
+{% endmacro %}
+{% macro run(model, ctx) %}
+{% set q = ctx["q"] %}
+{% set qr = q["reduction_context"] %}
+{% set k = ctx["k"] %}
+{% set kr = k["reduction_context"] %}
+{% set v = ctx["v"] %}
+    if {{ q["partial_input"]["active"] }}:
+        index0 = 0
+        index1 = 0
+        index2 = 0
+        q_head_linear = tle.encoding(
+            tl.arange(0, 1)[:, None] * {{ q["headwise_elements"] }}
+            + tl.arange(0, {{ q["headwise_elements"] }})[None, :],
+            {{ q["headwise_layout"]["name"] }},
+        )
+        q_head_active = q_head_linear < {{ q["headwise_elements"] }}
+{{ load_partial(qr["partial_input"], qr, q["headwise_reduction_coordinates"], "norm_value", q["headwise_partial_layout"], q["headwise_layout"], q["headwise_elements"], "        ") }}
+{% if model["QNorm"]["UseMean"] %}
+        q_mean = tl.sum(norm_value, axis=1) / ({{ q["normalization_size"] }})
+{% else %}
+        q_mean = 0.0
+{% endif %}
+        q_variance = tl.sum(norm_value * norm_value, axis=1) / ({{ q["normalization_size"] }}) - q_mean * q_mean
+        q_inv_std = tl.rsqrt(tl.maximum(q_variance, 0.0) + {{ pyrepr(model["QNorm"]["Epsilon"]) }})[:, None]
+{% if model["QNorm"]["UseMean"] %}
+        q_mean = q_mean[:, None]
+{% endif %}
+{{ assign_coordinates(q, q["headwise_compute_coordinates"], "q_head_linear", "        ") }}
+        mask = q_head_active & ({{ q["major_variable"] }} < {{ q["major_extent"]["FixedValue"] }})
+        mask = mask & ({{ q["output_physical_rotary"] }} < {{ dim(q["output_rotary_extent"]) }})
+        q_scale_value = tle.encoding(
+            tl.load({{ access_pointer(model["QNorm"], "Scale", "q_scale", q["scale_access"]) }}, mask=mask, other=0.0),
+            {{ q["headwise_layout"]["name"] }},
+        ).to(tl.float32)
+        q_bias_value = tle.encoding(
+            tl.load({{ access_pointer(model["QNorm"], "Bias", "q_bias", q["bias_access"]) }}, mask=mask, other=0.0),
+            {{ q["headwise_layout"]["name"] }},
+        ).to(tl.float32)
+        q_normalized = tle.encoding(
+            ((norm_value - q_mean) * q_inv_std * q_scale_value) + q_bias_value,
+            {{ q["headwise_layout"]["name"] }},
+        )
+        q_paired = tle.encoding(
+            tl.reshape(
+                tl.flip(tl.reshape(q_normalized, {{ q["headwise_pair_shape"] }}), 0),
+                {{ q["headwise_compute_shape"] }},
+            ),
+            {{ q["headwise_layout"]["name"] }},
+        )
+        q_rotated = tl.where({{ q["first_half"] }}, -q_paired, q_paired)
+        q_cos = tle.encoding(
+            tl.load({{ access_pointer(model["QRoPE"], "Cos", "cos", q["cos_access"]) }}, mask=mask, other=0.0),
+            {{ q["headwise_layout"]["name"] }},
+        ).to(tl.float32)
+        q_sin = tle.encoding(
+            tl.load({{ access_pointer(model["QRoPE"], "Sin", "sin", q["sin_access"]) }}, mask=mask, other=0.0),
+            {{ q["headwise_layout"]["name"] }},
+        ).to(tl.float32)
+        q_result = q_normalized * q_cos + q_rotated * q_sin
+{% set q_output = q["headwise_output"] %}
+{% for axis in range(q_output["hierarchy"] | length) if axis not in q_output["broadcast_axes"] %}
+        destination_shard_coord{{ axis }} = shard_coord{{ axis }}
+{% endfor %}
+{% set output_ns = namespace(indent="        ") %}
+{% for axis in q_output["broadcast_axes"] %}
+{{ output_ns.indent }}for destination_shard_coord{{ axis }} in tl.static_range(0, {{ q_output["hierarchy"][axis] }}):
+{% set output_ns.indent = output_ns.indent + "    " %}
+{% endfor %}
+{{ output_ns.indent }}destination_shard_index = {{ q_output["destination_shard_index"] }}
+{{ output_ns.indent }}destination_pool_index = {{ q_output["destination_pool_index"] }}
+{{ output_ns.indent }}destination_q_byte_offset = destination_pool_index * {{ q_output["address"]["PoolStrideBytes"] }} + {{ q_output["address"]["OffsetBytes"] }}
+{{ output_ns.indent }}destination_q = ({{ q_output["address"]["BaseName"] }} + destination_q_byte_offset).to({{ q_output["pointer_type"] }})
+{{ output_ns.indent }}tl.store(destination_q + {{ q["final_output_access"]["ScalarOffset"] }}, q_result, mask=mask)
+
+    if {{ k["partial_input"]["active"] }}:
+        index0 = 0
+        index1 = 0
+        index2 = 0
+        k_head_linear = tle.encoding(
+            tl.arange(0, 1)[:, None] * {{ k["headwise_elements"] }}
+            + tl.arange(0, {{ k["headwise_elements"] }})[None, :],
+            {{ k["headwise_layout"]["name"] }},
+        )
+        k_head_active = k_head_linear < {{ k["headwise_elements"] }}
+{{ load_partial(kr["partial_input"], kr, k["headwise_reduction_coordinates"], "norm_value", k["headwise_partial_layout"], k["headwise_layout"], k["headwise_elements"], "        ") }}
+{% if model["KNorm"]["UseMean"] %}
+        k_mean = tl.sum(norm_value, axis=1) / ({{ k["normalization_size"] }})
+{% else %}
+        k_mean = 0.0
+{% endif %}
+        k_variance = tl.sum(norm_value * norm_value, axis=1) / ({{ k["normalization_size"] }}) - k_mean * k_mean
+        k_inv_std = tl.rsqrt(tl.maximum(k_variance, 0.0) + {{ pyrepr(model["KNorm"]["Epsilon"]) }})[:, None]
+{% if model["KNorm"]["UseMean"] %}
+        k_mean = k_mean[:, None]
+{% endif %}
+{{ assign_coordinates(k, k["headwise_compute_coordinates"], "k_head_linear", "        ") }}
+        mask = k_head_active & ({{ k["major_variable"] }} < {{ k["major_extent"]["FixedValue"] }})
+        mask = mask & ({{ k["output_physical_rotary"] }} < {{ dim(k["output_rotary_extent"]) }})
+        k_scale_value = tle.encoding(
+            tl.load({{ access_pointer(model["KNorm"], "Scale", "k_scale", k["scale_access"]) }}, mask=mask, other=0.0),
+            {{ k["headwise_layout"]["name"] }},
+        ).to(tl.float32)
+        k_bias_value = tle.encoding(
+            tl.load({{ access_pointer(model["KNorm"], "Bias", "k_bias", k["bias_access"]) }}, mask=mask, other=0.0),
+            {{ k["headwise_layout"]["name"] }},
+        ).to(tl.float32)
+        k_normalized = tle.encoding(
+            ((norm_value - k_mean) * k_inv_std * k_scale_value) + k_bias_value,
+            {{ k["headwise_layout"]["name"] }},
+        )
+        k_paired = tle.encoding(
+            tl.reshape(
+                tl.flip(tl.reshape(k_normalized, {{ k["headwise_pair_shape"] }}), 0),
+                {{ k["headwise_compute_shape"] }},
+            ),
+            {{ k["headwise_layout"]["name"] }},
+        )
+        k_rotated = tl.where({{ k["first_half"] }}, -k_paired, k_paired)
+        k_cos = tle.encoding(
+            tl.load({{ access_pointer(model["KRoPE"], "Cos", "cos", k["cos_access"]) }}, mask=mask, other=0.0),
+            {{ k["headwise_layout"]["name"] }},
+        ).to(tl.float32)
+        k_sin = tle.encoding(
+            tl.load({{ access_pointer(model["KRoPE"], "Sin", "sin", k["sin_access"]) }}, mask=mask, other=0.0),
+            {{ k["headwise_layout"]["name"] }},
+        ).to(tl.float32)
+        k_result = k_normalized * k_cos + k_rotated * k_sin
+{{ cache_io.store(model["KUpdate"], k["cache"], "k_result", "mask", "        ") }}
+
+    if {{ v["partial_input"]["active"] }}:
+        index0 = 0
+        index1 = 0
+        index2 = 0
+        v_head_linear = tle.encoding(
+            tl.arange(0, 1)[:, None] * {{ v["headwise_elements"] }}
+            + tl.arange(0, {{ v["headwise_elements"] }})[None, :],
+            {{ v["headwise_layout"]["name"] }},
+        )
+        v_head_active = v_head_linear < {{ v["headwise_elements"] }}
+{{ load_partial(v["partial_input"], v, v["headwise_compute_coordinates"], "v_value", v["headwise_partial_layout"], v["headwise_layout"], v["headwise_elements"], "        ") }}
+{{ assign_coordinates(v, v["headwise_compute_coordinates"], "v_head_linear", "        ") }}
+        mask = v_head_active & ({{ v["major_variable"] }} < {{ v["major_extent"]["FixedValue"] }})
+{{ cache_io.store(model["VUpdate"], v, "v_value", "mask", "        ") }}
+{% endmacro %}

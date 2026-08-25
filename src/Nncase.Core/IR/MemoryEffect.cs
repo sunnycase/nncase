@@ -45,6 +45,12 @@ public enum MemoryAccessDomainKind
     FixedBlock,
 }
 
+public enum MemoryAccessPartitionKind
+{
+    WholeResource,
+    Argument,
+}
+
 /// <summary>
 /// Refines the default operand effects declared by <see cref="ParameterInfo"/>
 /// when an operation's attributes or arguments change its memory access.
@@ -52,6 +58,34 @@ public enum MemoryAccessDomainKind
 public interface IOpMemoryEffectProvider
 {
     MemoryEffect GetMemoryEffect(ParameterInfo parameter, IReadOnlyList<BaseExpr> arguments);
+}
+
+/// <summary>
+/// Describes a logical partition of one memory operand. Operations that access
+/// a disjoint subresource selected by another argument can expose that relation
+/// to interprocedural synchronization planning.
+/// </summary>
+public readonly record struct MemoryAccessPartition
+{
+    private MemoryAccessPartition(MemoryAccessPartitionKind kind, int argumentIndex)
+    {
+        if (kind == MemoryAccessPartitionKind.Argument && argumentIndex < 0)
+        {
+            throw new ArgumentOutOfRangeException(nameof(argumentIndex));
+        }
+
+        Kind = kind;
+        ArgumentIndex = argumentIndex;
+    }
+
+    public static MemoryAccessPartition WholeResource => default;
+
+    public MemoryAccessPartitionKind Kind { get; }
+
+    public int ArgumentIndex { get; }
+
+    public static MemoryAccessPartition ByArgument(int argumentIndex)
+        => new(MemoryAccessPartitionKind.Argument, argumentIndex);
 }
 
 /// <summary>
@@ -92,7 +126,8 @@ public readonly record struct MemoryEffect(
     MemoryAccessMode Mode,
     MemoryAccessScope Scope = MemoryAccessScope.Inferred,
     MemoryEffectKind Kind = MemoryEffectKind.Direct,
-    MemoryAccessDomain AccessDomain = default)
+    MemoryAccessDomain AccessDomain = default,
+    MemoryAccessPartition AccessPartition = default)
 {
     public static MemoryEffect None { get; } = new(MemoryAccessMode.None);
 
@@ -120,6 +155,9 @@ public readonly record struct MemoryEffect(
 
     public MemoryEffect InFixedBlock(int blockIndex)
         => this with { AccessDomain = MemoryAccessDomain.FixedBlock(blockIndex) };
+
+    public MemoryEffect PartitionedByArgument(int argumentIndex)
+        => this with { AccessPartition = MemoryAccessPartition.ByArgument(argumentIndex) };
 }
 
 /// <summary>
@@ -218,7 +256,8 @@ public static class MemoryEffectUtility
             lhs.Mode | rhs.Mode,
             MergeScope(lhs.Scope, rhs.Scope),
             lhs.Kind == rhs.Kind ? lhs.Kind : MemoryEffectKind.Direct,
-            MergeAccessDomain(lhs.AccessDomain, rhs.AccessDomain));
+            MergeAccessDomain(lhs.AccessDomain, rhs.AccessDomain),
+            MergeAccessPartition(lhs.AccessPartition, rhs.AccessPartition));
     }
 
     public static MemoryAccessScope MergeScope(MemoryAccessScope lhs, MemoryAccessScope rhs)
@@ -234,4 +273,11 @@ public static class MemoryEffectUtility
         => lhs.IsSameFixedBlock(rhs)
             ? lhs
             : MemoryAccessDomain.AllBlocks;
+
+    public static MemoryAccessPartition MergeAccessPartition(
+        MemoryAccessPartition lhs,
+        MemoryAccessPartition rhs)
+        => lhs == rhs
+            ? lhs
+            : MemoryAccessPartition.WholeResource;
 }

@@ -18,7 +18,11 @@ public sealed partial class UpdatePagedAttentionKVCache : NTTKernelOp
 {
     public static readonly ParameterInfo Slots = new(typeof(UpdatePagedAttentionKVCache), 0, "slots", memoryEffect: MemoryEffect.Read);
 
-    public static readonly ParameterInfo KVCaches = new(typeof(UpdatePagedAttentionKVCache), 1, "kvCaches", memoryEffect: MemoryEffect.ChipWrite);
+    public static readonly ParameterInfo KVCaches = new(
+        typeof(UpdatePagedAttentionKVCache),
+        1,
+        "kvCaches",
+        memoryEffect: MemoryEffect.ChipWrite.PartitionedByArgument(2));
 
     public static readonly ParameterInfo LayerId = new(typeof(UpdatePagedAttentionKVCache), 2, "layerId", IsDimensionType(), memoryEffect: MemoryEffect.None);
 

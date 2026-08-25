@@ -39,10 +39,16 @@ public sealed record PyNTTMicroKernelTemplateModel(
     IReadOnlyDictionary<string, long> Parameters,
     IReadOnlyDictionary<string, string> SharedWorkspaceOffsets,
     IReadOnlyDictionary<string, long[]> SharedWorkspaceShapes,
-    PyNTTTransferPipelineChannelTemplateModel[] TransferPipelineChannels)
+    PyNTTTransferPipelineChannelTemplateModel[] TransferPipelineChannels,
+    string[] ConsumerSharedWorkspaceNames)
 {
     public bool HasTransferPipeline => TransferPipelineChannels.Length != 0;
 }
+
+public sealed record PyNTTPipelineConsumerSharedWorkspaceTemplateModel(
+    string Name,
+    string VariableName,
+    string SharedWorkspaceOffset);
 
 public sealed record PyNTTPipelineStageTemplateModel(
     string StageId,
@@ -52,6 +58,7 @@ public sealed record PyNTTPipelineStageTemplateModel(
     string Template,
     object Model,
     IReadOnlyDictionary<string, string> SharedWorkspaceOffsets,
+    PyNTTPipelineConsumerSharedWorkspaceTemplateModel[] ConsumerSharedWorkspaces,
     string PipeName,
     string ReaderName,
     string WriterName);
@@ -606,6 +613,17 @@ public sealed record PyNTTGatherReduceNormApplyTemplateModel(
     public string[] RuntimeShapeArgs { get; set; } = Array.Empty<string>();
 }
 
+public sealed record PyNTTGatherReduceAddNormTemplateModel(
+    string FunctionName,
+    PyNTTReshardTemplateModel Reshard,
+    PyNTTBufferPointerTemplateModel Addend,
+    PyNTTNormStatsTemplateModel NormStats,
+    PyNTTNormApplyTemplateModel? NormApply,
+    string Comment)
+{
+    public string[] RuntimeShapeArgs { get; set; } = Array.Empty<string>();
+}
+
 public sealed record PyNTTQKVRoPENormTemplateModel(
     string FunctionName,
     PyNTTBufferPointerTemplateModel Input,
@@ -737,6 +755,20 @@ public sealed record PyNTTUpdatePagedAttentionKVCacheTemplateModel(
     public string[] RuntimeShapeArgs { get; set; } = Array.Empty<string>();
 }
 
+public sealed record PyNTTQKVPartialInputTemplateModel(
+    PyNTTPooledByteAddressTemplateModel Address,
+    int ScalarElementSizeBytes,
+    string DType,
+    string TritonDType,
+    PyNTTDimExpression[] GlobalShape,
+    PyNTTDimExpression[] LocalShape,
+    PyNTTDimExpression[] Strides,
+    int VectorLaneCount,
+    int[] VectorLaneShape,
+    int[] Hierarchy,
+    PyNTTShardAxisTemplateModel[] ShardAxes,
+    int[] PartialAxes);
+
 public sealed record PyNTTQKVRoPEWithCacheTemplateModel(
     string FunctionName,
     PyNTTQKVRoPENormTemplateModel QNorm,
@@ -746,6 +778,7 @@ public sealed record PyNTTQKVRoPEWithCacheTemplateModel(
     PyNTTUpdatePagedAttentionKVCacheTemplateModel KUpdate,
     PyNTTUpdatePagedAttentionKVCacheTemplateModel VUpdate,
     PyNTTBufferPointerTemplateModel QOutput,
+    PyNTTPooledByteAddressTemplateModel QOutputAddress,
     string QOutputDType,
     string QOutputTritonDType,
     PyNTTDimExpression[] QOutputShape,
@@ -754,6 +787,9 @@ public sealed record PyNTTQKVRoPEWithCacheTemplateModel(
     int[] QOutputVectorLaneShape,
     int[] QKVLayout,
     int[] AttentionLayout,
+    PyNTTQKVPartialInputTemplateModel? QPartial,
+    PyNTTQKVPartialInputTemplateModel? KPartial,
+    PyNTTQKVPartialInputTemplateModel? VPartial,
     string Comment)
 {
     public string[] RuntimeShapeArgs { get; set; } = Array.Empty<string>();
@@ -869,6 +905,16 @@ public sealed record PyNTTPagedAttentionMergeTemplateModel(
     int GlobalNumQueryHeads,
     int SplitHierarchyAxis,
     int SplitCount,
+    string Comment)
+{
+    public string[] RuntimeShapeArgs { get; set; } = Array.Empty<string>();
+}
+
+public sealed record PyNTTPagedAttentionMergePackedMatMulTemplateModel(
+    string FunctionName,
+    PyNTTPagedAttentionMergeTemplateModel Merge,
+    PyNTTMatmulTemplateModel Matmul,
+    PyNTTMicroKernelTemplateModel MicroKernel,
     string Comment)
 {
     public string[] RuntimeShapeArgs { get; set; } = Array.Empty<string>();

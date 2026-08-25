@@ -14,7 +14,11 @@ public sealed partial class PagedAttentionPartial : NTTKernelOp
 {
     public static readonly ParameterInfo Q = new(typeof(PagedAttentionPartial), 0, "q", memoryEffect: MemoryEffect.Read);
 
-    public static readonly ParameterInfo KVCaches = new(typeof(PagedAttentionPartial), 1, "kvCaches", memoryEffect: MemoryEffect.ChipRead);
+    public static readonly ParameterInfo KVCaches = new(
+        typeof(PagedAttentionPartial),
+        1,
+        "kvCaches",
+        memoryEffect: MemoryEffect.ChipRead.PartitionedByArgument(4));
 
     public static readonly ParameterInfo Extra = new(typeof(PagedAttentionPartial), 2, "extra", memoryEffect: MemoryEffect.Read);
 

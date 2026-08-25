@@ -162,9 +162,21 @@ public sealed class TritonTargetOpCostModel : ITargetOpCostModel, IHierarchicalT
         var computeCycles = query.Kind switch
         {
             MatMulOpCostKind.Simt => EstimateSimtMatMulComputeCycles(m, n, k, batch),
+            MatMulOpCostKind.Mma => EstimateMmaMatMulComputeCycles(
+                m,
+                n,
+                k,
+                batch,
+                query.Lhs.DType,
+                query.Rhs.DType),
             _ when !hasVectorLayout => EstimateScalarMatMulComputeCycles(m, n, k, batch),
             _ => EstimateMatMulComputeCycles(m, n, k, batch, query.Lhs.DType, query.Rhs.DType),
         };
+        if (!double.IsFinite(computeCycles))
+        {
+            cost = Cost.Zero;
+            return false;
+        }
 
         var lhsLoadBytes = TargetOpCostModelUtility.GetEffectiveMemoryBytes(
             GetTensorByteCount(query.Lhs),
@@ -220,17 +232,18 @@ public sealed class TritonTargetOpCostModel : ITargetOpCostModel, IHierarchicalT
     private double EstimateMatMulComputeCycles(long m, long n, long k, double batch, DataType lhsDType, DataType rhsDType)
     {
         var simtCycles = EstimateSimtMatMulComputeCycles(m, n, k, batch);
+        var mmaCycles = EstimateMmaMatMulComputeCycles(m, n, k, batch, lhsDType, rhsDType);
+        return double.IsFinite(mmaCycles) ? Math.Min(simtCycles, mmaCycles) : simtCycles;
+    }
+
+    private double EstimateMmaMatMulComputeCycles(long m, long n, long k, double batch, DataType lhsDType, DataType rhsDType)
+    {
         var candidates = _machine.Compute.MatrixPrimitives
             .Where(instruction => instruction.Supports(lhsDType, rhsDType))
             .Select(instruction => EstimateDotInstructionCycles(instruction, m, n, k, batch))
             .Where(double.IsFinite)
             .ToArray();
-        if (candidates.Length > 0)
-        {
-            return Math.Min(simtCycles, candidates.Min());
-        }
-
-        return simtCycles;
+        return candidates.Length > 0 ? candidates.Min() : double.PositiveInfinity;
     }
 
     private double EstimateSimtMatMulComputeCycles(long m, long n, long k, double batch)

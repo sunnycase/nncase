@@ -110,13 +110,15 @@ public sealed record TIRTransferPipelineChannel
 
 /// <summary>
 /// Declares independently executable global-to-Shared transfer channels of a
-/// selected microkernel. A Shared workspace has exactly one channel owner,
-/// while multiple channels may read the same semantic source operand.
+/// selected microkernel. A Shared workspace is owned either by exactly one
+/// transfer channel or by the consumer role, while multiple channels may read
+/// the same semantic source operand.
 /// </summary>
 public sealed record TIRTransferPipelineContract
 {
     public TIRTransferPipelineContract(
-        IEnumerable<TIRTransferPipelineChannel> channels)
+        IEnumerable<TIRTransferPipelineChannel> channels,
+        IEnumerable<int>? consumerSharedWorkspaceIndices = null)
     {
         ArgumentNullException.ThrowIfNull(channels);
         var values = channels.ToImmutableArray();
@@ -148,14 +150,37 @@ public sealed record TIRTransferPipelineContract
                 nameof(channels));
         }
 
+        var consumerWorkspaces = consumerSharedWorkspaceIndices?.ToImmutableArray() ??
+            ImmutableArray<int>.Empty;
+        if (consumerWorkspaces.Any(index => index < 0) ||
+            consumerWorkspaces.Distinct().Count() != consumerWorkspaces.Length)
+        {
+            throw new ArgumentException(
+                "Consumer Shared workspace indexes must be non-negative and unique.",
+                nameof(consumerSharedWorkspaceIndices));
+        }
+
+        var channelWorkspaces = values
+            .SelectMany(channel => channel.SharedWorkspaceIndices)
+            .ToImmutableArray();
+        var conflictingWorkspace = channelWorkspaces
+            .Intersect(consumerWorkspaces)
+            .Cast<int?>()
+            .FirstOrDefault();
+        if (conflictingWorkspace is not null)
+        {
+            throw new ArgumentException(
+                $"Shared workspace {conflictingWorkspace.Value} is owned by both a transfer channel and the consumer.",
+                nameof(consumerSharedWorkspaceIndices));
+        }
+
         Channels = values;
         SourceArgumentIndices = values
             .SelectMany(channel => channel.SourceArgumentIndices)
             .Distinct()
             .ToImmutableArray();
-        SharedWorkspaceIndices = values
-            .SelectMany(channel => channel.SharedWorkspaceIndices)
-            .ToImmutableArray();
+        SharedWorkspaceIndices = channelWorkspaces;
+        ConsumerSharedWorkspaceIndices = consumerWorkspaces;
     }
 
     public ImmutableArray<TIRTransferPipelineChannel> Channels { get; }
@@ -170,6 +195,12 @@ public sealed record TIRTransferPipelineContract
     /// Gets all channel-owned Shared workspaces for arena lifetime analysis.
     /// </summary>
     public ImmutableArray<int> SharedWorkspaceIndices { get; }
+
+    /// <summary>
+    /// Gets Shared workspaces owned directly by the consumer role rather than
+    /// by a transfer channel.
+    /// </summary>
+    public ImmutableArray<int> ConsumerSharedWorkspaceIndices { get; }
 }
 
 /// <summary>

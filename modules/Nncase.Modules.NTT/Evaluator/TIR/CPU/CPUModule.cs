@@ -49,6 +49,9 @@ internal class NTTModule : IApplicationPart
         registrator.RegisterManyInterface<NormStatsEvaluator>(reuse: Reuse.Singleton);
         registrator.RegisterManyInterface<NormApplyEvaluator>(reuse: Reuse.Singleton);
         registrator.RegisterManyInterface<GatherReduceNormApplyEvaluator>(reuse: Reuse.Singleton);
+        registrator.RegisterManyInterface<GatherReduceAddNormStatsEvaluator>(reuse: Reuse.Singleton);
+        registrator.RegisterManyInterface<GatherReduceAddNormApplyEvaluator>(reuse: Reuse.Singleton);
+        registrator.RegisterManyInterface<GatherReduceQKVRoPEWithCacheEvaluator>(reuse: Reuse.Singleton);
         registrator.RegisterManyInterface<QKVRoPEWithCacheEvaluator>(reuse: Reuse.Singleton);
         registrator.RegisterManyInterface<GatedDeltaNetConvolutionEvaluator>(reuse: Reuse.Singleton);
         registrator.RegisterManyInterface<GatedDeltaNetRecurrentCoreEvaluator>(reuse: Reuse.Singleton);
@@ -83,6 +86,7 @@ internal class NTTModule : IApplicationPart
         registrator.RegisterManyInterface<PagedAttentionUseSplitKVEvaluator>(reuse: Reuse.Singleton);
         registrator.RegisterManyInterface<PagedAttentionPartialEvaluator>(reuse: Reuse.Singleton);
         registrator.RegisterManyInterface<PagedAttentionMergeEvaluator>(reuse: Reuse.Singleton);
+        registrator.RegisterManyInterface<PagedAttentionMergePackedMatMulEvaluator>(reuse: Reuse.Singleton);
         registrator.RegisterManyInterface<UpdatePagedAttentionKVCacheEvaluator>(reuse: Reuse.Singleton);
         registrator.RegisterManyInterface<CreatePagedAttentionKVCacheEvaluator>(reuse: Reuse.Singleton);
         registrator.RegisterManyInterface<IdentityPagedAttentionKVCacheEvaluator>(reuse: Reuse.Singleton);

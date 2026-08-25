@@ -2,6 +2,8 @@
 {% import "triton/kernels/_elementwise.py.jinja" as elementwise with context %}
 {% import "triton/kernels/_paged_attention_kv_cache.py.jinja" as cache_io with context %}
 {% import "triton/kernels/_producer_consumer.py.jinja" as phases with context %}
+{% import "triton/kernels/_qkv_partial.py.jinja" as partial_io with context %}
+{% import "triton/kernels/_qkv_partial_headwise.py.jinja" as partial_headwise with context %}
 {% set ctx = qkv_rope_with_cache_context(model) %}
 {% set q_norm = model["QNorm"] %}
 {% set k_norm = model["KNorm"] %}
@@ -10,8 +12,29 @@
 {% set k_update = model["KUpdate"] %}
 {% set v_update = model["VUpdate"] %}
 {% set args = ("slot_mapping", "kv_cache", "num_blocks_per_shard", "query_start_loc", "num_seqs") %}
+{% set fused_partial = model["QPartial"] is not none %}
 # generated from PyNTT Jinja QKVRoPEWithCache.py.jinja
 # {{ model["Comment"] }}; q_shape={{ shape_tuple(q_norm["InputShape"]) }}, k_shape={{ shape_tuple(k_norm["InputShape"]) }}, v_shape={{ shape_tuple(v_update["SlotsShape"]) }}, layer={{ k_update["LayerIdExpression"] }}
+{% if fused_partial and ctx["headwise_partial"] %}
+{% for head in (ctx["q"], ctx["k"], ctx["v"]) %}
+{{ head["headwise_partial_layout"]["name"] }} = tl.constexpr(
+    tle.gpu.BlockEncoding(
+        [{{ head["headwise_partial_layout"]["size_per_thread"] | join(", ") }}],
+        [{{ head["headwise_partial_layout"]["threads_per_warp"] | join(", ") }}],
+        [{{ head["headwise_partial_layout"]["warps_per_cta"] | join(", ") }}],
+        [{{ head["headwise_partial_layout"]["order"] | join(", ") }}],
+    )
+)
+{{ head["headwise_layout"]["name"] }} = tl.constexpr(
+    tle.gpu.SlicedEncoding(
+        {{ head["headwise_layout"]["sliced_dimension"] }},
+        {{ head["headwise_layout"]["parent_name"] }}.value,
+    )
+)
+{% endfor %}
+
+
+{% endif %}
 {{ phases.consumer_header(model, args) }}
 {{ common.mesh_coordinates(model["MeshAxes"]) }}
     q_input = {{ ptr(q_norm, "Input") }}
@@ -27,17 +50,28 @@
     layer_id_value = (tl.full((), 0, tl.int64) + ({{ k_update["LayerIdExpression"] }})).to(tl.int64)
     num_tokens = tl.load(query_start_loc + num_seqs).to(tl.int64)
 
+{% if fused_partial and ctx["headwise_partial"] %}
+{{ partial_headwise.run(model, ctx) }}
+{% else %}
+{% if fused_partial %}
+    if {{ ctx["q"]["partial_input"]["active"] }}:
+{% endif %}
+{% set q_guard_depth = 1 if fused_partial else 0 %}
 {% for axis in ctx["q"]["outer_axes"] %}
-{{ "    " * loop.index }}for index{{ axis }} in tl.range(0, {{ dim(q_norm["InputShape"][axis]) }}):
+{{ "    " * (loop.index + q_guard_depth) }}for index{{ axis }} in tl.range(0, {{ dim(q_norm["InputShape"][axis]) }}):
 {% endfor %}
-{% set q_base = "    " * ((ctx["q"]["outer_axes"] | length) + 1) %}
+{% set q_base = "    " * ((ctx["q"]["outer_axes"] | length) + 1 + q_guard_depth) %}
 {{ q_base }}q_inner_count = ({{ ctx["q"]["normalization_size"] }}) + 0.0
 {% if q_norm["UseMean"] %}
 {{ q_base }}q_mean_sum = tl.full((), 0.0, tl.float32)
 {% endif %}
 {{ q_base }}q_square_sum = tl.full((), 0.0, tl.float32)
-{% call(indent) elementwise.iterate(ctx["q"]["reduction_context"], ctx["q"]["prefix_depth"], scope="q_reduce") %}
+{% call(indent) elementwise.iterate(ctx["q"]["reduction_context"], ctx["q"]["prefix_depth"] + q_guard_depth, scope="q_reduce") %}
+{% if fused_partial %}
+{{ partial_io.load(ctx["q"]["reduction_context"]["partial_input"], "norm_value", "mask", indent) }}
+{% else %}
 {{ indent }}norm_value = tl.load({{ access_pointer(q_norm, "Input", "q_input", ctx["q"]["reduction_context"]["input_access"]) }}, mask=mask, other=0.0).to(tl.float32)
+{% endif %}
 {% if q_norm["UseMean"] %}
 {{ indent }}q_mean_sum += {{ ctx["q"]["reduction"] }}
 {% endif %}
@@ -51,10 +85,15 @@
 {{ q_base }}q_variance = q_square_sum / q_inner_count
 {% endif %}
 {{ q_base }}q_inv_std = tl.rsqrt(tl.maximum(q_variance, 0.0) + {{ pyrepr(q_norm["Epsilon"]) }})
-{% call(indent) elementwise.iterate(ctx["q"], ctx["q"]["prefix_depth"], scope="q") %}
+{% call(indent) elementwise.iterate(ctx["q"], ctx["q"]["prefix_depth"] + q_guard_depth, scope="q") %}
 {{ indent }}mask = mask & ({{ ctx["q"]["output_physical_rotary"] }} < {{ dim(ctx["q"]["output_rotary_extent"]) }})
+{% if fused_partial %}
+{{ partial_io.load(ctx["q"]["partial_input"], "q_value", "mask", indent) }}
+{{ partial_io.load(ctx["q"]["paired_partial_input"], "q_pair", "mask", indent) }}
+{% else %}
 {{ indent }}q_value = tl.load({{ access_pointer(q_norm, "Input", "q_input", ctx["q"]["input_access"]) }}, mask=mask, other=0.0).to(tl.float32)
 {{ indent }}q_pair = tl.load({{ access_pointer(q_norm, "Input", "q_input", ctx["q"]["paired_input_access"]) }}, mask=mask, other=0.0).to(tl.float32)
+{% endif %}
 {{ indent }}q_scale_value = tl.load({{ access_pointer(q_norm, "Scale", "q_scale", ctx["q"]["scale_access"]) }}, mask=mask, other=0.0).to(tl.float32)
 {{ indent }}q_pair_scale = tl.load({{ access_pointer(q_norm, "Scale", "q_scale", ctx["q"]["paired_scale_access"]) }}, mask=mask, other=0.0).to(tl.float32)
 {{ indent }}q_bias_value = tl.load({{ access_pointer(q_norm, "Bias", "q_bias", ctx["q"]["bias_access"]) }}, mask=mask, other=0.0).to(tl.float32)
@@ -68,17 +107,25 @@
 {{ indent }}tl.store({{ access_pointer(model, "QOutput", "q_output", ctx["q"]["final_output_access"]) }}, q_result, mask=mask)
 {% endcall %}
 
+{% if fused_partial %}
+    if {{ ctx["k"]["partial_input"]["active"] }}:
+{% endif %}
+{% set k_guard_depth = 1 if fused_partial else 0 %}
 {% for axis in ctx["k"]["outer_axes"] %}
-{{ "    " * loop.index }}for index{{ axis }} in tl.range(0, {{ dim(k_norm["InputShape"][axis]) }}):
+{{ "    " * (loop.index + k_guard_depth) }}for index{{ axis }} in tl.range(0, {{ dim(k_norm["InputShape"][axis]) }}):
 {% endfor %}
-{% set k_base = "    " * ((ctx["k"]["outer_axes"] | length) + 1) %}
+{% set k_base = "    " * ((ctx["k"]["outer_axes"] | length) + 1 + k_guard_depth) %}
 {{ k_base }}k_inner_count = ({{ ctx["k"]["normalization_size"] }}) + 0.0
 {% if k_norm["UseMean"] %}
 {{ k_base }}k_mean_sum = tl.full((), 0.0, tl.float32)
 {% endif %}
 {{ k_base }}k_square_sum = tl.full((), 0.0, tl.float32)
-{% call(indent) elementwise.iterate(ctx["k"]["reduction_context"], ctx["k"]["prefix_depth"], scope="k_reduce") %}
+{% call(indent) elementwise.iterate(ctx["k"]["reduction_context"], ctx["k"]["prefix_depth"] + k_guard_depth, scope="k_reduce") %}
+{% if fused_partial %}
+{{ partial_io.load(ctx["k"]["reduction_context"]["partial_input"], "norm_value", "mask", indent) }}
+{% else %}
 {{ indent }}norm_value = tl.load({{ access_pointer(k_norm, "Input", "k_input", ctx["k"]["reduction_context"]["input_access"]) }}, mask=mask, other=0.0).to(tl.float32)
+{% endif %}
 {% if k_norm["UseMean"] %}
 {{ indent }}k_mean_sum += {{ ctx["k"]["reduction"] }}
 {% endif %}
@@ -92,10 +139,15 @@
 {{ k_base }}k_variance = k_square_sum / k_inner_count
 {% endif %}
 {{ k_base }}k_inv_std = tl.rsqrt(tl.maximum(k_variance, 0.0) + {{ pyrepr(k_norm["Epsilon"]) }})
-{% call(indent) elementwise.iterate(ctx["k"], ctx["k"]["prefix_depth"], scope="k") %}
+{% call(indent) elementwise.iterate(ctx["k"], ctx["k"]["prefix_depth"] + k_guard_depth, scope="k") %}
 {{ indent }}mask = mask & ({{ ctx["k"]["output_physical_rotary"] }} < {{ dim(ctx["k"]["output_rotary_extent"]) }})
+{% if fused_partial %}
+{{ partial_io.load(ctx["k"]["partial_input"], "k_value", "mask", indent) }}
+{{ partial_io.load(ctx["k"]["paired_partial_input"], "k_pair", "mask", indent) }}
+{% else %}
 {{ indent }}k_value = tl.load({{ access_pointer(k_norm, "Input", "k_input", ctx["k"]["input_access"]) }}, mask=mask, other=0.0).to(tl.float32)
 {{ indent }}k_pair = tl.load({{ access_pointer(k_norm, "Input", "k_input", ctx["k"]["paired_input_access"]) }}, mask=mask, other=0.0).to(tl.float32)
+{% endif %}
 {{ indent }}k_scale_value = tl.load({{ access_pointer(k_norm, "Scale", "k_scale", ctx["k"]["scale_access"]) }}, mask=mask, other=0.0).to(tl.float32)
 {{ indent }}k_pair_scale = tl.load({{ access_pointer(k_norm, "Scale", "k_scale", ctx["k"]["paired_scale_access"]) }}, mask=mask, other=0.0).to(tl.float32)
 {{ indent }}k_bias_value = tl.load({{ access_pointer(k_norm, "Bias", "k_bias", ctx["k"]["bias_access"]) }}, mask=mask, other=0.0).to(tl.float32)
@@ -109,10 +161,18 @@
 {{ cache_io.store(k_update, ctx["k"]["cache"], "k_result", "mask", indent) }}
 {% endcall %}
 
-{% call(indent) elementwise.iterate(ctx["v"], scope="v") %}
+{% if fused_partial %}
+    if {{ ctx["v"]["partial_input"]["active"] }}:
+{% endif %}
+{% call(indent) elementwise.iterate(ctx["v"], 1 if fused_partial else 0, scope="v") %}
+{% if fused_partial %}
+{{ partial_io.load(ctx["v"]["partial_input"], "v_value", "mask", indent) }}
+{% else %}
 {{ indent }}v_value = tl.load({{ access_pointer(v_update, "Slots", "v_input", ctx["v"]["slots_access"]) }}, mask=mask, other=0.0)
+{% endif %}
 {{ cache_io.store(v_update, ctx["v"], "v_value", "mask", indent) }}
 {% endcall %}
+{% endif %}
 
 
 {{ phases.dispatch(model, args) }}

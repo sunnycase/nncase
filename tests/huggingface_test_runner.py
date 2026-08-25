@@ -291,6 +291,20 @@ class HuggingfaceTestRunner(TestRunner):
         # Decode HF token
         return (new_token, self.tokenizer.decode(new_token, skip_special_tokens=False))
 
+    def apply_reference_lm_head(self, hidden_states: np.ndarray) -> np.ndarray:
+        lm_head = self.model.get_output_embeddings()
+        if lm_head is None:
+            raise RuntimeError("The HuggingFace reference model has no output embeddings.")
+        parameter = next(lm_head.parameters(), None)
+        if parameter is None:
+            raise RuntimeError("The HuggingFace reference output embeddings have no parameters.")
+        hidden_tensor = torch.as_tensor(
+            hidden_states,
+            dtype=self.hf_config.torch_dtype,
+            device=parameter.device,
+        )
+        return lm_head(hidden_tensor).detach().to(torch.float32).cpu().numpy()
+
     def get_result(self, model, token_num, eval_or_infer):
         results = []
         next_token_id = None
@@ -306,8 +320,9 @@ class HuggingfaceTestRunner(TestRunner):
                 logits_to_keep = 0
                 slice_indices = slice(-logits_to_keep, None) if isinstance(logits_to_keep,
                                                                            int) else logits_to_keep
-                nncase_logits = self.model.lm_head(torch.tensor(
-                    res[np.newaxis, ...][:, slice_indices, :], dtype=self.hf_config.torch_dtype)).detach().to(torch.float32).numpy()
+                nncase_logits = self.apply_reference_lm_head(
+                    res[np.newaxis, ...][:, slice_indices, :]
+                )
                 next_token_id, next_token = self.decode_token(nncase_logits)
             else:
                 results.append(res)
@@ -341,8 +356,9 @@ class HuggingfaceTestRunner(TestRunner):
                 logits_to_keep = 0
                 slice_indices = slice(-logits_to_keep, None) if isinstance(logits_to_keep,
                                                                            int) else logits_to_keep
-                nncase_logits = self.model.lm_head(torch.tensor(
-                    res[np.newaxis, ...][:, slice_indices, :], dtype=self.hf_config.torch_dtype)).detach().to(torch.float32).numpy()
+                nncase_logits = self.apply_reference_lm_head(
+                    res[np.newaxis, ...][:, slice_indices, :]
+                )
                 next_token_id, next_token = self.decode_token(nncase_logits)
             else:
                 results.append(res)

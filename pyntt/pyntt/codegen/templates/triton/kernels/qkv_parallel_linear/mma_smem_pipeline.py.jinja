@@ -1,0 +1,221 @@
+{% macro pipeline_setup(stage) -%}
+{% set stage_model = stage["Model"] %}
+{% set stage_ctx = packed_qkv_mma_pipeline_context(stage_model) %}
+{% set shared_buffer_shape = [stage_ctx["num_stages"]] + (stage_ctx["shared_stage_shape"] | list) %}
+{{ stage["StageName"] }}__rhs_stages = tle.gpu.alloc(
+    [{{ shared_buffer_shape | join(", ") }}],
+    dtype={{ stage_model["WeightTritonDType"] }},
+    layout=tle.gpu.nv_tma_shared_layout(
+        [{{ shared_buffer_shape | join(", ") }}],
+        [{{ range((shared_buffer_shape | length) - 1, -1, -1) | join(", ") }}],
+        {{ stage_model["WeightTritonDType"] }},
+        [{% for _ in shared_buffer_shape %}1{{ ", " if not loop.last }}{% endfor %}],
+        [{% for _ in shared_buffer_shape %}1{{ ", " if not loop.last }}{% endfor %}],
+        [{{ range((shared_buffer_shape | length) - 1, -1, -1) | join(", ") }}],
+        False,
+        True,
+    ),
+    scope=tle.gpu.smem,
+    alias=pyntt_shared_arena,
+    alias_offset_bytes={{ stage["SharedWorkspaceOffsets"]["rhs_stage"] }},
+)
+{% set lhs_workspace = stage["ConsumerSharedWorkspaces"][0] %}
+{{ lhs_workspace["VariableName"] }} = tle.gpu.alloc(
+    [1, {{ dim(stage_ctx["k"]) }}],
+    dtype={{ stage_model["InputTritonDType"] }},
+    layout=None,
+    scope=tle.gpu.smem,
+    alias=pyntt_shared_arena,
+    alias_offset_bytes={{ lhs_workspace["SharedWorkspaceOffset"] }},
+    nv_mma_shared_layout=True,
+)
+{{ stage["PipeName"] }} = tle.pipe(
+    capacity={{ stage_ctx["num_stages"] }},
+    scope="cta",
+    name="{{ stage["StageName"] }}_weight",
+    weight={{ stage["StageName"] }}__rhs_stages,
+)
+{%- endmacro %}
+{% if model is defined %}
+{% import "triton/kernels/_common.py.jinja" as common with context %}
+{% set ctx = packed_qkv_mma_pipeline_context(model) %}
+# generated from PyNTT algorithm triton.qkv_parallel_linear/mma_smem_pipeline
+# {{ model["Comment"] }}; input_dtype={{ model["InputDType"] }}, weight_dtype={{ model["WeightDType"] }}, output_dtype={{ model["OutputDType"] }}, input_shape={{ shape_tuple(model["InputShape"]) }}, weight_shape={{ shape_tuple(model["WeightShape"]) }}, projection_n_capacities={{ model["ProjectionNCapacities"] }}, q_output_shape={{ shape_tuple(model["QOutputShape"]) }}, k_output_shape={{ shape_tuple(model["KOutputShape"]) }}, v_output_shape={{ shape_tuple(model["VOutputShape"]) }}, rhs_layout={{ model["RhsLayout"] }}, n_lane={{ model["NVectorLaneCount"] }}, k_pack={{ model["KPackLaneCount"] }}, k_lane={{ model["KVectorLaneCount"] }}, block_n={{ ctx["block_n"] }}, block_k={{ ctx["block_k"] }}, num_stages={{ ctx["num_stages"] }}
+{{ ctx["mma_layout_name"] }} = tl.constexpr(
+    tle.gpu.MmaEncoding([2, 0], [{{ model["NumWarps"] }}, 1], [16, 8])
+)
+{{ ctx["mma_a_layout_name"] }} = tl.constexpr(
+    tle.gpu.DotOperandEncoding(0, {{ ctx["mma_layout_name"] }}, 2)
+)
+{{ ctx["mma_b_layout_name"] }} = tl.constexpr(
+    tle.gpu.DotOperandEncoding(1, {{ ctx["mma_layout_name"] }}, 2)
+)
+{{ ctx["mma_b_k_layout_name"] }} = tl.constexpr(
+    tle.gpu.SlicedEncoding(1, {{ ctx["mma_b_layout_name"] }}.value)
+)
+{{ ctx["mma_c_m_layout_name"] }} = tl.constexpr(
+    tle.gpu.SlicedEncoding(1, {{ ctx["mma_layout_name"] }}.value)
+)
+{{ ctx["mma_c_n_layout_name"] }} = tl.constexpr(
+    tle.gpu.SlicedEncoding(0, {{ ctx["mma_layout_name"] }}.value)
+)
+{{ ctx["mma_input_copy_layout_name"] }} = tl.constexpr(
+    tle.gpu.BlockEncoding(
+        [1, 1],
+        [1, {{ model["TargetWorkerWidth"] }}],
+        [1, {{ model["NumWarps"] }}],
+        [0, 1],
+    )
+)
+
+
+{{ "@triton.jit(noinline=True)" if model["NoInline"] else "@triton.jit" }}
+def {{ model["FunctionName"] }}__consumer_stage(weight_stage, lhs_stage, k_tile):
+    b_k = tle.encoding(
+        tl.arange(0, {{ ctx["block_k"] }}),
+        {{ ctx["mma_b_k_layout_name"] }},
+    )
+    lhs_row = tle.encoding(
+        tl.zeros(({{ ctx["block_k"] }},), tl.int32),
+        {{ ctx["mma_b_k_layout_name"] }},
+    )
+    packed_weight = tl.load(tle.gpu.local_ptr(weight_stage))
+    logical_weight = tl.reshape(
+        packed_weight,
+        (
+            {{ ctx["block_n"] // model["NVectorLaneCount"] }},
+            {{ ctx["block_k"] // (model["KPackLaneCount"] * model["KVectorLaneCount"]) }},
+            {{ model["NVectorLaneCount"] }},
+            {{ model["KPackLaneCount"] * model["KVectorLaneCount"] }},
+        ),
+    )
+    logical_weight = tl.reshape(
+        tl.permute(logical_weight, (0, 2, 1, 3)),
+        ({{ ctx["block_n"] }}, {{ ctx["block_k"] }}),
+    )
+    a_value = tle.encoding(
+        logical_weight,
+        {{ ctx["mma_a_layout_name"] }},
+    )
+    input_value = tle.encoding(
+        tl.load(
+            tle.gpu.local_ptr(
+                lhs_stage,
+                (lhs_row, k_tile * {{ ctx["block_k"] }} + b_k),
+            )
+        ),
+        {{ ctx["mma_b_k_layout_name"] }},
+    )
+    b_value = tle.encoding(
+        tl.broadcast_to(input_value[:, None], ({{ ctx["block_k"] }}, 8)),
+        {{ ctx["mma_b_layout_name"] }},
+    )
+    stage_acc = tle.encoding(
+        tl.zeros(({{ ctx["block_n"] }}, 8), tl.float32),
+        {{ ctx["mma_layout_name"] }},
+    )
+    return tl.dot(a_value, b_value, acc=stage_acc, out_dtype=tl.float32)
+
+
+{{ "@triton.jit(noinline=True)" if model["NoInline"] else "@triton.jit" }}
+def {{ model["FunctionName"] }}__producer(writer, {{ helper_parameters(model) }}):
+{{ common.mesh_coordinates(model["MeshAxes"]) }}
+    weight_descriptor_entry = tle.gpu.tensor_map_table_entry(
+        {{ ctx["descriptor_name"] }},
+        shard_index,
+    )
+    tle.gpu.tensor_map_fenceproxy_acquire(weight_descriptor_entry)
+    n_tile = tl.full((), 0, tl.int32)
+    for k_tile in tl.static_range(0, {{ ctx["num_k_tiles"] }}):
+        slot = writer.acquire(k_tile)
+        weight_descriptor = tle.gpu.reinterpret_tensor_map(
+            weight_descriptor_entry,
+            slot.weight,
+        )
+        tle.gpu.copy(
+            weight_descriptor,
+            slot.weight,
+            [{{ ctx["shared_stage_shape"] | join(", ") }}],
+            offsets=[
+{% for offset in ctx["descriptor_offsets"] %}
+                {{ tma_offset(offset) }},
+{% endfor %}
+            ],
+            eviction_policy="evict_first",
+        )
+        writer.commit(k_tile)
+    writer.close({{ ctx["num_k_tiles"] }})
+
+
+{{ "@triton.jit(noinline=True)" if model["NoInline"] else "@triton.jit" }}
+def {{ model["FunctionName"] }}__consumer(reader, lhs_stage, {{ helper_parameters(model) }}):
+{{ common.mesh_coordinates(model["MeshAxes"]) }}
+    input0 = {{ ptr(model, "Input") }}
+{% for prefix in ("Q", "K", "V") %}
+    {{ prefix | lower }}_output = {{ ptr(model, prefix ~ "Output") }}
+{% endfor %}
+    c_m = tle.encoding(
+        tl.arange(0, {{ ctx["block_n"] }}),
+        {{ ctx["mma_c_m_layout_name"] }},
+    )
+    c_n = tle.encoding(
+        tl.arange(0, 8),
+        {{ ctx["mma_c_n_layout_name"] }},
+    )
+    c_n_zero = tle.encoding(
+        tl.zeros((1, 8), tl.int32),
+        {{ ctx["mma_layout_name"] }},
+    )
+    input_copy_offset = tle.encoding(
+        tl.arange(0, {{ dim(ctx["k"]) }})[None, :],
+        {{ ctx["mma_input_copy_layout_name"] }},
+    )
+    pipeline_input_copy_k = input_copy_offset
+    tle.gpu.copy(
+        {{ access_pointer(model, "Input", "input0", ctx["complete_input_copy_access"]) }},
+        lhs_stage,
+        [1, {{ dim(ctx["k"]) }}],
+        is_async=True,
+        eviction_policy="evict_last",
+    )
+    tle.gpu.async_commit_group()
+    acc = tle.encoding(
+        tl.zeros(({{ ctx["block_n"] }}, 8), tl.float32),
+        {{ ctx["mma_layout_name"] }},
+    )
+    for k_tile in tl.static_range(0, {{ ctx["num_k_tiles"] }}):
+        ready = reader.wait(k_tile)
+        if k_tile == 0:
+            tle.gpu.async_wait_group(0)
+            tl.debug_barrier()
+        acc += {{ model["FunctionName"] }}__consumer_stage(
+            ready.slot.weight,
+            lhs_stage,
+            k_tile,
+        )
+        reader.release(k_tile)
+
+    pipeline_output_n = c_m
+{% for projection in ctx["projections"] %}
+    {{ projection["projection_n_expr"] }} = (
+        pipeline_output_n - {{ projection["projection_start"] }}
+    )
+    {{ projection["lower"] }}_output_ptr = tle.encoding(
+        {{ access_pointer(model, projection["prefix"] ~ "Output", projection["lower"] ~ "_output", projection["output_access"]) }}[:, None]
+        + c_n_zero,
+        {{ ctx["mma_layout_name"] }},
+    )
+    {{ projection["lower"] }}_output_mask = tle.encoding(
+        ({{ projection["projection_mask"] }})[:, None]
+        & (c_n[None, :] == c_n_zero),
+        {{ ctx["mma_layout_name"] }},
+    )
+    tl.store(
+        {{ projection["lower"] }}_output_ptr,
+        acc,
+        mask={{ projection["lower"] }}_output_mask,
+    )
+{% endfor %}
+
+
+{% endif %}

@@ -25,6 +25,16 @@ public sealed partial class TensorStore : NTTKernelOp
         IReadOnlyList<BaseExpr> arguments)
     {
         var effect = base.GetMemoryEffect(parameter, arguments);
+        if (ReferenceEquals(parameter, Dest) &&
+            arguments.Count > Dest.Index &&
+            IsCompactPerOwner(arguments[Dest.Index]))
+        {
+            // Every block writes only its own ABI component. Cross-block reads
+            // performed while forming that component remain effects of Src;
+            // publishing Dest itself requires only owner-local ordering.
+            effect = effect with { Scope = MemoryAccessScope.Inferred };
+        }
+
         if ((ReferenceEquals(parameter, Src) || ReferenceEquals(parameter, Dest)) &&
             arguments.Count > Dest.Index &&
             arguments[Src.Index] is TIR.Buffer source &&
@@ -36,4 +46,14 @@ public sealed partial class TensorStore : NTTKernelOp
 
         return effect;
     }
+
+    private static bool IsCompactPerOwner(BaseExpr expression)
+        => expression switch
+        {
+            TIR.Buffer buffer =>
+                buffer.DistributedStorageKind == DistributedBufferStorageKind.CompactPerOwner,
+            BufferVar bufferVar =>
+                bufferVar.LayoutAnnotation.DistributedStorageKind == DistributedBufferStorageKind.CompactPerOwner,
+            _ => false,
+        };
 }

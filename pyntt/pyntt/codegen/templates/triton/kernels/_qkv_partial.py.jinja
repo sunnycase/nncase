@@ -1,0 +1,25 @@
+{% macro load(partial, value_name, mask, indent) %}
+{{ indent }}partial_acc = tl.zeros_like({{ partial["source_access"]["ScalarOffset"] }}).to({{ partial["accumulator_dtype"] }})
+{{ indent }}for partial_start in tl.range(0, {{ partial["reduction_extent"] }}, {{ partial["reduction_width"] }}):
+{{ indent }}    partial_lane = partial_start + tl.arange(0, {{ partial["reduction_width"] }})
+{{ indent }}    partial_lane_mask = partial_lane < {{ partial["reduction_extent"] }}
+{{ indent }}    partial_lane = partial_lane{{ partial["reduction_lane_reshape"] }}
+{{ indent }}    partial_lane_mask = partial_lane_mask{{ partial["reduction_lane_reshape"] }}
+{% for axis in range(partial["hierarchy"] | length) %}
+{% if axis in partial["partial_axes"] %}
+{{ indent }}    source_shard_coord{{ axis }} = (partial_lane // {{ partial["axis_strides"][axis] }}) % {{ partial["hierarchy"][axis] }}
+{% elif axis in partial["owner_expressions"] %}
+{{ indent }}    source_shard_coord{{ axis }} = (({{ partial["owner_expressions"][axis] }}) + ({{ partial["source_access"]["ScalarOffset"] }}) * 0){{ partial["target_reduction_reshape"] }}
+{% else %}
+{{ indent }}    source_shard_coord{{ axis }} = shard_coord{{ axis }} + partial_lane * 0
+{% endif %}
+{% endfor %}
+{{ indent }}    source_shard_index = {{ partial["source_shard_index"] }}
+{{ indent }}    source_pool_index = {{ partial["source_pool_index"] }}
+{{ indent }}    source_byte_offset = source_pool_index * {{ partial["address"]["PoolStrideBytes"] }} + {{ partial["address"]["OffsetBytes"] }}
+{{ indent }}    source = ({{ partial["address"]["BaseName"] }} + source_byte_offset).to({{ partial["pointer_type"] }})
+{{ indent }}    source_offsets = ({{ partial["source_access"]["ScalarOffset"] }}){{ partial["target_reduction_reshape"] }}
+{{ indent }}    source_value = tl.load(source + source_offsets, mask=({{ mask }}){{ partial["target_reduction_reshape"] }} & partial_lane_mask, other={{ partial["zero"] }}).to({{ partial["accumulator_dtype"] }})
+{{ indent }}    partial_acc += tl.sum(source_value, axis={{ partial["reduction_axis"] }})
+{{ indent }}{{ value_name }} = partial_acc.to({{ partial["triton_dtype"] }}).to({{ partial["accumulator_dtype"] }})
+{% endmacro %}

@@ -171,6 +171,27 @@ public sealed class SelectTIRMicroKernelsPass : ModulePass
                     }
                 }
             }
+
+            foreach (var workspaceIndex in contract.ConsumerSharedWorkspaceIndices)
+            {
+                if ((uint)workspaceIndex >= (uint)selection.SharedWorkspaces.Length)
+                {
+                    throw new InvalidOperationException(
+                        $"TIR microkernel {selection.Family}/{selection.Variant} for " +
+                        $"{kernelOp.GetType().Name} declares invalid consumer Shared workspace {workspaceIndex}.");
+                }
+            }
+
+            var ownedWorkspaceIndices = contract.SharedWorkspaceIndices
+                .Concat(contract.ConsumerSharedWorkspaceIndices)
+                .OrderBy(index => index)
+                .ToArray();
+            if (!ownedWorkspaceIndices.SequenceEqual(Enumerable.Range(0, selection.SharedWorkspaces.Length)))
+            {
+                throw new InvalidOperationException(
+                    $"TIR microkernel {selection.Family}/{selection.Variant} for {kernelOp.GetType().Name} " +
+                    "must assign every Shared workspace to one transfer channel or the consumer role.");
+            }
         }
 
         private TIR.Buffer CreateSharedWorkspaceBuffer(

@@ -103,6 +103,7 @@ public abstract class TIRSelectionPass : FunctionPass
         Expr sourceExpr,
         IRType type,
         MemoryLocation defaultLocation,
+        IReadOnlyList<int> resultPath,
         string name)
     {
         var tensorType = type switch
@@ -779,7 +780,7 @@ public abstract class TIRSelectionPass : FunctionPass
                 var fields = tt.Fields.AsValueEnumerable()
                     .Select((type, index) => IsRootTupleProjection(expr, index)
                         ? CreateOutputBuffer(type)
-                        : CreateBuffer(expr, type, memoryLocation))
+                        : CreateIntermediateOutput(expr, type, memoryLocation, [index]))
                     .ToArray();
                 return new IR.Tuple(fields);
             }
@@ -807,6 +808,17 @@ public abstract class TIRSelectionPass : FunctionPass
                 projection[IR.Tensors.GetItem.Index] is DimConst index &&
                 index.Value == fieldIndex;
         }
+
+        private BaseExpr CreateIntermediateOutput(
+            Expr sourceExpr,
+            IRType type,
+            MemoryLocation memoryLocation,
+            IReadOnlyList<int> resultPath)
+            => type is TupleType tupleType
+                ? new IR.Tuple(tupleType.Fields.AsValueEnumerable()
+                    .Select((field, index) => CreateIntermediateOutput(sourceExpr, field, memoryLocation, [.. resultPath, index]))
+                    .ToArray())
+                : CreateBuffer(sourceExpr, type, memoryLocation, resultPath);
 
         private BaseExpr CreateOutputBuffer(IRType type)
         {
@@ -846,10 +858,18 @@ public abstract class TIRSelectionPass : FunctionPass
         }
 
         private TIR.Buffer CreateBuffer(Expr sourceExpr, IRType type, MemoryLocation memoryLocation)
+            => CreateBuffer(sourceExpr, type, memoryLocation, Array.Empty<int>());
+
+        private TIR.Buffer CreateBuffer(
+            Expr sourceExpr,
+            IRType type,
+            MemoryLocation memoryLocation,
+            IReadOnlyList<int> resultPath)
             => _selectionPass.CreateIntermediateBuffer(
                 sourceExpr,
                 type,
                 memoryLocation,
+                resultPath,
                 $"buffer_{_bufferIndex++}");
     }
 }

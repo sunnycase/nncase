@@ -14,6 +14,7 @@ using Nncase.Passes.Transforms;
 using Nncase.Schedule;
 using Nncase.Targets;
 using Nncase.TIR;
+using Nncase.Utilities;
 using Xunit;
 
 namespace Nncase.Tests.TransformTest;
@@ -112,6 +113,105 @@ public sealed class UnitTestMemorySynchronization : TestClassBase
         Assert.Equal(MemoryEffect.Read, TIR.NTT.Unary.Input.MemoryEffect);
         Assert.Equal(MemoryEffect.Write, TIR.NTT.Unary.Output.MemoryEffect);
         Assert.Empty(ExprCollector.Collect(lowered.Body).OfType<Block>());
+    }
+
+    [Fact]
+    public async Task TestPyNTTPagedAttentionCombineSynchronizesOnlySplitAxis()
+    {
+        CompileOptions.TargetOptions = new PyNTTTargetOptions
+        {
+            Hierarchies = new[] { new[] { 4, 8 } },
+            HierarchyNames = "yx",
+            HierarchyLevels = "bb",
+        };
+        var placement = new Placement([4, 8], "yx", "bb");
+        var layout = new IRArray<AttentionDimKind>(new[]
+        {
+            AttentionDimKind.Head,
+            AttentionDimKind.Dim,
+            AttentionDimKind.Seq,
+        });
+        var statePolicies = new SBP[]
+        {
+            SBP.SBlockCyclic([1], 2),
+            SBP.B,
+            SBP.B,
+        };
+        var maxStateType = new DistributedType(
+            new TensorType(DataTypes.Float32, new RankedShape(16, 1, 1)),
+            statePolicies,
+            placement,
+            SBP.P([0], ReduceOp.Max));
+        var sumStateType = maxStateType with { Partial = SBP.P([0], ReduceOp.Sum) };
+        var accStateType = new DistributedType(
+            new TensorType(DataTypes.Float32, new RankedShape(16, 128, 1)),
+            statePolicies,
+            placement,
+            SBP.P([0], ReduceOp.Sum));
+        var outputType = new DistributedType(
+            new TensorType(DataTypes.BFloat16, new RankedShape(16, 128, 1)),
+            [SBP.SBlockCyclic([1], 2), SBP.SBlockCyclic([0], 32), SBP.B],
+            placement);
+        var maxState = new Var("max_state", maxStateType);
+        var sumState = new Var("sum_state", sumStateType);
+        var accState = new Var("acc_state", accStateType);
+        var combine = IR.F.NTT.PagedAttentionCombine(
+            maxState,
+            sumState,
+            accState,
+            layout,
+            2048,
+            DataTypes.BFloat16,
+            outputType,
+            0,
+            4);
+        var function = new Function(
+            "main",
+            PyNTTTarget.Kind,
+            combine,
+            [maxState, sumState, accState]);
+        Assert.True(function.InferenceType());
+
+        var lowered = Assert.IsType<PrimFunction>(
+            await new NTTTIRSelectionPass(CompileOptions, PyNTTTarget.Kind).RunAsync(function, new()));
+        var selectedBarrierCall = Assert.Single(
+            ExprCollector.Collect(lowered.Body)
+                .OfType<Call>()
+                .Where(call => call.Target is TIR.NTT.Barrier));
+        var selectedBarrier = Assert.IsType<TIR.NTT.Barrier>(selectedBarrierCall.Target);
+        Assert.Equal(new[] { 0 }, selectedBarrier.AxisGroupAxes.ToArray());
+        var mergeCall = Assert.Single(
+            ExprCollector.Collect(lowered.Body)
+                .OfType<Call>()
+                .Where(call => call.Target is TIR.NTT.PagedAttentionMerge));
+        var selectedMaxState = Assert.IsType<TIR.Buffer>(mergeCall[TIR.NTT.PagedAttentionMerge.MaxState]);
+        var selectedSumState = Assert.IsType<TIR.Buffer>(mergeCall[TIR.NTT.PagedAttentionMerge.SumState]);
+        var selectedAccState = Assert.IsType<TIR.Buffer>(mergeCall[TIR.NTT.PagedAttentionMerge.AccState]);
+        var seed = CreateWorkspaceBuffer("seed", DataTypes.Float32, 4096, 4, [1]);
+        var module = new IRModule(lowered.With(
+            body: new Sequential(
+                TIR.F.NTT.Unary(UnaryOp.Abs, seed, selectedMaxState),
+                TIR.F.NTT.Unary(UnaryOp.Abs, seed, selectedSumState),
+                TIR.F.NTT.Unary(UnaryOp.Abs, seed, selectedAccState),
+                selectedBarrierCall,
+                mergeCall)));
+        await new PlanMemorySynchronizationPass(
+            PyNTTTarget.Kind,
+            MemorySynchronizationScopes.All).RunAsync(module, new());
+
+        var planned = Assert.IsType<PrimFunction>(module.Entry);
+        var barriers = ExprCollector.Collect(planned.Body)
+            .OfType<Call>()
+            .Select(call => call.Target)
+            .OfType<TIR.NTT.Barrier>()
+            .ToArray();
+        var barrier = Assert.Single(barriers);
+        Assert.Equal(TIR.NTT.BarrierScope.Chip, barrier.Scope);
+        Assert.Equal(new[] { 0 }, barrier.AxisGroupAxes.ToArray());
+        Assert.Single(
+            ExprCollector.Collect(planned.Body)
+                .OfType<Call>()
+                .Where(call => call.Target is TIR.NTT.PagedAttentionMerge));
     }
 
     [Fact]
@@ -926,6 +1026,76 @@ public sealed class UnitTestMemorySynchronization : TestClassBase
     }
 
     [Fact]
+    public async Task TestPyNTTTuplePartialAllReduceSharesOneChipBarrier()
+    {
+        CompileOptions.TargetOptions = new PyNTTTargetOptions();
+        var placement = new Placement([4, 8], "yx", "bb");
+        var inputType = new DistributedType(
+            new TensorType(DataTypes.Float32, new[] { 1, 128 }),
+            [SBP.B, SBP.SContiguous([0, 1], 4)],
+            placement);
+        var input = new Var("input", inputType);
+        var partials = Enumerable.Range(0, 3)
+            .Select(_ => IR.F.NN.NormStats(1, input, useMean: false))
+            .ToArray();
+        var partialTypes = partials.Select(partial => Assert.IsType<DistributedType>(partial.CheckedType)).ToArray();
+        var outputTypes = partialTypes
+            .Select(partialType => (IRType)(partialType with { Partial = null }))
+            .ToArray();
+        var allReduce = IR.F.Distributed.Boxing(new IR.Tuple(partials), new TupleType(outputTypes));
+        var function = new Function(
+            "main",
+            PyNTTTarget.Kind,
+            allReduce,
+            new[] { input });
+        Assert.True(function.InferenceType());
+
+        var lowered = Assert.IsType<PrimFunction>(
+            await new NTTTIRSelectionPass(CompileOptions, PyNTTTarget.Kind).RunAsync(function, new()));
+        var allReduceCalls = ExprCollector.Collect(lowered.Body)
+            .OfType<Call>()
+            .Where(call => call.Target is TIR.NTT.GatherReduceScatter)
+            .ToArray();
+        Assert.Equal(3, allReduceCalls.Length);
+
+        var partialBuffers = allReduceCalls
+            .Select(call => Assert.IsType<TIR.Buffer>(call[TIR.NTT.GatherReduceScatter.Input]))
+            .ToArray();
+        var seed = CreateWorkspaceBuffer("seed", DataTypes.Float32, 4096, 4, [1024]);
+        var producer = TIR.F.NTT.PackedQKVParallelLinear(
+            seed,
+            seed,
+            seed,
+            seed,
+            seed,
+            seed,
+            seed,
+            seed,
+            seed,
+            seed,
+            seed,
+            seed,
+            seed,
+            partialBuffers[0],
+            partialBuffers[1],
+            partialBuffers[2],
+            1,
+            1);
+
+        var synchronizationBody = new Sequential(
+            new Expr[] { producer }.Concat(allReduceCalls.Cast<Expr>()).ToArray());
+        var module = new IRModule(lowered.With(body: synchronizationBody));
+        await new PlanMemorySynchronizationPass(
+            PyNTTTarget.Kind,
+            MemorySynchronizationScopes.All).RunAsync(module, new());
+        var planned = Assert.IsType<PrimFunction>(module.Entry);
+        var chipBarriers = ExprCollector.Collect(planned.Body)
+            .OfType<Call>()
+            .Count(call => call.Target is TIR.NTT.Barrier { Scope: TIR.NTT.BarrierScope.Chip });
+        Assert.Equal(1, chipBarriers);
+    }
+
+    [Fact]
     public async Task TestInterproceduralUpdatesShareOneOuterChipBarrier()
     {
         var cacheType = TensorType.Scalar(new ReferenceType(DataTypes.Int32));
@@ -983,6 +1153,109 @@ public sealed class UnitTestMemorySynchronization : TestClassBase
         var tiledLoop = Assert.Single(ExprCollector.Collect(rewrittenCallee.Body).OfType<Nncase.TIR.For>());
         Assert.DoesNotContain(ExprCollector.Collect(tiledLoop.Body).OfType<Call>(), call => call.Target is TIR.NTT.Barrier { Scope: TIR.NTT.BarrierScope.Chip });
         Assert.DoesNotContain(ExprCollector.Collect(rewrittenCallee.Body).OfType<Call>(), call => call.Target is TIR.NTT.Barrier);
+    }
+
+    [Fact]
+    public async Task TestInterproceduralDisjointKVCacheLayerPartitionsDoNotSynchronize()
+    {
+        var cacheType = TensorType.Scalar(new ReferenceType(DataTypes.Int32));
+        var dataType = new TensorType(DataTypes.Float32, new[] { 4 });
+        var calleeCache = new BufferVar("callee_cache", cacheType, BufferVarRole.InOut, MemoryLocation.Input);
+        var calleeData = new BufferVar("callee_data", dataType, BufferVarRole.Input, MemoryLocation.Data);
+        var calleeLayerId = new DimVar("callee_layer_id");
+        var update = TIR.F.NTT.UpdatePagedAttentionKVCache(
+            calleeData,
+            calleeCache,
+            calleeLayerId,
+            AttentionCacheKind.Key,
+            new[] { AttentionDimKind.Seq, AttentionDimKind.Head, AttentionDimKind.Dim });
+        var callee = new PrimFunction(
+            "update_cache_layer",
+            PyNTTTarget.Kind,
+            new Sequential(update),
+            new IVar[] { calleeCache, calleeData, calleeLayerId });
+
+        var cache = new BufferVar("cache", cacheType, BufferVarRole.InOut, MemoryLocation.Input);
+        var layer0Data = CreateWorkspaceBuffer("layer0_data", DataTypes.Float32, 0, 16, [4]);
+        var layer1Data = CreateWorkspaceBuffer("layer1_data", DataTypes.Float32, 16, 16, [4]);
+        var main = new PrimFunction(
+            "main",
+            PyNTTTarget.Kind,
+            new Sequential(
+                new Call(callee, cache, layer0Data, new DimConst(0)),
+                new Call(callee, cache, layer1Data, new DimConst(1))),
+            new IVar[] { cache });
+        var module = new IRModule(main);
+        module.Add(callee);
+
+        await new PlanMemorySynchronizationPass(
+            PyNTTTarget.Kind,
+            MemorySynchronizationScopes.All).RunAsync(module, new());
+
+        var rewrittenMain = Assert.IsType<PrimFunction>(module.Entry);
+        Assert.Equal(2, rewrittenMain.Body.Count);
+        Assert.All(rewrittenMain.Body.Fields.ToArray(), field => Assert.IsType<Call>(field));
+        Assert.DoesNotContain(
+            ExprCollector.Collect(rewrittenMain.Body).OfType<Call>(),
+            call => call.Target is TIR.NTT.Barrier);
+    }
+
+    [Fact]
+    public async Task TestInterproceduralDynamicKVCacheLayerPartitionsRemainConservative()
+    {
+        var cacheType = TensorType.Scalar(new ReferenceType(DataTypes.Int32));
+        var dataType = new TensorType(DataTypes.Float32, new[] { 4 });
+        var calleeCache = new BufferVar("callee_cache", cacheType, BufferVarRole.InOut, MemoryLocation.Input);
+        var calleeData = new BufferVar("callee_data", dataType, BufferVarRole.Input, MemoryLocation.Data);
+        var calleeLayerId = new DimVar("callee_layer_id");
+        var update = TIR.F.NTT.UpdatePagedAttentionKVCache(
+            calleeData,
+            calleeCache,
+            calleeLayerId,
+            AttentionCacheKind.Key,
+            new[] { AttentionDimKind.Seq, AttentionDimKind.Head, AttentionDimKind.Dim });
+        var callee = new PrimFunction(
+            "update_dynamic_cache_layer",
+            PyNTTTarget.Kind,
+            new Sequential(update),
+            new IVar[] { calleeCache, calleeData, calleeLayerId });
+
+        var cache = new BufferVar("cache", cacheType, BufferVarRole.InOut, MemoryLocation.Input);
+        var layer0Data = CreateWorkspaceBuffer("layer0_data", DataTypes.Float32, 0, 16, [4]);
+        var layer1Data = CreateWorkspaceBuffer("layer1_data", DataTypes.Float32, 16, 16, [4]);
+        var layer0 = new DimVar("layer0");
+        var layer1 = new DimVar("layer1");
+        var consume = TIR.F.NTT.PagedAttention(
+            layer1Data,
+            cache,
+            layer1Data,
+            layer1Data,
+            layer1,
+            layer1Data,
+            new[] { AttentionDimKind.Seq, AttentionDimKind.Head, AttentionDimKind.Dim },
+            4);
+        var main = new PrimFunction(
+            "main",
+            PyNTTTarget.Kind,
+            new Sequential(
+                new Call(callee, cache, layer0Data, layer0),
+                consume),
+            new IVar[] { cache, layer0, layer1 });
+        var module = new IRModule(main);
+        module.Add(callee);
+
+        await new PlanMemorySynchronizationPass(
+            PyNTTTarget.Kind,
+            MemorySynchronizationScopes.All).RunAsync(module, new());
+
+        var rewrittenMain = Assert.IsType<PrimFunction>(module.Entry);
+        Assert.Collection(
+            rewrittenMain.Body.Fields.ToArray(),
+            field => Assert.IsType<Call>(field),
+            field => Assert.Equal(
+                TIR.NTT.BarrierScope.Chip,
+                Assert.IsType<TIR.NTT.Barrier>(Assert.IsType<Call>(field).Target).Scope),
+            field => Assert.IsType<Call>(field));
     }
 
     [Fact]
@@ -1099,6 +1372,104 @@ public sealed class UnitTestMemorySynchronization : TestClassBase
         var barrierCall = Assert.IsType<Call>(rewrittenMain.Body[1]);
         Assert.Equal(TIR.NTT.BarrierScope.Chip, Assert.IsType<TIR.NTT.Barrier>(barrierCall.Target).Scope);
         Assert.IsType<Call>(rewrittenMain.Body[2]);
+    }
+
+    [Fact]
+    public async Task TestInterproceduralCompactPerOwnerStoreRequiresOnlyBlockBarrier()
+    {
+        var tensorType = new TensorType(DataTypes.Float32, new[] { 8 });
+        var placement = new Placement([2], "b", "b");
+        var distributedType = new DistributedType(
+            tensorType,
+            new SBP[] { SBP.SContiguous([0], 1) },
+            placement);
+        var compactLayout = BufferLayoutAnnotation.ExactStrided(
+            new Dimension[] { 1 },
+            DistributedBufferStorageKind.CompactPerOwner);
+
+        var producerOutputVar = new BufferVar(
+            "producer_output",
+            distributedType,
+            BufferVarRole.Output,
+            MemoryLocation.Output,
+            compactLayout);
+        var producerOutput = T.AttachBuffer(
+            producerOutputVar,
+            tensorType,
+            MemoryLocation.Output,
+            0,
+            out _,
+            "producer_output_view",
+            distributedType);
+        var producerSource = CreateCompactPerOwnerBuffer(
+            "producer_source",
+            distributedType,
+            2048);
+        var producer = new PrimFunction(
+            "produce_compact",
+            PyNTTTarget.Kind,
+            new Sequential(TIR.F.NTT.TensorStore(
+                producerSource,
+                producerOutput,
+                distributedType.AxisPolicies,
+                placement)),
+            new IVar[] { producerOutputVar });
+
+        var consumerInputVar = new BufferVar(
+            "consumer_input",
+            distributedType,
+            BufferVarRole.Input,
+            MemoryLocation.Input,
+            compactLayout);
+        var consumerInput = T.AttachBuffer(
+            consumerInputVar,
+            tensorType,
+            MemoryLocation.Input,
+            0,
+            out _,
+            "consumer_input_view",
+            distributedType);
+        var consumerOutput = CreateCompactPerOwnerBuffer(
+            "consumer_output",
+            distributedType,
+            4096);
+        var consumer = new PrimFunction(
+            "consume_compact",
+            PyNTTTarget.Kind,
+            new Sequential(TIR.F.NTT.Unary(UnaryOp.Abs, consumerInput, consumerOutput)),
+            new IVar[] { consumerInputVar });
+
+        var intermediate = CreateCompactPerOwnerBuffer(
+            "intermediate",
+            distributedType,
+            0);
+        var main = new PrimFunction(
+            "main",
+            PyNTTTarget.Kind,
+            new Sequential(
+                new Call(producer, intermediate),
+                new Call(consumer, intermediate)),
+            Array.Empty<IVar>());
+        var module = new IRModule(main);
+        module.Add(producer);
+        module.Add(consumer);
+
+        await new PlanMemorySynchronizationPass(
+            PyNTTTarget.Kind,
+            MemorySynchronizationScopes.All).RunAsync(module, new());
+
+        var rewrittenMain = Assert.IsType<PrimFunction>(module.Entry);
+        Assert.Collection(
+            rewrittenMain.Body.Fields.ToArray(),
+            field => Assert.Equal(
+                "produce_compact",
+                Assert.IsType<PrimFunction>(Assert.IsType<Call>(field).Target).Name),
+            field => Assert.Equal(
+                TIR.NTT.BarrierScope.Block,
+                Assert.IsType<TIR.NTT.Barrier>(Assert.IsType<Call>(field).Target).Scope),
+            field => Assert.Equal(
+                "consume_compact",
+                Assert.IsType<PrimFunction>(Assert.IsType<Call>(field).Target).Name));
     }
 
     [Fact]
@@ -1666,6 +2037,37 @@ public sealed class UnitTestMemorySynchronization : TestClassBase
             shape.ToArray(),
             strides.Select(stride => (Dimension)stride).ToArray(),
             distributedType);
+    }
+
+    private static Nncase.TIR.Buffer CreateCompactPerOwnerBuffer(
+        string name,
+        DistributedType distributedType,
+        ulong allocationOffset)
+    {
+        var localTensorType = DistributedUtility.GetDividedTensorType(distributedType);
+        var localShape = ((RankedShape)localTensorType.Shape).Dimensions.ToArray();
+        var componentSize = localShape.Aggregate(
+            (long)distributedType.TensorType.DType.SizeInBytes,
+            (size, dimension) => checked(size * dimension.FixedValue));
+        var ownerCount = distributedType.Placement.Hierarchy.Aggregate(
+            1L,
+            (count, extent) => checked(count * extent));
+        var physical = new PhysicalBuffer(
+            distributedType.TensorType.DType.SizeInBytes,
+            Tensor.FromPointer(allocationOffset, distributedType.TensorType.DType),
+            checked(componentSize * ownerCount),
+            MemoryLocation.ChipLocalData);
+        var globalShape = ((RankedShape)distributedType.TensorType.Shape).Dimensions.ToArray();
+        return new Nncase.TIR.Buffer(
+            name,
+            distributedType.TensorType.DType,
+            new MemSpan(physical, 0, componentSize),
+            globalShape,
+            TensorUtilities.GetDefaultStrides(localShape)
+                .Select(stride => (Dimension)stride)
+                .ToArray(),
+            distributedType,
+            distributedStorageKind: DistributedBufferStorageKind.CompactPerOwner);
     }
 
     private static Nncase.TIR.Buffer CreateSharedBuffer(string name, ulong offset)

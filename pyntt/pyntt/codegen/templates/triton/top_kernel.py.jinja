@@ -1,5 +1,7 @@
 {% import "triton/kernels/_common.py.jinja" as common with context %}
-{% if noinline %}
+{% if noinline and do_not_specialize %}
+@triton.jit(noinline=True, do_not_specialize={{ do_not_specialize }})
+{% elif noinline %}
 @triton.jit(noinline=True)
 {% elif do_not_specialize %}
 @triton.jit(do_not_specialize={{ do_not_specialize }})

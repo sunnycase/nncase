@@ -209,6 +209,17 @@ public partial class NTT
             addend ?? None.Default);
     }
 
+    public static Expr PackedMatMulNormStatsCombine(
+        Expr input,
+        Expr addend,
+        IRType outputType,
+        int axis,
+        bool useMean)
+        => new Call(
+            new PackedMatMulNormStatsCombine(outputType, axis, useMean),
+            input,
+            addend);
+
     public static Expr PackedMatMulSamplingPartial(
         Expr lhs,
         Expr rhs,
@@ -327,6 +338,9 @@ public partial class NTT
             kWeightScale,
             vWeightScale);
     }
+
+    public static Expr PackedQKVParallelLinearCombine(Expr qkv, IRType outputType)
+        => new Call(new PackedQKVParallelLinearCombine(outputType), qkv);
 
     public static Expr PackedMatMulGlu(
         Expr input,

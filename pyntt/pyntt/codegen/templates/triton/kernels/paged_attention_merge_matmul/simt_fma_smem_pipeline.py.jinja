@@ -1,0 +1,262 @@
+{% macro pipeline_setup(stage) -%}
+{% set ctx = paged_attention_merge_matmul_context(stage["Model"]) %}
+{% set mm = ctx["matmul"] %}
+{% set shared_buffer_shape = [ctx["num_stages"]] + (ctx["shared_stage_shape"] | list) %}
+{{ stage["StageName"] }}__rhs_stages = tle.gpu.alloc(
+    [{{ shared_buffer_shape | join(", ") }}],
+    dtype={{ mm["RhsTritonDType"] }},
+    layout=tle.gpu.nv_tma_shared_layout(
+        [{{ shared_buffer_shape | join(", ") }}],
+        [{{ range((shared_buffer_shape | length) - 1, -1, -1) | join(", ") }}],
+        {{ mm["RhsTritonDType"] }},
+        [{% for _ in shared_buffer_shape %}1{{ ", " if not loop.last }}{% endfor %}],
+        [{% for _ in shared_buffer_shape %}1{{ ", " if not loop.last }}{% endfor %}],
+        [{{ range((shared_buffer_shape | length) - 1, -1, -1) | join(", ") }}],
+        False,
+        True,
+    ),
+    scope=tle.gpu.smem,
+    alias=pyntt_shared_arena,
+    alias_offset_bytes={{ stage["SharedWorkspaceOffsets"]["rhs_stage"] }},
+)
+{{ stage["PipeName"] }} = tle.pipe(
+    capacity={{ ctx["num_stages"] }},
+    scope="cta",
+    name="{{ stage["StageName"] }}_weight",
+    weight={{ stage["StageName"] }}__rhs_stages,
+)
+{%- endmacro %}
+{% if model is defined %}
+{% import "triton/kernels/_common.py.jinja" as common with context %}
+{% set ctx = paged_attention_merge_matmul_context(model) %}
+{% set mm = ctx["matmul"] %}
+{% set merge = ctx["merge"] %}
+{% set mctx = ctx["merge_context"] %}
+# generated from PyNTT algorithm triton.paged_attention_merge_matmul/simt_fma_smem_pipeline
+# {{ model["Comment"] }}; head_dim={{ mctx["local_head_dimension"] }}, block_n={{ ctx["block_n"] }}, block_k={{ ctx["block_k"] }}, num_stages={{ ctx["num_stages"] }}
+{{ ctx["consumer_weight_layout_name"] }} = tl.constexpr(
+    tle.gpu.BlockEncoding(
+        [{{ ctx["consumer_size_per_thread"] | join(", ") }}],
+        [{{ ctx["consumer_threads_per_warp"] | join(", ") }}],
+        [{{ ctx["consumer_warps_per_cta"] | join(", ") }}],
+        [0, 1],
+    )
+)
+{{ ctx["consumer_lhs_layout_name"] }} = tl.constexpr(
+    tle.gpu.SlicedEncoding(
+        0,
+        {{ ctx["consumer_weight_layout_name"] }}.value,
+    )
+)
+{{ ctx["consumer_output_layout_name"] }} = tl.constexpr(
+    tle.gpu.SlicedEncoding(
+        1,
+        {{ ctx["consumer_weight_layout_name"] }}.value,
+    )
+)
+
+
+{{ "@triton.jit(noinline=True)" if model["NoInline"] else "@triton.jit" }}
+def {{ model["FunctionName"] }}__producer(writer, {{ helper_parameters(model) }}):
+{{ common.mesh_coordinates(model["MeshAxes"]) }}
+    rhs_descriptor_entry = tle.gpu.tensor_map_table_entry(
+        {{ ctx["rhs_descriptor_name"] }},
+        shard_index,
+    )
+    tle.gpu.tensor_map_fenceproxy_acquire(rhs_descriptor_entry)
+    active_n = {{ dim(ctx["n"]) }}
+    for n_tile in tl.range(0, {{ ctx["runtime_num_n_tiles"] }}):
+        k_tile = 0
+        sequence = n_tile.to(tl.int32)
+        slot = writer.acquire(sequence)
+        rhs_descriptor = tle.gpu.reinterpret_tensor_map(
+            rhs_descriptor_entry,
+            slot.weight,
+        )
+        tle.gpu.copy(
+            rhs_descriptor,
+            slot.weight,
+            [{{ ctx["tma_block_shape"] | join(", ") }}],
+            offsets=[
+{% for offset in ctx["rhs_descriptor_offsets"] %}
+                {{ tma_offset(offset) }},
+{% endfor %}
+            ],
+            eviction_policy="evict_first",
+        )
+        writer.commit(sequence)
+    writer.close({{ ctx["runtime_num_n_tiles"] }}.to(tl.int32))
+
+
+{{ "@triton.jit(noinline=True)" if model["NoInline"] else "@triton.jit" }}
+def {{ model["FunctionName"] }}__consumer(reader, {{ helper_parameters(model) }}):
+{{ common.mesh_coordinates(model["MeshAxes"]) }}
+    output = {{ ptr(mm, "Output") }}
+{% if mm["HasAddend"] %}
+    addend = {{ ptr(mm, "Addend") }}
+{% endif %}
+    split_offsets = tl.arange(0, {{ mctx["split_tile"] }})
+    split_mask = split_offsets < {{ mctx["split_count"] }}
+    dim_grid = tl.arange(0, {{ mctx["local_head_dimension"] }})[None, :]
+    max_state_sources = {{ mctx["max_state_source_pointer"] }}
+    sum_state_sources = {{ mctx["sum_state_source_pointer"] }}
+    acc_state_sources = {{ mctx["acc_state_source_pointer"] }}[:, None]
+    local_query_id = 0
+    q_head = 0
+    global_query_id = {{ mctx["global_query_id"] }}
+    global_q_head = {{ mctx["global_q_head"] }}
+    max_values = tl.load(
+        {{ access_pointer(merge, "MaxState", "max_state_sources", mctx["max_state_access"]) }},
+        mask=split_mask,
+        other=-float("inf"),
+    )
+    sum_values = tl.load(
+        {{ access_pointer(merge, "SumState", "sum_state_sources", mctx["sum_state_access"]) }},
+        mask=split_mask,
+        other=0.0,
+    )
+    valid = split_mask & (sum_values > 0.0)
+    merged_max = tl.max(tl.where(valid, max_values, -float("inf")), axis=0)
+    safe_max = tl.where(merged_max == -float("inf"), 0.0, merged_max)
+    weights = tl.where(valid, tl.exp2(max_values - safe_max), 0.0)
+    merged_sum = tl.sum(weights * sum_values, axis=0)
+    acc_values = tl.load(
+        {{ access_pointer(merge, "AccState", "acc_state_sources", mctx["acc_state_access"]) }},
+        mask=split_mask[:, None],
+        other=0.0,
+    )
+    merged_acc = tl.sum(weights[:, None] * acc_values, axis=0)
+    merged_lhs = tl.reshape(
+        tl.where(merged_sum > 0.0, merged_acc / merged_sum, 0.0),
+        ({{ mctx["local_head_dimension"] }},),
+    ).to({{ mm["LhsTritonDType"] }})
+    merged_lhs = tle.encoding(
+        merged_lhs,
+        {{ ctx["consumer_lhs_layout_name"] }},
+    )
+{% if ctx["reduction_groups_per_stage"] == 1 %}
+    merged_lhs_groups = merged_lhs
+{% else %}
+    merged_lhs_groups = tl.permute(
+        tl.reshape(
+            merged_lhs,
+            ({{ ctx["reduction_groups_per_stage"] }}, {{ ctx["reduction_group"] }}),
+        ),
+        (1, 0),
+    )
+{% endif %}
+{% for step in ctx["merged_lhs_split_steps"] %}
+    {{ step["even"] }}, {{ step["odd"] }} = tl.split(
+{% if step["needs_reshape"] %}
+        tl.reshape(
+            {{ step["source"] }},
+            ({{ ctx["reduction_group"] }}, {{ step["reshape_extent"] }}, 2),
+        )
+{% else %}
+        {{ step["source"] }}
+{% endif %}
+    )
+{% endfor %}
+    local_n_source = tl.arange(0, {{ ctx["block_n"] }})
+    local_n = tle.encoding(
+        tle.encoding(
+            local_n_source,
+            {{ ctx["consumer_output_layout_name"] }},
+        )[:, None],
+        {{ ctx["consumer_weight_layout_name"] }},
+    )
+    local_k_vector = tle.encoding(
+        tl.arange(0, {{ ctx["reduction_group"] }}),
+        {{ ctx["consumer_lhs_layout_name"] }},
+    )
+    local_k = tle.encoding(
+        local_k_vector[None, :],
+        {{ ctx["consumer_weight_layout_name"] }},
+    )
+    active_n = {{ dim(ctx["n"]) }}
+    for n_tile in tl.range(0, {{ ctx["runtime_num_n_tiles"] }}):
+        n_start = n_tile * {{ ctx["block_n"] }}
+        partial = tle.encoding(
+            tl.zeros(({{ ctx["block_n"] }}, {{ ctx["reduction_group"] }}), tl.float32),
+            {{ ctx["consumer_weight_layout_name"] }},
+        )
+        sequence = n_tile.to(tl.int32)
+        ready = reader.wait(sequence)
+{% for k_group in ctx["reduction_group_indices"] %}
+        shared_k = {{ k_group }} * {{ ctx["reduction_group"] }} + local_k
+        shared_payload = (
+            local_n % {{ mm["RhsNVectorLaneCount"] }}
+            * {{ ctx["k_atom"] }}
+            + shared_k % {{ ctx["k_atom"] }}
+        )
+        weight_ptr = tle.gpu.local_ptr(
+            ready.slot.weight,
+            (
+{% for index in ctx["shared_weight_indices"] %}
+                tle.encoding(
+                    {{ index }},
+                    {{ ctx["consumer_weight_layout_name"] }},
+                ),
+{% endfor %}
+            ),
+            shape=({{ ctx["block_n"] }}, {{ ctx["reduction_group"] }}),
+        )
+        weight_ptr = tl.max_contiguous(weight_ptr, [1, 8])
+        weight_ptr = tl.multiple_of(weight_ptr, [1, 16])
+        weight_value = tle.encoding(
+            tl.load(weight_ptr),
+            {{ ctx["consumer_weight_layout_name"] }},
+        )
+        lhs_value = tle.encoding(
+            {{ ctx["merged_lhs_group_variables"][k_group] }},
+            {{ ctx["consumer_lhs_layout_name"] }},
+        )
+        lhs_value = tle.encoding(
+            lhs_value[None, :],
+            {{ ctx["consumer_weight_layout_name"] }},
+        )
+        partial += weight_value.to(tl.float32) * lhs_value.to(tl.float32)
+{% endfor %}
+        reader.release(sequence)
+
+        result = tl.sum(partial, axis=1) * {{ mm["Scale"] }}
+        pipeline_output_n = n_start + tle.encoding(
+            local_n_source,
+            {{ ctx["consumer_output_layout_name"] }},
+        )
+{% if ctx["load_c"] %}
+        previous = tl.load(
+            {{ access_pointer(mm, "Output", "output", ctx["pipeline_output_access"]) }},
+            mask=({{ ctx["pipeline_output_mask"] }}) & ({{ ctx["load_c_predicate"] }}),
+            other=0.0,
+        ).to(tl.float32)
+{% if ctx["load_c_predicate"] == "True" %}
+        result = previous + result
+{% else %}
+{% if mm["HasAddend"] %}
+        addend_value = tl.load(
+            {{ access_pointer(mm, "Addend", "addend", ctx["pipeline_addend_access"]) }},
+            mask=({{ ctx["pipeline_output_mask"] }}) & ~({{ ctx["load_c_predicate"] }}),
+            other=0.0,
+        ).to(tl.float32)
+{% else %}
+        addend_value = tl.zeros(({{ ctx["block_n"] }},), tl.float32)
+{% endif %}
+        result = tl.where({{ ctx["load_c_predicate"] }}, previous, addend_value) + result
+{% endif %}
+{% elif mm["HasAddend"] %}
+        addend_value = tl.load(
+            {{ access_pointer(mm, "Addend", "addend", ctx["pipeline_addend_access"]) }},
+            mask={{ ctx["pipeline_output_mask"] }},
+            other=0.0,
+        ).to(tl.float32)
+        result = addend_value + result
+{% endif %}
+        tl.store(
+            {{ access_pointer(mm, "Output", "output", ctx["pipeline_output_access"]) }},
+            result,
+            mask={{ ctx["pipeline_output_mask"] }},
+        )
+
+
+{% endif %}

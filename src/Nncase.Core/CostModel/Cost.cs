@@ -25,6 +25,8 @@ public static class CostFactorNames
     public static readonly string GridSynchronization = "GridSynchronization";
 
     public static readonly string Comm = "Comm";
+
+    public static readonly string PipelineDrainCycles = "PipelineDrainCycles";
 }
 
 /// <summary>

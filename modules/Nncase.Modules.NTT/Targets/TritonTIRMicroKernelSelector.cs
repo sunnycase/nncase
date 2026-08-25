@@ -46,6 +46,20 @@ public sealed class TritonTIRMicroKernelSelector : ITIRMicroKernelSelector
     private const int SparseExpertsDownMaximumStageK = 128;
     private const int SparseExpertsDownMaximumRoutesPerStage = 8;
     private const int SparseExpertsDownMinimumExpertBlockK = 16;
+    private const int PackedQkvSplitKMmaBlockN = 256;
+    private const int PackedQkvSplitKMmaBlockK = 64;
+    private const int PackedQkvSplitKMmaNumStages = 2;
+    private const int PackedQkvDirectMmaBlockN = 32;
+    private const int PackedQkvDirectMmaInputK = 2048;
+    private const int PackedQkvDirectMmaBlockK = 1024;
+    private const int PackedQkvDirectMmaNumStages = 2;
+
+    private enum ConsumerLhsStagingKind
+    {
+        None,
+        PerKTile,
+        CompleteK,
+    }
 
     public TIRMicroKernelSelection? Select(TIRMicroKernelSelectionContext context)
     {
@@ -114,6 +128,15 @@ public sealed class TritonTIRMicroKernelSelector : ITIRMicroKernelSelector
                 [
                     Nncase.TIR.NTT.NVFP4MatMul.RhsPacked.Index,
                 ]),
+            Nncase.TIR.NTT.PagedAttentionMergePackedMatMul fused => SelectMatmul(
+                context,
+                transposeA: false,
+                transposeB: fused.RhsLayout == IR.NTT.PackedMatMulRhsLayout.NMajor,
+                kMajorPacked: fused.RhsLayout == IR.NTT.PackedMatMulRhsLayout.KMajor,
+                lhsIndex: 4,
+                rhsIndex: 5,
+                outputIndex: 6,
+                family: "triton.paged_attention_merge_matmul"),
             Nncase.TIR.NTT.PackedMatMulNormStats packedMatmulNormStats => SelectMatmul(
                 context,
                 transposeA: false,
@@ -121,7 +144,8 @@ public sealed class TritonTIRMicroKernelSelector : ITIRMicroKernelSelector
                 kMajorPacked: packedMatmulNormStats.RhsLayout == IR.NTT.PackedMatMulRhsLayout.KMajor,
                 lhsIndex: 0,
                 rhsIndex: 1,
-                outputIndex: 2),
+                outputIndex: 2,
+                enableCompleteConsumerLhsStage: true),
             Nncase.TIR.NTT.PackedMatMulSamplingPartial packedMatmulSamplingPartial =>
                 SelectPackedMatMulSamplingPartial(context, packedMatmulSamplingPartial),
             Nncase.TIR.NTT.SUMMA summa => SelectSumma(context, summa),
@@ -956,6 +980,8 @@ public sealed class TritonTIRMicroKernelSelector : ITIRMicroKernelSelector
         int lhsIndex,
         int rhsIndex,
         int outputIndex,
+        bool enableCompleteConsumerLhsStage = false,
+        string family = "triton.matmul",
         string? fp8Variant = null,
         int blockFp8ReductionGroup = 0)
     {
@@ -972,9 +998,13 @@ public sealed class TritonTIRMicroKernelSelector : ITIRMicroKernelSelector
         var n = GetScalarExtent(outputDimensions[^1], output.ElemType);
         var kDimension = lhsDimensions[transposeA ? ^2 : ^1];
         var k = GetScalarExtent(kDimension, lhs.ElemType);
+        var consumerLhsStaging = enableCompleteConsumerLhsStage &&
+            CanStageCompleteConsumerLhs(lhs, transposeA, m, kDimension, k)
+            ? ConsumerLhsStagingKind.CompleteK
+            : ConsumerLhsStagingKind.None;
         return CreateMatrixSelection(
             context.Machine,
-            "triton.matmul",
+            family,
             GetScalarDataType(lhs.ElemType),
             GetScalarDataType(rhs.ElemType),
             GetScalarDataType(output.ElemType),
@@ -984,6 +1014,7 @@ public sealed class TritonTIRMicroKernelSelector : ITIRMicroKernelSelector
             kDimension.IsFixed,
             kMajorPacked,
             sourceArgumentIndices: [rhsIndex],
+            consumerLhsStaging: consumerLhsStaging,
             fp8Variant: fp8Variant,
             blockFp8ReductionGroup: blockFp8ReductionGroup);
     }
@@ -1051,6 +1082,7 @@ public sealed class TritonTIRMicroKernelSelector : ITIRMicroKernelSelector
                 reservedSharedBytes: 0,
                 variant: "simt_fma_smem_pipeline",
                 blockFp8ReductionGroup: 0,
+                consumerLhsStaging: ConsumerLhsStagingKind.None,
                 out var pipeline))
         {
             throw new InvalidOperationException(
@@ -1164,6 +1196,57 @@ public sealed class TritonTIRMicroKernelSelector : ITIRMicroKernelSelector
 
         var n = checked(qkv.ProjectionNCapacities.Sum());
         var kDimension = inputDimensions[^1];
+        var k = GetScalarExtent(kDimension, input.ElemType);
+        if (TryGetPackedQkvMmaConfiguration(
+                context,
+                qkv,
+                input,
+                weight,
+                qOutput,
+                kOutput,
+                vOutput,
+                m,
+                n,
+                kDimension,
+                k,
+                out var mmaPipeline))
+        {
+            const int nVector = 8;
+            const int kAtom = 16;
+            var rhsStageKAtoms = mmaPipeline.BlockK / kAtom;
+            var rhsStageNAtoms = mmaPipeline.BlockN / nVector;
+            var rhsStageAtoms = checked(rhsStageKAtoms * rhsStageNAtoms);
+            var rhsStage = new TIRSharedWorkspaceDescriptor(
+                "rhs_stage",
+                new TensorType(
+                    DataTypes.BFloat16,
+                    new RankedShape(
+                        mmaPipeline.NumStages,
+                        rhsStageAtoms,
+                        nVector * kAtom)),
+                NvidiaNvmmaSharedAlignmentBytes);
+            var lhsStage = new TIRSharedWorkspaceDescriptor(
+                "lhs_stage",
+                new TensorType(
+                    DataTypes.BFloat16,
+                    new RankedShape(1, checked((int)k))),
+                NvidiaNvmmaSharedAlignmentBytes);
+            return new(
+                "triton.qkv_parallel_linear",
+                "mma_smem_pipeline",
+                CreateParameters(
+                    1,
+                    mmaPipeline.BlockN,
+                    mmaPipeline.BlockK,
+                    mmaPipeline.NumStages),
+                ImmutableArray.Create(rhsStage, lhsStage),
+                new TIRTransferPipelineContract(
+                [
+                    new TIRTransferPipelineChannel("weight", [1], [0]),
+                ],
+                [1]));
+        }
+
         return CreateMatrixSelection(
             context.Machine,
             "triton.qkv_parallel_linear",
@@ -1172,11 +1255,137 @@ public sealed class TritonTIRMicroKernelSelector : ITIRMicroKernelSelector
             GetScalarDataType(qOutput.ElemType),
             m,
             n,
-            GetScalarExtent(kDimension, input.ElemType),
+            k,
             kDimension.IsFixed,
             qkv.RhsLayout == IR.NTT.PackedMatMulRhsLayout.KMajor,
-            sourceArgumentIndices: [1]);
+            sourceArgumentIndices: [1],
+            consumerLhsStaging: ConsumerLhsStagingKind.PerKTile);
     }
+
+    private static bool TryGetPackedQkvMmaConfiguration(
+        TIRMicroKernelSelectionContext context,
+        Nncase.TIR.NTT.PackedQKVParallelLinearFusedRhs qkv,
+        TensorBufferOperand input,
+        TensorBufferOperand weight,
+        TensorBufferOperand qOutput,
+        TensorBufferOperand kOutput,
+        TensorBufferOperand vOutput,
+        long m,
+        long n,
+        Dimension kDimension,
+        long k,
+        out PackedGemvPipelineConfiguration configuration)
+    {
+        configuration = default;
+        var partial = qOutput.DistributedType?.Partial;
+        var hasCanonicalPacking =
+            input.ElemType == DataTypes.BFloat16 &&
+            weight.ElemType is VectorType weightVector &&
+            weightVector.Lanes.SequenceEqual([8, 2, 8]) &&
+            qOutput.ElemType is VectorType qVector &&
+            qVector.Lanes.SequenceEqual([8]) &&
+            kOutput.ElemType is VectorType kVector &&
+            kVector.Lanes.SequenceEqual([8]) &&
+            vOutput.ElemType is VectorType vVector &&
+            vVector.Lanes.SequenceEqual([8]);
+        var hasContiguousReductionAxis =
+            input.Strides is { } inputStrides &&
+            inputStrides[^1].IsFixed &&
+            inputStrides[^1].FixedValue == 1;
+        var supportsWarpMma = context.Machine.Compute.MatrixPrimitives.Any(
+            primitive =>
+                primitive.M == 16 &&
+                primitive.N == 8 &&
+                primitive.K == 16 &&
+                primitive.CooperativeWorkers == 1 &&
+                primitive.Supports(DataTypes.BFloat16, DataTypes.BFloat16));
+        var commonRequirements =
+            qkv.RhsLayout == IR.NTT.PackedMatMulRhsLayout.KMajor &&
+            hasCanonicalPacking &&
+            hasContiguousReductionAxis &&
+            supportsWarpMma &&
+            GetScalarDataType(input.ElemType) == DataTypes.BFloat16 &&
+            GetScalarDataType(weight.ElemType) == DataTypes.BFloat16 &&
+            GetScalarDataType(qOutput.ElemType) == DataTypes.BFloat16 &&
+            GetScalarDataType(kOutput.ElemType) == DataTypes.BFloat16 &&
+            GetScalarDataType(vOutput.ElemType) == DataTypes.BFloat16 &&
+            m == 1 &&
+            kDimension.IsFixed &&
+            context.Arguments.Skip(2).Take(9).All(argument => argument is None) &&
+            context.Machine.Execution.Kind == BlockExecutionKind.PersistentGpuBlock &&
+            context.Machine.Execution.WorkersPerBlock == 8 &&
+            context.Machine.Execution.WorkerWidth == 32;
+        if (!commonRequirements)
+        {
+            return false;
+        }
+
+        if (n == PackedQkvSplitKMmaBlockN &&
+            k == 256 &&
+            partial is { Op: ReduceOp.Sum } &&
+            HasSameSumPartial(kOutput, partial) &&
+            HasSameSumPartial(vOutput, partial))
+        {
+            configuration = new(
+                PackedQkvSplitKMmaBlockN,
+                PackedQkvSplitKMmaBlockK,
+                PackedQkvSplitKMmaNumStages);
+        }
+        else if (n == PackedQkvDirectMmaBlockN &&
+                 k == PackedQkvDirectMmaInputK &&
+                 partial is null &&
+                 kOutput.DistributedType?.Partial is null &&
+                 vOutput.DistributedType?.Partial is null)
+        {
+            configuration = new(
+                PackedQkvDirectMmaBlockN,
+                PackedQkvDirectMmaBlockK,
+                PackedQkvDirectMmaNumStages);
+        }
+        else
+        {
+            return false;
+        }
+
+        var sharedSpace = context.Machine.MemorySpaces.Values.SingleOrDefault(
+            space => space.TIRBinding?.Location == MemoryLocation.Shared);
+        if (sharedSpace is null)
+        {
+            configuration = default;
+            return false;
+        }
+
+        var parentSpace = context.Machine.GetTilingParentMemorySpace(sharedSpace.TilingLevel);
+        var transfer = context.Machine.GetTransfer(parentSpace.Id, sharedSpace.Id);
+        if (transfer.Asynchronous is not { } asynchronousTransfer ||
+            (configuration.NumStages > 1 &&
+             !asynchronousTransfer.SupportsStageCount(configuration.NumStages)))
+        {
+            configuration = default;
+            return false;
+        }
+
+        const long elementBytes = 2;
+        var requiredSharedBytes = checked(
+            ((long)configuration.NumStages * configuration.BlockN * configuration.BlockK * elementBytes) +
+            (k * elementBytes));
+        var allocatedSharedBytes = context.Machine.GetAllocationSizeBytes(
+            sharedSpace,
+            requiredSharedBytes);
+        if (allocatedSharedBytes > context.Machine.GetMaximumUsableAllocationBytes(sharedSpace))
+        {
+            configuration = default;
+            return false;
+        }
+
+        return true;
+    }
+
+    private static bool HasSameSumPartial(
+        TensorBufferOperand output,
+        SBPPartial expected)
+        => output.DistributedType?.Partial is { Op: ReduceOp.Sum } actual &&
+            actual.Axes.SequenceEqual(expected.Axes);
 
     private static TIRMicroKernelSelection SelectPackedMatMulGlu(
         TIRMicroKernelSelectionContext context,
@@ -1211,6 +1420,17 @@ public sealed class TritonTIRMicroKernelSelector : ITIRMicroKernelSelector
         var m = GetMax(outputDimensions[^2]);
         var n = GetScalarExtent(outputDimensions[^1], output.ElemType);
         var kDimension = inputDimensions[^1];
+        var k = GetScalarExtent(kDimension, input.ElemType);
+        var consumerLhsStaging = n > PackedGemvMinimumBlockN &&
+            CanStageCompleteConsumerLhs(
+                input,
+                false,
+                m,
+                kDimension,
+                k,
+                minimumK: PackedGemvMaximumBlockK)
+            ? ConsumerLhsStagingKind.CompleteK
+            : ConsumerLhsStagingKind.None;
         return CreateMatrixSelection(
             context.Machine,
             "triton.matmul_glu",
@@ -1219,14 +1439,15 @@ public sealed class TritonTIRMicroKernelSelector : ITIRMicroKernelSelector
             GetScalarDataType(output.ElemType),
             m,
             n,
-            GetScalarExtent(kDimension, input.ElemType),
+            k,
             kDimension.IsFixed,
             matmulGlu.RhsLayout == IR.NTT.PackedMatMulRhsLayout.KMajor,
             simultaneousRhsTileCount: 2,
             sourceArgumentIndices: [1, 2],
             fp8Variant: matmulGlu.QuantizationMode == IR.Math.MatMulQuantizationMode.DynamicBlock
                 ? "simt_block_fp8_fma_smem_pipeline"
-                : null);
+                : null,
+            consumerLhsStaging: consumerLhsStaging);
     }
 
     private static TIRMicroKernelSelection SelectNVFP4MatMulGlu(
@@ -1423,6 +1644,7 @@ public sealed class TritonTIRMicroKernelSelector : ITIRMicroKernelSelector
         bool kMajorPacked,
         int simultaneousRhsTileCount = 1,
         IReadOnlyList<int>? sourceArgumentIndices = null,
+        ConsumerLhsStagingKind consumerLhsStaging = ConsumerLhsStagingKind.None,
         string? fp8Variant = null,
         int blockFp8ReductionGroup = 0)
     {
@@ -1443,8 +1665,9 @@ public sealed class TritonTIRMicroKernelSelector : ITIRMicroKernelSelector
                     kMajorPacked,
                     simultaneousRhsTileCount,
                     reservedSharedBytes: 0,
-                    variant,
-                    blockFp8ReductionGroup,
+                    variant: variant,
+                    blockFp8ReductionGroup: blockFp8ReductionGroup,
+                    consumerLhsStaging: consumerLhsStaging,
                     out var pipeline))
             {
                 if (outputType != DataTypes.BFloat16)
@@ -1500,8 +1723,8 @@ public sealed class TritonTIRMicroKernelSelector : ITIRMicroKernelSelector
                                 (pipeline.BlockK / kAtom) * (pipeline.BlockN / nVector),
                                 nVector * kAtom,
                             }));
-                var sharedWorkspaces = ImmutableArray.CreateBuilder<TIRSharedWorkspaceDescriptor>();
-                sharedWorkspaces.Add(
+                var workspaces = ImmutableArray.CreateBuilder<TIRSharedWorkspaceDescriptor>();
+                workspaces.Add(
                     new TIRSharedWorkspaceDescriptor(
                         "rhs_stage",
                         rhsShape,
@@ -1509,7 +1732,7 @@ public sealed class TritonTIRMicroKernelSelector : ITIRMicroKernelSelector
                 if (variant == "mma_block_fp8_smem_pipeline")
                 {
                     var activationGroupCount = checked(pipeline.BlockK / blockFp8ReductionGroup);
-                    sharedWorkspaces.Add(
+                    workspaces.Add(
                         new TIRSharedWorkspaceDescriptor(
                             "lhs_quantized",
                             new TensorType(
@@ -1520,7 +1743,7 @@ public sealed class TritonTIRMicroKernelSelector : ITIRMicroKernelSelector
                                     blockFp8ReductionGroup,
                                 })),
                             TritonSharedVectorAlignmentBytes));
-                    sharedWorkspaces.Add(
+                    workspaces.Add(
                         new TIRSharedWorkspaceDescriptor(
                             "lhs_scale",
                             new TensorType(
@@ -1529,14 +1752,42 @@ public sealed class TritonTIRMicroKernelSelector : ITIRMicroKernelSelector
                             TritonSharedVectorAlignmentBytes));
                 }
 
+                var lhsStageExtent = GetConsumerLhsStageExtent(
+                    consumerLhsStaging,
+                    k,
+                    pipeline.BlockK);
+                var lhsStageWorkspaceIndex = -1;
+                if (lhsStageExtent > 0)
+                {
+                    lhsStageWorkspaceIndex = workspaces.Count;
+                    workspaces.Add(new TIRSharedWorkspaceDescriptor(
+                        "lhs_stage",
+                        new TensorType(
+                            lhsType,
+                            new RankedShape(new[] { 1, lhsStageExtent })),
+                        NvidiaNvmmaSharedAlignmentBytes));
+                }
+
+                var parameters = CreateParameters(
+                    1,
+                    pipeline.BlockN,
+                    pipeline.BlockK,
+                    pipeline.NumStages);
+                if (variant == "mma_block_fp8_smem_pipeline")
+                {
+                    parameters = parameters.Add("transfer_block_k", blockFp8TransferBlockK);
+                }
+
+                if (consumerLhsStaging == ConsumerLhsStagingKind.CompleteK)
+                {
+                    parameters = parameters.Add("lhs_stage_extent", lhsStageExtent);
+                }
+
                 return new(
                     family,
                     variant,
-                    variant == "mma_block_fp8_smem_pipeline"
-                        ? CreateParameters(1, pipeline.BlockN, pipeline.BlockK, pipeline.NumStages)
-                            .Add("transfer_block_k", blockFp8TransferBlockK)
-                        : CreateParameters(1, pipeline.BlockN, pipeline.BlockK, pipeline.NumStages),
-                    sharedWorkspaces.ToImmutable(),
+                    parameters,
+                    workspaces.ToImmutable(),
                     new TIRTransferPipelineContract(
                     [
                         new TIRTransferPipelineChannel(
@@ -1544,7 +1795,8 @@ public sealed class TritonTIRMicroKernelSelector : ITIRMicroKernelSelector
                             sourceArgumentIndices ?? throw new InvalidOperationException(
                                 $"{family}/{variant} is missing transfer source operand indexes."),
                             [0]),
-                    ]));
+                    ],
+                    lhsStageWorkspaceIndex >= 0 ? [lhsStageWorkspaceIndex] : null));
             }
 
             if (rhsType == DataTypes.Float8E4M3 || rhsType == DataTypes.Float8E5M2)
@@ -1633,6 +1885,64 @@ public sealed class TritonTIRMicroKernelSelector : ITIRMicroKernelSelector
             ["num_stages"] = numStages,
         }.ToImmutableDictionary(StringComparer.Ordinal);
 
+    private static bool CanStageCompleteConsumerLhs(
+        TensorBufferOperand lhs,
+        bool transposeA,
+        long m,
+        Dimension kDimension,
+        long k,
+        long minimumK = 4096)
+    {
+        var reductionAxis = transposeA ? lhs.Rank - 2 : lhs.Rank - 1;
+        if (lhs.Strides is not { } strides)
+        {
+            return false;
+        }
+
+        var reductionStride = strides[reductionAxis];
+        return m == 1 &&
+            kDimension.IsFixed &&
+            k >= minimumK &&
+            k % PackedGemvMaximumBlockK == 0 &&
+            reductionStride.IsFixed &&
+            reductionStride.FixedValue == 1 &&
+            TryRoundUpToPowerOfTwo(k, out _);
+    }
+
+    private static int GetConsumerLhsStageExtent(
+        ConsumerLhsStagingKind kind,
+        long k,
+        int blockK)
+    {
+        return kind switch
+        {
+            ConsumerLhsStagingKind.None => 0,
+            ConsumerLhsStagingKind.PerKTile => blockK,
+            ConsumerLhsStagingKind.CompleteK when TryRoundUpToPowerOfTwo(k, out var extent) => extent,
+            ConsumerLhsStagingKind.CompleteK => throw new InvalidOperationException(
+                $"Complete consumer LHS staging cannot represent K={k} as a positive int32 power-of-two extent."),
+            _ => throw new ArgumentOutOfRangeException(nameof(kind), kind, null),
+        };
+    }
+
+    private static bool TryRoundUpToPowerOfTwo(long value, out int result)
+    {
+        result = 0;
+        if (value <= 0 || value > (1L << 30))
+        {
+            return false;
+        }
+
+        var extent = 1;
+        while (extent < value)
+        {
+            extent = checked(extent * 2);
+        }
+
+        result = extent;
+        return true;
+    }
+
     private static bool TryGetPackedGemvPipelineConfiguration(
         TargetMachineModel machine,
         string family,
@@ -1646,10 +1956,12 @@ public sealed class TritonTIRMicroKernelSelector : ITIRMicroKernelSelector
         long reservedSharedBytes,
         string variant,
         int blockFp8ReductionGroup,
+        ConsumerLhsStagingKind consumerLhsStaging,
         out PackedGemvPipelineConfiguration configuration)
     {
         configuration = default;
         if ((family != "triton.matmul" &&
+             family != "triton.paged_attention_merge_matmul" &&
              family != "triton.matmul_sampling_partial" &&
              family != "triton.qkv_parallel_linear" &&
              family != "triton.matmul_glu") ||
@@ -1753,7 +2065,6 @@ public sealed class TritonTIRMicroKernelSelector : ITIRMicroKernelSelector
                         continue;
                     }
 
-                    var requiredSharedBytes = checked(physicalStageCount * stageBytes);
                     var candidateReservedSharedBytes = checked(
                         reservedSharedBytes +
                         (directBlockFp8Mma
@@ -1761,6 +2072,13 @@ public sealed class TritonTIRMicroKernelSelector : ITIRMicroKernelSelector
                                 candidateBlockK,
                                 blockFp8ReductionGroup)
                             : 0));
+                    var lhsStageExtent = GetConsumerLhsStageExtent(
+                        consumerLhsStaging,
+                        k,
+                        candidateBlockK);
+                    var lhsStageBytes = checked((long)lhsStageExtent * lhsType.SizeInBytes);
+                    var requiredSharedBytes = checked(
+                        (physicalStageCount * stageBytes) + lhsStageBytes);
                     var allocatedSharedBytes = machine.GetAllocationSizeBytes(
                         sharedSpace,
                         checked(requiredSharedBytes + candidateReservedSharedBytes));
@@ -1875,27 +2193,30 @@ public sealed class TritonTIRMicroKernelSelector : ITIRMicroKernelSelector
             bytesPerLogicalTile,
             sharedMemory.ReadBytesPerCycle);
         var fmaCycles = DivideRoundUp(fmaCount, machine.Compute.SimtFmaPerCycle);
-        var consumerWorkCycles = Math.Max(sharedLoadCycles, fmaCycles);
 
         // The template partitions N across all consumer warps and K within a
-        // warp. A tile narrower than one target vector per thread still issues
-        // the same warp instructions with proportionally fewer useful lanes.
+        // warp. With one reduction group per warp width, block_n / workers is
+        // also the number of contiguous K values loaded by each thread. Narrow
+        // vectors reduce shared-load instruction efficiency, but they do not
+        // create inactive FMA lanes: the FMA count above already contains only
+        // the work issued by the tile.
         var vectorLanes = machine.Execution.VectorWidthBits /
             checked(elementBytes * 8);
-        var nValuesPerWarp = configuration.BlockN /
+        var kValuesPerThread = configuration.BlockN /
             machine.Execution.WorkersPerBlock;
-        if (vectorLanes <= 0 || nValuesPerWarp <= 0)
+        if (vectorLanes <= 0 || kValuesPerThread <= 0)
         {
             throw new InvalidOperationException(
-                $"Packed GEMV vector utilization requires positive vector and per-warp N extents, " +
+                $"Packed GEMV vector utilization requires positive vector and per-thread K extents, " +
                 $"got vector_lanes={vectorLanes}, block_n={configuration.BlockN}, " +
                 $"consumer_warps={machine.Execution.WorkersPerBlock}.");
         }
 
-        var usefulVectorLanes = Math.Min(vectorLanes, nValuesPerWarp);
-        consumerWorkCycles = DivideRoundUp(
-            checked(consumerWorkCycles * vectorLanes),
+        var usefulVectorLanes = Math.Min(vectorLanes, kValuesPerThread);
+        var vectorizedSharedLoadCycles = DivideRoundUp(
+            checked(sharedLoadCycles * vectorLanes),
             usefulVectorLanes);
+        var consumerWorkCycles = Math.Max(vectorizedSharedLoadCycles, fmaCycles);
         var consumerControlCycles = checked(
             (long)rhsTilesPerGroup *
             (transfer.Asynchronous.WaitCycles +
@@ -2111,7 +2432,8 @@ public sealed class TritonTIRMicroKernelSelector : ITIRMicroKernelSelector
                 buffer.Name,
                 buffer.ElemType,
                 buffer.Dimensions.ToArray(),
-                buffer.DistributedType),
+                buffer.DistributedType,
+                buffer.Strides.ToArray()),
             BufferVar bufferVar => CreateBufferOperand(context.Op, index, name, bufferVar),
             _ => throw new InvalidOperationException(
                 $"TIR microkernel selector for {context.Op.GetType().Name} expects {name} " +
@@ -2145,7 +2467,8 @@ public sealed class TritonTIRMicroKernelSelector : ITIRMicroKernelSelector
             bufferVar.Name,
             tensorType.DType,
             shape.Dimensions.ToArray(),
-            distributedType);
+            distributedType,
+            Strides: null);
     }
 
     private static void RequireRank(TensorBufferOperand buffer, int minimumRank, Op op, string name)
@@ -2217,7 +2540,8 @@ public sealed class TritonTIRMicroKernelSelector : ITIRMicroKernelSelector
         string Name,
         DataType ElemType,
         Dimension[] Dimensions,
-        DistributedType? DistributedType)
+        DistributedType? DistributedType,
+        Dimension[]? Strides)
     {
         public int Rank => Dimensions.Length;
     }

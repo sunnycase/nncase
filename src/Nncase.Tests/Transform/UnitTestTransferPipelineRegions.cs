@@ -57,6 +57,32 @@ public sealed class UnitTestTransferPipelineRegions : TestClassBase
     }
 
     [Fact]
+    public void TestTransferPipelineAllowsConsumerSharedWorkspaceOwnership()
+    {
+        var contract = new TIRTransferPipelineContract(
+        [
+            new TIRTransferPipelineChannel("weight", [1], [0]),
+        ],
+        [1]);
+
+        Assert.Equal(new[] { 0 }, contract.SharedWorkspaceIndices);
+        Assert.Equal(new[] { 1 }, contract.ConsumerSharedWorkspaceIndices);
+    }
+
+    [Fact]
+    public void TestTransferPipelineRejectsWorkspaceOwnedByChannelAndConsumer()
+    {
+        var exception = Assert.Throws<ArgumentException>(() =>
+            new TIRTransferPipelineContract(
+            [
+                new TIRTransferPipelineChannel("weight", [1], [0]),
+            ],
+            [0]));
+
+        Assert.Contains("owned by both", exception.Message, StringComparison.Ordinal);
+    }
+
+    [Fact]
     public async Task TestOverlappingPipelineStagesDrainPreviousOwner()
     {
         var source = CreateBuffer("source", MemoryLocation.Data, 4096);

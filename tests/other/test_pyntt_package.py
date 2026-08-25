@@ -93,6 +93,35 @@ def test_pyntt_target_options_do_not_expose_removed_pipeline_policy():
     assert not hasattr(options, "PipelinePolicy")
 
 
+def test_pyntt_qkv_headwise_partial_layout_balances_head_warps_and_local_reduction():
+    _add_pyntt_to_path()
+    from pyntt.codegen.render import _qkv_headwise_partial_layout
+
+    layout = _qkv_headwise_partial_layout(
+        "qkv_rope",
+        "q",
+        128,
+        {
+            "address": {"OffsetBytes": "5120", "PoolStrideBytes": "256"},
+            "reduction_extent": 8,
+            "scalar_element_size_bytes": 2,
+            "vector_lane_count": 8,
+        },
+        num_warps=8,
+        worker_width=32,
+    )
+
+    assert layout is not None
+    assert layout["shape"] == (1, 8, 128)
+    assert layout["size_per_thread"] == (1, 8, 1)
+    assert layout["threads_per_warp"] == (1, 1, 32)
+    assert layout["warps_per_cta"] == (2, 1, 4)
+    assert layout["order"] == (2, 1, 0)
+    assert layout["contiguous_elements"] == 1
+    assert layout["load_contiguous_elements"] == 8
+    assert layout["alignment_bytes"] == 16
+
+
 def test_pyntt_elementwise_accesses_preserve_their_natural_broadcast_domain():
     _add_pyntt_to_path()
     from pyntt.codegen.render import _elementwise_binary_template_context
@@ -1174,6 +1203,7 @@ def test_pyntt_nvfp4_descriptor_reinterprets_target_packed_k_lanes():
             },
             "SharedWorkspaceOffsets": {"packed_weight_stage": "0"},
             "SharedWorkspaceShapes": {"packed_weight_stage": [4, 128, 128]},
+            "ConsumerSharedWorkspaceNames": [],
         },
         "LhsShape": [1, 640],
         "RhsPackedShape": [640, 80],
@@ -1263,6 +1293,7 @@ def test_pyntt_nvfp4_descriptor_preserves_block_cyclic_n_and_k_axes():
             },
             "SharedWorkspaceOffsets": {"packed_weight_stage": "0"},
             "SharedWorkspaceShapes": {"packed_weight_stage": [4, 128, 128]},
+            "ConsumerSharedWorkspaceNames": [],
         },
         "LhsShape": [1, 544],
         "RhsPackedShape": [640, 68],
@@ -1950,7 +1981,10 @@ def test_pyntt_qkv_pipeline_uses_one_canonical_fused_n_transfer():
     ).read_text(encoding="utf-8")
 
     assert projection_ns == {"Q": 96, "K": 32, "V": 32}
-    assert template.count("tle.gpu.copy(") == 1
+    assert template.count("tle.gpu.copy(") == 2
+    assert "is_async=True" in template
+    assert "tle.gpu.async_commit_group()" in template
+    assert "tle.gpu.async_wait_group(0)" in template
     assert "for n_tile in tl.static_range(" in template
     assert "for q_tile" not in template
     assert "for k_projection_tile" not in template
@@ -1963,6 +1997,108 @@ def test_pyntt_qkv_pipeline_requires_three_projection_capacities():
 
     with pytest.raises(ValueError, match="three projection N capacities"):
         _packed_qkv_fixed_projection_ns({"ProjectionNCapacities": [64, 32]})
+
+
+def test_pyntt_qkv_mma_pipeline_uses_bf16_packed_lanes():
+    _add_pyntt_to_path()
+    from pyntt.codegen.render import _packed_gemv_vector_lane_shape
+
+    assert _packed_gemv_vector_lane_shape("mma_smem_pipeline") == (8, 2, 8)
+
+
+def test_pyntt_qkv_mma_pipeline_uses_selected_variant(monkeypatch):
+    _add_pyntt_to_path()
+    import pyntt.codegen.render as render
+
+    monkeypatch.setattr(
+        render,
+        "_packed_qkv_logical_output_shape",
+        lambda model, prefix: (1, 32),
+    )
+    monkeypatch.setattr(
+        render,
+        "_microkernel_context",
+        lambda model, family, variant: {
+            "parameters": {"block_n": 31, "block_k": 1024, "num_stages": 2}
+        },
+    )
+    model = {
+        "InputDType": "bfloat16",
+        "WeightDType": "bfloat16",
+        "OutputDType": "bfloat16",
+        "RhsLayout": "k_major",
+        "NPackedLaneCount": 1,
+        "NVectorLaneCount": 8,
+        "KPackLaneCount": 2,
+        "KVectorLaneCount": 8,
+        "InputShape": [1, 2048],
+        "InputStrides": [2048, 1],
+        "WeightShape": [128, 20],
+        "QOutputShape": [1, 96],
+        "KOutputShape": [1, 32],
+        "VOutputShape": [1, 32],
+    }
+
+    with pytest.raises(ValueError, match="tile is incompatible"):
+        render._packed_qkv_gemv_pipeline_template_context(
+            model,
+            expected_variant="mma_smem_pipeline",
+        )
+
+
+def test_pyntt_packed_gemv_canonical_rhs_uses_global_physical_view():
+    _add_pyntt_to_path()
+    from pyntt.codegen.render import _packed_gemv_rhs_physical_view
+
+    model = {
+        "Rhs": {
+            "DistributedStorageKind": "CanonicalGlobal",
+            "GlobalShape": [128, 18992],
+            "Strides": [18992, 1],
+        },
+        "RhsShape": [128, {"FixedValue": None}],
+        "RhsStrides": [18992, 1],
+    }
+
+    assert _packed_gemv_rhs_physical_view(model) == (
+        (128, 18992),
+        (18992, 1),
+    )
+
+
+def test_pyntt_packed_gemv_outlines_large_pure_consumer_stages():
+    _add_pyntt_to_path()
+    from pyntt.codegen.render import _should_outline_packed_gemv_consumer_stage
+
+    assert not _should_outline_packed_gemv_consumer_stage(
+        block_k=256,
+        reduction_group=32,
+    )
+    assert _should_outline_packed_gemv_consumer_stage(
+        block_k=1024,
+        reduction_group=32,
+    )
+
+    template_dir = (
+        Path(__file__).resolve().parents[2]
+        / "pyntt/pyntt/codegen/templates/triton/kernels"
+    )
+    matmul = (template_dir / "matmul/simt_fma_smem_pipeline.py.jinja").read_text(
+        encoding="utf-8"
+    )
+    qkv = (
+        template_dir / "qkv_parallel_linear/simt_fma_smem_pipeline.py.jinja"
+    ).read_text(encoding="utf-8")
+    glu = (
+        template_dir / "matmul_glu/simt_fma_smem_pipeline.py.jinja"
+    ).read_text(encoding="utf-8")
+
+    assert '{% if ctx["outline_consumer_stage"] %}' in matmul
+    assert "@triton.jit(noinline=True)" in matmul
+    assert "__consumer_stage(" in matmul
+    assert 'or ctx["outline_consumer_stage"]' in qkv
+    assert '{% if ctx["outline_consumer_stage"] %}' in glu
+    assert "@triton.jit(noinline=True)" in glu
 
 
 def test_pyntt_renderer_marks_dynamic_top_kernel_scalars_non_specializing():
@@ -2120,6 +2256,11 @@ def test_pyntt_renderer_preserves_codegen_scope_device_boundary():
         "tle.shard_id(PYNTT_GRID_MESH, 'block_b').to(tl.int64)"
     ) == 2
     assert source.count("child(shard_index)") == 2
+    assert (
+        "@triton.jit(noinline=True, "
+        "do_not_specialize=('child_shard_index',))\n"
+        "def child(child_shard_index):"
+    ) in source
     assert "def child(child_shard_index):" in source
     assert "pyntt_call_frame" not in source
 
@@ -2144,8 +2285,8 @@ def test_pyntt_renderer_materializes_named_mesh_coordinates():
     source = render_manifest(manifest)
 
     assert '_PYNTT_GRID_MESH_VALUE = tle.device_mesh({"block": [(\'block_y\', 4), (\'block_x\', 8)]})' in source
-    assert "shard_coord0 = tle.shard_id(PYNTT_GRID_MESH, 'block_y')" in source
-    assert "shard_coord1 = tle.shard_id(PYNTT_GRID_MESH, 'block_x')" in source
+    assert "shard_coord0 = tle.shard_id(PYNTT_GRID_MESH, 'block_y').to(tl.int64)" in source
+    assert "shard_coord1 = tle.shard_id(PYNTT_GRID_MESH, 'block_x').to(tl.int64)" in source
     assert "shard_index = (shard_coord0 * 8 + shard_coord1)" in source
     assert "tl.program_id(0)" not in source
     assert "shard_index //" not in source
@@ -2185,7 +2326,7 @@ def test_pyntt_renderer_passes_nested_device_arguments_directly():
     assert "pyntt_call_frame" not in source
 
 
-def test_pyntt_renderer_marks_nested_device_helpers_noinline(monkeypatch):
+def test_pyntt_renderer_inlines_nested_device_helpers(monkeypatch):
     _add_pyntt_to_path()
     import pyntt.codegen.render as render
 
@@ -2213,7 +2354,7 @@ def test_pyntt_renderer_marks_nested_device_helpers_noinline(monkeypatch):
         (),
     )
 
-    assert captured["noinline"] is True
+    assert captured["noinline"] is False
 
 
 def test_pyntt_renderer_reduces_contiguous_axes_first():
@@ -2259,6 +2400,37 @@ def test_pyntt_renderer_reduces_contiguous_axes_first():
     )
     assert strided["flat_reduction"] is False
     assert strided["square_reduction"] == (
+        "tl.sum(tl.sum(square_partial, axis=1), axis=0)"
+    )
+
+    block_cyclic = _norm_stats_template_context(
+        {
+            "Input": {
+                "ShardAxes": [
+                    {"Stages": []},
+                    {
+                        "Stages": [
+                            {
+                                "HierarchyAxes": [0],
+                                "Distribution": "BlockCyclic",
+                                "BlockSize": 8,
+                            }
+                        ]
+                    },
+                ]
+            },
+            "InputShape": [1, 32],
+            "InputStrides": [0, 1],
+            "InputVectorLaneShape": [8],
+            "InputVectorLaneCount": 8,
+            "OutputShape": [1, 1, 1],
+            "OutputStrides": [0, 0, 0],
+            "OutputVectorLaneShape": [],
+            "Axis": 1,
+        }
+    )
+    assert block_cyclic["flat_reduction"] is False
+    assert block_cyclic["square_reduction"] == (
         "tl.sum(tl.sum(square_partial, axis=1), axis=0)"
     )
 

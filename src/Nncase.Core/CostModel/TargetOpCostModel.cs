@@ -23,6 +23,11 @@ public enum MatMulOpCostKind
     /// SIMT implementation, without tensor-core dot instructions.
     /// </summary>
     Simt,
+
+    /// <summary>
+    /// Matrix-instruction implementation, without a SIMT fallback.
+    /// </summary>
+    Mma,
 }
 
 /// <summary>

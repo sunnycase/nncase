@@ -30,7 +30,11 @@ public sealed partial class QKVRoPEWithCache : NTTKernelOp
 
     public static readonly ParameterInfo Sin = new(typeof(QKVRoPEWithCache), 8, "sin", memoryEffect: MemoryEffect.Read);
 
-    public static readonly ParameterInfo KVCaches = new(typeof(QKVRoPEWithCache), 9, "kv_caches", memoryEffect: MemoryEffect.ChipWrite);
+    public static readonly ParameterInfo KVCaches = new(
+        typeof(QKVRoPEWithCache),
+        9,
+        "kv_caches",
+        memoryEffect: MemoryEffect.ChipWrite.PartitionedByArgument(10));
 
     public static readonly ParameterInfo LayerId = new(typeof(QKVRoPEWithCache), 10, "layer_id", IR.TypePatternUtility.IsDimensionType(), memoryEffect: MemoryEffect.None);
 

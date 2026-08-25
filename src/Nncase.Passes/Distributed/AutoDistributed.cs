@@ -901,13 +901,10 @@ internal sealed class AutoDistributedRewriter : ExprVisitor<Unit, Unit>
 
     private sealed class OutputReshardClosureState
     {
-        public OutputReshardClosureState(TensorType tensorType, DistributedReshardUsageKind usageKind)
+        public OutputReshardClosureState(DistributedReshardUsageKind usageKind)
         {
-            TensorType = tensorType;
             UsageKind = usageKind;
         }
-
-        public TensorType TensorType { get; }
 
         public DistributedReshardUsageKind UsageKind { get; }
 
@@ -1802,7 +1799,18 @@ internal sealed class AutoDistributedRewriter : ExprVisitor<Unit, Unit>
             CompleteBidirectionalCandidateClosure(candidateSite);
         }
 
-        // 4. add not infered type in search space.
+        // 4. Add tuple partial-materialization alternatives before field consumers split the
+        // tuple into independent search clusters.
+        if (expr.CheckedType is TupleType)
+        {
+            CompleteTupleOutputPartialReshardClosure(
+                callCluster,
+                candidateSite.DirectOutputBuckets,
+                DistributedReshardUsageKind.Internal);
+            return default;
+        }
+
+        // 5. add not infered type in search space.
         if (expr.CheckedType is not TensorType tensorType || !IsDistributableTensorType(tensorType))
         {
             return default;
@@ -1815,7 +1823,7 @@ internal sealed class AutoDistributedRewriter : ExprVisitor<Unit, Unit>
             DistributedReshardUsageKind.Internal,
             function);
 
-        // 5. filter
+        // 6. filter
         FilterByScheme(expr, callCluster);
         return default;
     }
@@ -2333,30 +2341,26 @@ internal sealed class AutoDistributedRewriter : ExprVisitor<Unit, Unit>
         IRType targetType,
         Function ownerFunction)
     {
-        var existingBuckets = inputCluster.Clusters
-            .OfType<DistributedSearchGraph>()
-            .Where(bucket => bucket.Vertices.FirstOrDefault()?.IRType == targetType)
-            .ToArray();
-        if (existingBuckets.Length > 0)
-        {
-            return existingBuckets;
-        }
-
         var key = new ProviderInputTypeKey(inputCluster, targetType);
         if (_providerInputTypeMemo.TryGetValue(key, out var cached))
         {
             return cached;
         }
 
+        var existingBuckets = inputCluster.Clusters
+            .OfType<DistributedSearchGraph>()
+            .Where(bucket => bucket.Vertices.FirstOrDefault()?.IRType == targetType)
+            .ToArray();
+
         if (inputCluster.Kind != SearchGraphKind.DistributedCluster ||
-            targetType is not DistributedType distributedTarget ||
-            !SingleNodeMemoryCheck(distributedTarget, _moduleKind, TargetOptions))
+            !ProviderInputTypeMemoryCheck(targetType))
         {
-            _providerInputTypeMemo.Add(key, Array.Empty<DistributedSearchGraph>());
-            return Array.Empty<DistributedSearchGraph>();
+            _providerInputTypeMemo.Add(key, existingBuckets);
+            return existingBuckets;
         }
 
-        if (TryCreateDirectConstantProviderInputBucket(
+        if (targetType is DistributedType distributedTarget &&
+            TryCreateDirectConstantProviderInputBucket(
                 inputExpression,
                 inputCluster,
                 distributedTarget,
@@ -2392,8 +2396,8 @@ internal sealed class AutoDistributedRewriter : ExprVisitor<Unit, Unit>
 
         if (paths.Count == 0)
         {
-            _providerInputTypeMemo.Add(key, Array.Empty<DistributedSearchGraph>());
-            return Array.Empty<DistributedSearchGraph>();
+            _providerInputTypeMemo.Add(key, existingBuckets);
+            return existingBuckets;
         }
 
         var adaptationCluster = _rootSearchGraph.CreateCluster<DistributedSearchGraph>(SearchGraphKind.DistributedCluster);
@@ -2412,7 +2416,7 @@ internal sealed class AutoDistributedRewriter : ExprVisitor<Unit, Unit>
                 ownerFunction);
         }
 
-        IReadOnlyList<DistributedSearchGraph> created = [targetBucket];
+        IReadOnlyList<DistributedSearchGraph> created = [.. existingBuckets, targetBucket];
         _providerInputTypeMemo.Add(key, created);
         _profiler.Count("candidate_provider_input_types_materialized");
         return created;
@@ -2445,6 +2449,13 @@ internal sealed class AutoDistributedRewriter : ExprVisitor<Unit, Unit>
             ownerFunction: ownerFunction);
         return bucket;
     }
+
+    private bool ProviderInputTypeMemoryCheck(IRType type) => type switch
+    {
+        DistributedType distributedType => SingleNodeMemoryCheck(distributedType, _moduleKind, TargetOptions),
+        TupleType tupleType => tupleType.Fields.All(ProviderInputTypeMemoryCheck),
+        _ => true,
+    };
 
     private IReadOnlyList<IRType> GetProviderReturnCandidateTypes(IRType type)
     {
@@ -2520,15 +2531,62 @@ internal sealed class AutoDistributedRewriter : ExprVisitor<Unit, Unit>
         DistributedReshardUsageKind usageKind,
         Function? ownerFunction = null)
     {
+        var targetTypes = _profiler.Time(
+            "output_reshard_get_target_types",
+            () => GetLeafCandidateDistTypes(tensorType).Distinct().Cast<IRType>().ToArray());
+        CompleteOutputReshardClosure(
+            callCluster,
+            targetTypes,
+            directOutputBuckets,
+            usageKind,
+            ownerFunction: ownerFunction);
+    }
+
+    private void CompleteTupleOutputPartialReshardClosure(
+        DistributedSearchGraph callCluster,
+        IReadOnlyList<DistributedSearchGraph> directOutputBuckets,
+        DistributedReshardUsageKind usageKind)
+    {
+        var sources = directOutputBuckets
+            .Where(bucket => bucket.Vertices.FirstOrDefault()?.IRType is TupleType tupleType && ContainsPartial(tupleType))
+            .ToArray();
+        var targetTypes = directOutputBuckets
+            .Select(bucket => bucket.Vertices.FirstOrDefault()?.IRType)
+            .OfType<TupleType>()
+            .Where(tupleType => !ContainsPartial(tupleType))
+            .Distinct()
+            .Cast<IRType>()
+            .ToArray();
+        if (sources.Length == 0 || targetTypes.Length == 0)
+        {
+            return;
+        }
+
+        CompleteOutputReshardClosure(
+            callCluster,
+            targetTypes,
+            sources,
+            usageKind,
+            IsTuplePartialMaterialization);
+    }
+
+    private void CompleteOutputReshardClosure(
+        DistributedSearchGraph callCluster,
+        IReadOnlyList<IRType> targetTypes,
+        IReadOnlyList<DistributedSearchGraph> directOutputBuckets,
+        DistributedReshardUsageKind usageKind,
+        Func<IRType, IRType, bool>? canReshard = null,
+        Function? ownerFunction = null)
+    {
         if (!_outputReshardClosureStates.TryGetValue(callCluster, out var state))
         {
-            state = new OutputReshardClosureState(tensorType, usageKind);
+            state = new OutputReshardClosureState(usageKind);
             _outputReshardClosureStates.Add(callCluster, state);
         }
-        else if (state.TensorType != tensorType || state.UsageKind != usageKind)
+        else if (state.UsageKind != usageKind)
         {
             throw new InvalidOperationException(
-                $"Output reshard closure for one cluster changed from {state.TensorType}/{state.UsageKind} to {tensorType}/{usageKind}.");
+                $"Output reshard closure for one cluster changed usage from {state.UsageKind} to {usageKind}.");
         }
 
         var sources = directOutputBuckets
@@ -2538,10 +2596,7 @@ internal sealed class AutoDistributedRewriter : ExprVisitor<Unit, Unit>
                 Node: bucket.Vertices.FirstOrDefault()
                     ?? throw new InvalidOperationException("An inferred output bucket cannot be empty when completing its reshard closure.")))
             .ToArray();
-        var targetTypes = _profiler.Time(
-            "output_reshard_get_target_types",
-            () => GetLeafCandidateDistTypes(tensorType).Distinct().ToArray());
-        _profiler.Count("output_reshard_target_types", targetTypes.Length);
+        _profiler.Count("output_reshard_target_types", targetTypes.Count);
         _profiler.Count("output_reshard_source_buckets", sources.Length);
 
         foreach (var targetType in targetTypes)
@@ -2551,6 +2606,11 @@ internal sealed class AutoDistributedRewriter : ExprVisitor<Unit, Unit>
             state.TargetBuckets.TryGetValue(targetType, out var targetBucket);
             foreach (var source in sources)
             {
+                if (canReshard is not null && !canReshard(source.Node.IRType, targetType))
+                {
+                    continue;
+                }
+
                 var plans = _profiler.Time(
                     "output_reshard_plan",
                     () => GetReshardPlans(
@@ -2592,6 +2652,45 @@ internal sealed class AutoDistributedRewriter : ExprVisitor<Unit, Unit>
             {
                 _profiler.Count("output_reshard_target_buckets");
             }
+        }
+    }
+
+    private static bool IsTuplePartialMaterialization(IRType sourceType, IRType targetType)
+    {
+        var hasPartialMaterialization = false;
+        return Visit(sourceType, targetType) && hasPartialMaterialization;
+
+        bool Visit(IRType source, IRType target)
+        {
+            if (source == target)
+            {
+                return true;
+            }
+
+            if (source is TupleType sourceTuple &&
+                target is TupleType targetTuple &&
+                sourceTuple.Count == targetTuple.Count &&
+                sourceTuple.IsVariadic == targetTuple.IsVariadic)
+            {
+                for (int i = 0; i < sourceTuple.Count; i++)
+                {
+                    if (!Visit(sourceTuple[i], targetTuple[i]))
+                    {
+                        return false;
+                    }
+                }
+
+                return true;
+            }
+
+            if (source is DistributedType { Partial: not null } &&
+                target is DistributedType { Partial: null })
+            {
+                hasPartialMaterialization = true;
+                return true;
+            }
+
+            return false;
         }
     }
 
@@ -4662,12 +4761,12 @@ internal sealed class AutoDistributedRewriter : ExprVisitor<Unit, Unit>
         return focusTerms.Any(term => text.Contains(term, StringComparison.OrdinalIgnoreCase));
     }
 
-    private bool ContainsPartial(IRType type)
+    private bool ContainsPartial(IRType type) => type switch
     {
-        var text = type.ToString();
-        return text?.Contains("Partial: P", StringComparison.OrdinalIgnoreCase) == true
-            || text?.Contains("SBPPartial", StringComparison.OrdinalIgnoreCase) == true;
-    }
+        DistributedType distributedType => distributedType.Partial is not null || distributedType.AxisPolicies.Any(policy => policy is SBPPartial),
+        TupleType tupleType => tupleType.Fields.Any(ContainsPartial),
+        _ => false,
+    };
 
     private UInt128 GetScore(IReadOnlyDictionary<SearchableNode, UInt128> costScoreMemo, SearchableNode node)
         => costScoreMemo.TryGetValue(node, out var score) ? score : 0;

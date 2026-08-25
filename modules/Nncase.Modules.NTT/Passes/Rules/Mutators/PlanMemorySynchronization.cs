@@ -9,12 +9,90 @@ using Nncase.Utilities;
 
 namespace Nncase.Passes.Mutators;
 
+internal enum ResolvedMemoryAccessPartitionKind
+{
+    WholeResource,
+    Static,
+    Symbolic,
+}
+
+internal enum FunctionMemoryAccessPartitionKind
+{
+    WholeResource,
+    Static,
+    Parameter,
+}
+
 internal readonly record struct MemoryArena(MemoryLocation Location, int Hierarchy);
 
 internal readonly record struct MemoryByteRange(long Start, long End)
 {
     public bool Overlaps(MemoryByteRange other) => Start < other.End && other.Start < End;
 }
+
+internal readonly record struct ResolvedMemoryAccessPartition
+{
+    private ResolvedMemoryAccessPartition(
+        ResolvedMemoryAccessPartitionKind kind,
+        long staticValue,
+        BaseExpr? symbolicIdentity)
+    {
+        Kind = kind;
+        StaticValue = staticValue;
+        SymbolicIdentity = symbolicIdentity;
+    }
+
+    public static ResolvedMemoryAccessPartition WholeResource => default;
+
+    public ResolvedMemoryAccessPartitionKind Kind { get; }
+
+    public long StaticValue { get; }
+
+    public BaseExpr? SymbolicIdentity { get; }
+
+    public static ResolvedMemoryAccessPartition Static(long value)
+        => new(ResolvedMemoryAccessPartitionKind.Static, value, null);
+
+    public static ResolvedMemoryAccessPartition Symbolic(BaseExpr identity)
+        => new(ResolvedMemoryAccessPartitionKind.Symbolic, 0, identity);
+
+    public bool HasSameRegion(ResolvedMemoryAccessPartition other)
+        => Kind == other.Kind && Kind switch
+        {
+            ResolvedMemoryAccessPartitionKind.WholeResource => true,
+            ResolvedMemoryAccessPartitionKind.Static => StaticValue == other.StaticValue,
+            ResolvedMemoryAccessPartitionKind.Symbolic =>
+                ReferenceEquals(SymbolicIdentity, other.SymbolicIdentity),
+            _ => throw new InvalidOperationException(
+                $"Unsupported memory access partition kind {Kind}."),
+        };
+
+    public bool MayAlias(ResolvedMemoryAccessPartition other)
+        => Kind == ResolvedMemoryAccessPartitionKind.WholeResource ||
+            other.Kind == ResolvedMemoryAccessPartitionKind.WholeResource ||
+            Kind != ResolvedMemoryAccessPartitionKind.Static ||
+            other.Kind != ResolvedMemoryAccessPartitionKind.Static ||
+            StaticValue == other.StaticValue;
+}
+
+internal readonly record struct FunctionMemoryAccessPartition(
+    FunctionMemoryAccessPartitionKind Kind,
+    long StaticValue,
+    int ParameterIndex)
+{
+    public static FunctionMemoryAccessPartition WholeResource => default;
+
+    public static FunctionMemoryAccessPartition Static(long value)
+        => new(FunctionMemoryAccessPartitionKind.Static, value, -1);
+
+    public static FunctionMemoryAccessPartition Parameter(int parameterIndex)
+        => new(FunctionMemoryAccessPartitionKind.Parameter, 0, parameterIndex);
+}
+
+internal readonly record struct FunctionParameterEffect(
+    int ParameterIndex,
+    FunctionMemoryAccessPartition AccessPartition,
+    EffectInfo Effect);
 
 internal readonly record struct EffectInfo(
     MemoryAccessMode Mode,
@@ -236,7 +314,7 @@ internal sealed class MemoryEffectAnalyzer
         PrimFunction function,
         EffectSet effects)
     {
-        var parameterEffects = new Dictionary<int, EffectInfo>();
+        var parameterEffects = new List<FunctionParameterEffect>();
         foreach (var item in effects.Items)
         {
             if (item.Resource.ExpressionIdentity is not { } identity)
@@ -250,18 +328,50 @@ internal sealed class MemoryEffectAnalyzer
                 continue;
             }
 
-            if (parameterEffects.TryGetValue(parameterIndex, out var existing))
+            var accessPartition = CreateFunctionAccessPartition(
+                function,
+                item.Resource.AccessPartition);
+            var existingIndex = parameterEffects.FindIndex(
+                candidate => candidate.ParameterIndex == parameterIndex &&
+                    candidate.AccessPartition == accessPartition);
+            if (existingIndex >= 0)
             {
-                parameterEffects[parameterIndex] = existing.Merge(item.Effect);
+                var existing = parameterEffects[existingIndex];
+                parameterEffects[existingIndex] = existing with
+                {
+                    Effect = existing.Effect.Merge(item.Effect),
+                };
             }
             else
             {
-                parameterEffects.Add(parameterIndex, item.Effect);
+                parameterEffects.Add(new FunctionParameterEffect(
+                    parameterIndex,
+                    accessPartition,
+                    item.Effect));
             }
         }
 
         return new FunctionEffectSummary(parameterEffects);
     }
+
+    private static FunctionMemoryAccessPartition CreateFunctionAccessPartition(
+        PrimFunction function,
+        ResolvedMemoryAccessPartition accessPartition)
+        => accessPartition.Kind switch
+        {
+            ResolvedMemoryAccessPartitionKind.WholeResource =>
+                FunctionMemoryAccessPartition.WholeResource,
+            ResolvedMemoryAccessPartitionKind.Static =>
+                FunctionMemoryAccessPartition.Static(accessPartition.StaticValue),
+            ResolvedMemoryAccessPartitionKind.Symbolic
+                when accessPartition.SymbolicIdentity is { } identity &&
+                    FindParameterIndex(function, identity) is var parameterIndex &&
+                    parameterIndex >= 0 =>
+                FunctionMemoryAccessPartition.Parameter(parameterIndex),
+            ResolvedMemoryAccessPartitionKind.Symbolic =>
+                FunctionMemoryAccessPartition.WholeResource,
+            _ => throw new ArgumentOutOfRangeException(nameof(accessPartition)),
+        };
 
     private EffectSet GetProducerEntrySourceEffects(
         Sequential body,
@@ -425,7 +535,10 @@ internal sealed class MemoryEffectAnalyzer
                     return;
                 }
 
-                var resource = ResolveResource(argument, effect.Scope, bindings);
+                var resource = ResolveResource(argument, effect.Scope, bindings) with
+                {
+                    AccessPartition = ResolveAccessPartition(call, effect, bindings),
+                };
                 effects.Add(
                     resource,
                     new EffectInfo(
@@ -444,20 +557,88 @@ internal sealed class MemoryEffectAnalyzer
         ResourceBindingScope bindings)
     {
         var effects = new EffectSet();
-        foreach (var (parameterIndex, effect) in summary.ParameterEffects)
+        foreach (var parameterEffect in summary.ParameterEffects)
         {
+            var parameterIndex = parameterEffect.ParameterIndex;
+            var effect = parameterEffect.Effect;
             if (parameterIndex >= arguments.Length || arguments[parameterIndex] is not Expr argument)
             {
                 throw new InvalidOperationException($"Cannot map memory effect for PrimFunction parameter {parameterIndex}.");
             }
 
-            var resource = ResolveResource(argument, MemoryAccessScope.Inferred, bindings);
+            var resource = ResolveResource(argument, MemoryAccessScope.Inferred, bindings) with
+            {
+                AccessPartition = InstantiateAccessPartition(
+                    parameterEffect.AccessPartition,
+                    arguments,
+                    bindings),
+            };
             effects.Add(
                 resource with { Scope = MergeScope(resource.Scope, effect.Scope) },
                 effect);
         }
 
         return effects;
+    }
+
+    private static ResolvedMemoryAccessPartition ResolveAccessPartition(
+        Call call,
+        MemoryEffect effect,
+        ResourceBindingScope bindings)
+    {
+        if (effect.AccessPartition.Kind == MemoryAccessPartitionKind.WholeResource)
+        {
+            return ResolvedMemoryAccessPartition.WholeResource;
+        }
+
+        var argumentIndex = effect.AccessPartition.ArgumentIndex;
+        if ((uint)argumentIndex >= (uint)call.Arguments.Length)
+        {
+            throw new InvalidOperationException(
+                $"Memory access partition argument {argumentIndex} is outside the {call.Arguments.Length} arguments of {call.Target.GetType().Name}.");
+        }
+
+        return ResolveAccessPartition(call.Arguments[argumentIndex], bindings);
+    }
+
+    private static ResolvedMemoryAccessPartition InstantiateAccessPartition(
+        FunctionMemoryAccessPartition accessPartition,
+        ReadOnlySpan<BaseExpr> arguments,
+        ResourceBindingScope bindings)
+        => accessPartition.Kind switch
+        {
+            FunctionMemoryAccessPartitionKind.WholeResource =>
+                ResolvedMemoryAccessPartition.WholeResource,
+            FunctionMemoryAccessPartitionKind.Static =>
+                ResolvedMemoryAccessPartition.Static(accessPartition.StaticValue),
+            FunctionMemoryAccessPartitionKind.Parameter
+                when (uint)accessPartition.ParameterIndex < (uint)arguments.Length =>
+                ResolveAccessPartition(arguments[accessPartition.ParameterIndex], bindings),
+            FunctionMemoryAccessPartitionKind.Parameter =>
+                throw new InvalidOperationException(
+                    $"Cannot map memory access partition for PrimFunction parameter {accessPartition.ParameterIndex}."),
+            _ => throw new ArgumentOutOfRangeException(nameof(accessPartition)),
+        };
+
+    private static ResolvedMemoryAccessPartition ResolveAccessPartition(
+        BaseExpr expression,
+        ResourceBindingScope bindings)
+    {
+        var resolving = new HashSet<BaseExpr>(ReferenceEqualityComparer.Instance);
+        while (expression is IVar && bindings.TryGet(expression, out var boundExpression))
+        {
+            if (!resolving.Add(expression))
+            {
+                throw new InvalidOperationException(
+                    $"Cyclic TIR memory access partition binding detected at '{((IVar)expression).Name}'.");
+            }
+
+            expression = boundExpression;
+        }
+
+        return TryGetFixedInt64(expression, out var value)
+            ? ResolvedMemoryAccessPartition.Static(value)
+            : ResolvedMemoryAccessPartition.Symbolic(expression);
     }
 
     private static EffectSet Union(IEnumerable<EffectSet> sets)
@@ -1348,13 +1529,15 @@ internal sealed record MemoryResource(
     MemoryByteRange? AllocationRange,
     MemoryByteRange? AccessRange,
     TIR.NTT.BarrierScope Scope,
-    DistributedType? DistributedType)
+    DistributedType? DistributedType,
+    ResolvedMemoryAccessPartition AccessPartition = default)
 {
     public bool HasSameRegion(MemoryResource other)
         => HasSameLogicalResource(other) &&
             HasSameBacking(other) &&
             AllocationRange == other.AllocationRange &&
-            AccessRange == other.AccessRange;
+            AccessRange == other.AccessRange &&
+            AccessPartition.HasSameRegion(other.AccessPartition);
 
     public bool HasSameLogicalResource(MemoryResource other)
         => (LogicalIdentity is not null && ReferenceEquals(LogicalIdentity, other.LogicalIdentity)) ||
@@ -1363,6 +1546,11 @@ internal sealed record MemoryResource(
     public bool MayAlias(MemoryResource other)
     {
         if (!HasSameBacking(other))
+        {
+            return false;
+        }
+
+        if (!AccessPartition.MayAlias(other.AccessPartition))
         {
             return false;
         }
@@ -1392,7 +1580,7 @@ internal sealed record MemoryResource(
     }
 }
 
-internal sealed record FunctionEffectSummary(IReadOnlyDictionary<int, EffectInfo> ParameterEffects);
+internal sealed record FunctionEffectSummary(IReadOnlyList<FunctionParameterEffect> ParameterEffects);
 
 internal sealed record TransferSourceDependency(
     EffectSet SourceEffects,

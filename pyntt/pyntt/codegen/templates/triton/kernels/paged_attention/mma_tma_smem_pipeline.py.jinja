@@ -91,60 +91,36 @@
                     [0, 0, 0, 0, 0],
                     [1, 1, {{ tile_size }}, 1, {{ cache["HeadDim"] }}],
                 )
-                key_ptr = tle.gpu.local_ptr(
-                    key_stage,
-                    (shared_zero, shared_zero, {{ shared_rows_name }}, shared_zero, {{ shared_dims_name }}),
-                    shape=({{ tile_size }}, {{ cache["HeadDim"] }}),
-                )
-                key_values = tle.encoding(
-                    tl.trans(tl.load(key_ptr)),
-                    {{ model["FunctionName"] }}__rhs_dot_layout,
-                )
-                score_init = tle.encoding(
-                    tl.zeros(
-                        ({{ ctx["q_head_group_tile"] }}, {{ tile_size }}),
-                        tl.float32,
-                    ),
-                    {{ model["FunctionName"] }}__mma_layout,
-                )
-                score = tl.dot(q_values, key_values, acc=score_init)
-                key_reader.release(sequence)
 {% if masked %}
                 attention_mask = q_head_mask[:, None] & context_mask[None, :]
 {% else %}
                 attention_mask = tl.broadcast_to(q_head_mask[:, None], ({{ ctx["q_head_group_tile"] }}, {{ tile_size }}))
 {% endif %}
-                score = tl.where(attention_mask, score * scale_log2_value, -float("inf"))
-                block_max = tl.max(score, axis=1)
-                has_context = block_max != -float("inf")
-                new_max = tl.maximum(max_score, block_max)
-                safe_new_max = tl.where(has_context, new_max, 0.0)
-                safe_prev_max = tl.where(has_context, max_score, 0.0)
-                alpha = tl.exp2(safe_prev_max - safe_new_max)
-                prob = tl.exp2(tl.where(attention_mask, score - safe_new_max[:, None], -float("inf")))
+                attention_mask = tle.encoding(
+                    attention_mask,
+                    {{ model["FunctionName"] }}__mma_layout,
+                )
+                prob, alpha, new_max, has_context = {{ model["FunctionName"] }}__qk_consumer_stage(
+                    key_stage,
+                    q_values,
+                    attention_mask,
+                    max_score,
+                    scale_log2_value,
+                    {{ tile_size }},
+                )
+                key_reader.release(sequence)
                 value_ready = value_reader.wait(sequence)
                 value_stage = value_ready.slot.value.subslice(
                     [0, 0, 0, 0, 0],
                     [1, 1, {{ tile_size }}, 1, {{ cache["HeadDim"] }}],
                 )
-                value_ptr = tle.gpu.local_ptr(
+                acc = {{ model["FunctionName"] }}__value_consumer_stage(
                     value_stage,
-                    (shared_zero, shared_zero, {{ shared_rows_name }}, shared_zero, {{ shared_dims_name }}),
-                    shape=({{ tile_size }}, {{ cache["HeadDim"] }}),
+                    prob,
+                    alpha,
+                    acc,
+                    {{ tile_size }},
                 )
-                value_values = tle.encoding(
-                    tl.load(value_ptr),
-                    {{ model["FunctionName"] }}__rhs_dot_layout,
-                )
-                prob_values = tle.encoding(
-                    prob.to({{ cache["TritonDType"] }}),
-                    {{ model["FunctionName"] }}__lhs_dot_layout,
-                )
-                scaled_acc = tle.encoding(
-                    acc * alpha[:, None],
-                    {{ model["FunctionName"] }}__mma_layout,
-                )
-                acc = tl.dot(prob_values, value_values, scaled_acc, input_precision="ieee")
                 value_reader.release(sequence)
                 sum_exp = sum_exp * alpha + tl.sum(prob, axis=1)
                 max_score = tl.where(has_context, new_max, max_score)
@@ -172,6 +148,126 @@
         2,
     )
 )
+{{ model["FunctionName"] }}__score_row_layout = tl.constexpr(
+    tle.gpu.SlicedEncoding(
+        1,
+        {{ model["FunctionName"] }}__mma_layout,
+    )
+)
+@triton.jit(noinline=True, allow_tensor_args=True)
+def {{ model["FunctionName"] }}__qk_consumer_stage(
+    key_stage,
+    q_values,
+    attention_mask,
+    max_score,
+    scale_log2_value,
+    tile_size: tl.constexpr,
+):
+    q_values = tle.encoding(
+        q_values,
+        {{ model["FunctionName"] }}__lhs_dot_layout,
+    )
+    attention_mask = tle.encoding(
+        attention_mask,
+        {{ model["FunctionName"] }}__mma_layout,
+    )
+    max_score = tle.encoding(
+        max_score,
+        {{ model["FunctionName"] }}__score_row_layout,
+    )
+    shared_zero = tl.full((), 0, tl.int32)
+    shared_rows = tl.broadcast_to(
+        tl.arange(0, tile_size)[:, None],
+        (tile_size, {{ cache["HeadDim"] }}),
+    )
+    shared_dims = tl.broadcast_to(
+        tl.arange(0, {{ cache["HeadDim"] }})[None, :],
+        (tile_size, {{ cache["HeadDim"] }}),
+    )
+    key_ptr = tle.gpu.local_ptr(
+        key_stage,
+        (shared_zero, shared_zero, shared_rows, shared_zero, shared_dims),
+        shape=(tile_size, {{ cache["HeadDim"] }}),
+    )
+    key_values = tle.encoding(
+        tl.trans(tl.load(key_ptr)),
+        {{ model["FunctionName"] }}__rhs_dot_layout,
+    )
+    score_init = tle.encoding(
+        tl.zeros(
+            ({{ ctx["q_head_group_tile"] }}, tile_size),
+            tl.float32,
+        ),
+        {{ model["FunctionName"] }}__mma_layout,
+    )
+    score = tl.dot(q_values, key_values, acc=score_init)
+    score = tl.where(attention_mask, score * scale_log2_value, -float("inf"))
+    block_max = tl.max(score, axis=1)
+    has_context = block_max != -float("inf")
+    new_max = tl.maximum(max_score, block_max)
+    safe_new_max = tl.where(has_context, new_max, 0.0)
+    safe_prev_max = tl.where(has_context, max_score, 0.0)
+    alpha = tl.exp2(safe_prev_max - safe_new_max)
+    prob = tl.exp2(
+        tl.where(attention_mask, score - safe_new_max[:, None], -float("inf"))
+    )
+    return prob, alpha, new_max, has_context
+
+
+@triton.jit(noinline=True, allow_tensor_args=True)
+def {{ model["FunctionName"] }}__value_consumer_stage(
+    value_stage,
+    prob,
+    alpha,
+    acc,
+    tile_size: tl.constexpr,
+):
+    prob = tle.encoding(
+        prob,
+        {{ model["FunctionName"] }}__mma_layout,
+    )
+    alpha = tle.encoding(
+        alpha,
+        {{ model["FunctionName"] }}__score_row_layout,
+    )
+    acc = tle.encoding(
+        acc,
+        {{ model["FunctionName"] }}__mma_layout,
+    )
+    shared_zero = tl.full((), 0, tl.int32)
+    shared_rows = tl.broadcast_to(
+        tl.arange(0, tile_size)[:, None],
+        (tile_size, {{ cache["HeadDim"] }}),
+    )
+    shared_dims = tl.broadcast_to(
+        tl.arange(0, {{ cache["HeadDim"] }})[None, :],
+        (tile_size, {{ cache["HeadDim"] }}),
+    )
+    value_ptr = tle.gpu.local_ptr(
+        value_stage,
+        (shared_zero, shared_zero, shared_rows, shared_zero, shared_dims),
+        shape=(tile_size, {{ cache["HeadDim"] }}),
+    )
+    value_values = tle.encoding(
+        tl.load(value_ptr),
+        {{ model["FunctionName"] }}__rhs_dot_layout,
+    )
+    prob_values = tle.encoding(
+        prob.to({{ cache["TritonDType"] }}),
+        {{ model["FunctionName"] }}__lhs_dot_layout,
+    )
+    scaled_acc = tle.encoding(
+        acc * alpha[:, None],
+        {{ model["FunctionName"] }}__mma_layout,
+    )
+    return tl.dot(
+        prob_values,
+        value_values,
+        scaled_acc,
+        input_precision="ieee",
+    )
+
+
 {{ "@triton.jit(noinline=True)" if model["NoInline"] else "@triton.jit" }}
 def {{ model["FunctionName"] }}__regular_producer(key_writer, value_writer, {{ helper_parameters(model) }}):
 {{ common.mesh_coordinates(model["MeshAxes"]) }}
@@ -338,9 +434,18 @@ def {{ model["FunctionName"] }}__regular_consumer(key_reader, value_reader, {{ h
                 ),
                 {{ model["FunctionName"] }}__lhs_dot_layout,
             )
-            max_score = tl.full(({{ ctx["q_head_group_tile"] }},), -float("inf"), tl.float32)
-            sum_exp = tl.zeros(({{ ctx["q_head_group_tile"] }},), tl.float32)
-            acc = tl.zeros(({{ ctx["q_head_group_tile"] }}, {{ cache["HeadDim"] }}), tl.float32)
+            max_score = tle.encoding(
+                tl.full(({{ ctx["q_head_group_tile"] }},), -float("inf"), tl.float32),
+                {{ model["FunctionName"] }}__score_row_layout,
+            )
+            sum_exp = tle.encoding(
+                tl.zeros(({{ ctx["q_head_group_tile"] }},), tl.float32),
+                {{ model["FunctionName"] }}__score_row_layout,
+            )
+            acc = tle.encoding(
+                tl.zeros(({{ ctx["q_head_group_tile"] }}, {{ cache["HeadDim"] }}), tl.float32),
+                {{ model["FunctionName"] }}__mma_layout,
+            )
             single_query_active = single_token_context & direct_owner & found_seq
 {% if cache["IdLength"] > 1 %}
             single_topology_id = tl.load(block_table, mask=single_query_active, other=0).to(tl.int64)

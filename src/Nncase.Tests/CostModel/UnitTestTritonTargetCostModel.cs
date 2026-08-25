@@ -102,6 +102,31 @@ public sealed class UnitTestTritonTargetCostModel : TestClassBase
     }
 
     [Fact]
+    public void TestExplicitMmaMatMulCostDoesNotFallBackToSimt()
+    {
+        var costModel = new TritonTargetOpCostModel(CreateGpuMachine());
+        var lhs = new TargetCostTensor(
+            DataTypes.BFloat16,
+            new RankedShape(1, 256));
+        var rhs = new TargetCostTensor(
+            DataTypes.BFloat16,
+            new RankedShape(256, 256));
+        var output = new TargetCostTensor(
+            DataTypes.BFloat16,
+            new RankedShape(1, 256));
+
+        Assert.True(costModel.TryGetMatMulCost(
+            new(lhs, rhs, output, DataTypes.BFloat16, MatMulOpCostKind.Mma),
+            out var mmaCost));
+        Assert.True(costModel.TryGetMatMulCost(
+            new(lhs, rhs, output, DataTypes.BFloat16, MatMulOpCostKind.Simt),
+            out var simtCost));
+        Assert.True(
+            mmaCost[CostFactorNames.CPUCycles] <
+            simtCost[CostFactorNames.CPUCycles]);
+    }
+
+    [Fact]
     public async Task TestAutoVectorizeExtractsVectorizedMatMul()
     {
         CompileOptions.TargetOptions = CreateOptions(CreateGpuMachine(rootBytesPerCycle: 174));
@@ -203,6 +228,54 @@ public sealed class UnitTestTritonTargetCostModel : TestClassBase
         Assert.Equal((UInt128)4, cost[CostFactorNames.BlockLocalMemoryStoreBytes]);
         Assert.Equal((UInt128)62, cost[CostFactorNames.CPUCycles]);
         Assert.Equal((UInt128)1, cost[CostFactorNames.GridSynchronization]);
+    }
+
+    [Fact]
+    public void TestTuplePartialAllReduceSharesGridSynchronization()
+    {
+        CompileOptions.TargetOptions = CreateOptions(CreateGpuMachine());
+        var placement = new Placement([4, 8], "y,x", "bb");
+        var tensorTypes = new[]
+        {
+            new TensorType(DataTypes.BFloat16, new RankedShape(1, 16)),
+            new TensorType(DataTypes.BFloat16, new RankedShape(1, 8)),
+            new TensorType(DataTypes.BFloat16, new RankedShape(1, 8)),
+        };
+        var inputTypes = tensorTypes
+            .Select(tensorType => (IRType)new DistributedType(tensorType, [SBP.B, SBP.B], placement, SBP.P([0, 1])))
+            .ToArray();
+        var outputTypes = tensorTypes
+            .Select(tensorType => (IRType)new DistributedType(tensorType, [SBP.B, SBP.B], placement))
+            .ToArray();
+        var inputs = inputTypes
+            .Select((inputType, index) => (BaseExpr)new Var($"input_{index}", inputType))
+            .ToArray();
+        var boxing = IR.F.Distributed.Boxing(new IR.Tuple(inputs), new TupleType(outputTypes));
+        CompilerServices.InferenceType(boxing);
+
+        var tupleCost = CompilerServices.EvaluateCost(boxing, CompileOptions);
+        var fieldCosts = Enumerable.Range(0, inputs.Length)
+            .Select(index =>
+            {
+                var fieldBoxing = IR.F.Distributed.Boxing(inputs[index], outputTypes[index]);
+                CompilerServices.InferenceType(fieldBoxing);
+                return CompilerServices.EvaluateCost(fieldBoxing, CompileOptions);
+            })
+            .ToArray();
+
+        Assert.Equal((UInt128)1, tupleCost[CostFactorNames.GridSynchronization]);
+        foreach (var factorName in fieldCosts.SelectMany(cost => cost.Factors.Keys).Distinct())
+        {
+            if (factorName == CostFactorNames.GridSynchronization)
+            {
+                continue;
+            }
+
+            var expected = fieldCosts.Aggregate(
+                (UInt128)0,
+                (sum, cost) => sum + (cost.Factors.TryGetValue(factorName, out var value) ? value : 0));
+            Assert.Equal(expected, tupleCost[factorName]);
+        }
     }
 
     [Fact]

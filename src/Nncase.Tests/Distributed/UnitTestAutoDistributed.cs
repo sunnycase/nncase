@@ -8,6 +8,7 @@ using System.Linq;
 using System.Reflection;
 using System.Text.Json;
 using System.Threading.Tasks;
+using Nncase.CostModel;
 using Nncase.Diagnostics;
 using Nncase.Evaluator.IR.NTT;
 using Nncase.Evaluator.NN;
@@ -1047,6 +1048,247 @@ public sealed class UnitTestDistribAutoDistributed : TestClassBase
     }
 
     [Fact]
+    public void TestPackedQKVCandidateProviderPreservesDirectAndEmitsCoupledSplitKPlan()
+    {
+        var options = new PyNTTTargetOptions
+        {
+            HierarchyNames = "yx",
+            HierarchyLevels = "bb",
+            Hierarchies = [new[] { 8, 16 }],
+        };
+        CompileOptions.TargetOptions = options;
+        var placement = new Placement([8, 16], "yx", "bb");
+        var inputTensorType = new TensorType(DataTypes.BFloat16, new long[] { 1, 2048 });
+        var qWeightTensorType = new TensorType(
+            new VectorType(DataTypes.BFloat16, [8, 2, 8]),
+            new long[] { 128, 256 });
+        var kvWeightTensorType = new TensorType(
+            new VectorType(DataTypes.BFloat16, [8, 2, 8]),
+            new long[] { 128, 128 });
+        var inputType = new DistributedType(
+            inputTensorType,
+            [SBP.B, SBP.SBlockCyclic([0], 64)],
+            placement);
+        var directInputType = new DistributedType(
+            inputTensorType,
+            [SBP.B, SBP.B],
+            placement);
+        var qWeightType = new DistributedType(
+            qWeightTensorType,
+            [SBP.SBlockCyclic([0], 4), SBP.SBlockCyclic([1], 1)],
+            placement);
+        var kvWeightType = new DistributedType(
+            kvWeightTensorType,
+            [SBP.SBlockCyclic([0], 4), SBP.SBlockCyclic([1], 1)],
+            placement);
+        var directQWeightType = new DistributedType(
+            qWeightTensorType,
+            [SBP.B, SBP.SBlockCyclic([0, 1], 1)],
+            placement);
+        var directKVWeightType = new DistributedType(
+            kvWeightTensorType,
+            [SBP.B, SBP.SBlockCyclic([0, 1], 1)],
+            placement);
+        var input = new Var("input", inputTensorType);
+        var qWeight = new Var("q_weight", qWeightTensorType);
+        var kWeight = new Var("k_weight", kvWeightTensorType);
+        var vWeight = new Var("v_weight", kvWeightTensorType);
+        var sourceCall = Assert.IsType<Call>(IR.F.NTT.PackedQKVParallelLinear(
+            input,
+            qWeight,
+            kWeight,
+            vWeight,
+            None.Default,
+            None.Default,
+            None.Default,
+            None.Default,
+            None.Default,
+            None.Default,
+            None.Default,
+            None.Default,
+            None.Default,
+            16,
+            8,
+            DataTypes.BFloat16,
+            PackedMatMulRhsLayout.KMajor));
+        Assert.True(sourceCall.InferenceType());
+        var sourceOutputType = Assert.IsType<TupleType>(sourceCall.CheckedType);
+        var sourceOutputFields = sourceOutputType.Fields.Cast<TensorType>().ToArray();
+        var materializedOutputType = new TupleType(sourceOutputFields
+            .Select(field => (IRType)new DistributedType(
+                field,
+                [SBP.B, SBP.SBlockCyclic([1], 8)],
+                placement))
+            .ToArray());
+        var context = new DistributedCandidateContext(
+            CompileOptions,
+            options,
+            PyNTTTarget.Kind,
+            sourceCall,
+            [
+                new IRType[] { inputType, directInputType },
+                new IRType[] { qWeightType, directQWeightType },
+                new IRType[] { kvWeightType, directKVWeightType },
+                new IRType[] { kvWeightType, directKVWeightType },
+                .. Enumerable.Repeat<IReadOnlyList<IRType>>(
+                    new IRType[] { NoneType.Default },
+                    9),
+            ]);
+        var provider = new PackedQKVParallelLinearCandidateProvider();
+        var target = Assert.IsType<PackedQKVParallelLinear>(sourceCall.Target);
+
+        var returnTypes = provider.GetReturnCandidateTypes(
+            context,
+            target,
+            [materializedOutputType]);
+        var outputType = Assert.IsType<TupleType>(Assert.Single(
+            returnTypes.Where(type =>
+                type is TupleType tuple &&
+                tuple.Fields.All(field => field is DistributedType { Partial: not null }))));
+        Assert.Contains(materializedOutputType, returnTypes);
+        var outputFields = outputType.Fields.Cast<DistributedType>().ToArray();
+        Assert.All(outputFields, output => Assert.Equal(SBP.P([0], ReduceOp.Sum), output.Partial));
+        Assert.All(outputFields, output => Assert.Equal(SBP.SBlockCyclic([1], 8), output.AxisPolicies[^1]));
+        Assert.True(provider.TryGetInputTypeTuples(context, target, outputType, out var tuples));
+        var tuple = Assert.Single(tuples);
+        Assert.Equal(inputType, tuple.InputTypes[PackedQKVParallelLinear.Input.Index]);
+        Assert.NotEqual(qWeightType, tuple.InputTypes[PackedQKVParallelLinear.QWeight.Index]);
+        Assert.NotEqual(kvWeightType, tuple.InputTypes[PackedQKVParallelLinear.KWeight.Index]);
+        Assert.NotEqual(kvWeightType, tuple.InputTypes[PackedQKVParallelLinear.VWeight.Index]);
+
+        IRType[] directArguments =
+        [
+            directInputType,
+            directQWeightType,
+            directKVWeightType,
+            directKVWeightType,
+            .. Enumerable.Repeat<IRType>(NoneType.Default, 9),
+        ];
+        var directOutputType = Assert.IsType<TupleType>(PackedQKVParallelLinearEvaluator.InferType(
+            target,
+            directArguments[0],
+            directArguments[1],
+            directArguments[2],
+            directArguments[3],
+            directArguments[4],
+            directArguments[5],
+            directArguments[6],
+            directArguments[7],
+            directArguments[8],
+            directArguments[9],
+            directArguments[10],
+            directArguments[11],
+            directArguments[12]));
+        Assert.Equal(
+            materializedOutputType,
+            PackedQKVParallelLinearCombineEvaluator.InferType(outputType, materializedOutputType));
+
+        var heterogeneousDirectOutputType = new TupleType(
+        [
+            new DistributedType(
+                sourceOutputFields[0],
+                [SBP.B, SBP.SBlockCyclic([0, 1], 2)],
+                placement),
+            new DistributedType(
+                sourceOutputFields[1],
+                [SBP.B, SBP.SBlockCyclic([0, 1], 1)],
+                placement),
+            new DistributedType(
+                sourceOutputFields[2],
+                [SBP.B, SBP.SBlockCyclic([0, 1], 1)],
+                placement),
+        ]);
+        Assert.True(provider.TryGetInputTypeTuples(
+            context,
+            target,
+            heterogeneousDirectOutputType,
+            out var heterogeneousDirectTuples));
+        var heterogeneousDirectArguments = Assert.Single(
+            heterogeneousDirectTuples.Where(candidate =>
+                candidate.InputTypes[PackedQKVParallelLinear.Input.Index] == directInputType)).InputTypes;
+        Assert.Equal(
+            heterogeneousDirectOutputType,
+            PackedQKVParallelLinearEvaluator.InferType(
+                target,
+                heterogeneousDirectArguments[0],
+                heterogeneousDirectArguments[1],
+                heterogeneousDirectArguments[2],
+                heterogeneousDirectArguments[3],
+                heterogeneousDirectArguments[4],
+                heterogeneousDirectArguments[5],
+                heterogeneousDirectArguments[6],
+                heterogeneousDirectArguments[7],
+                heterogeneousDirectArguments[8],
+                heterogeneousDirectArguments[9],
+                heterogeneousDirectArguments[10],
+                heterogeneousDirectArguments[11],
+                heterogeneousDirectArguments[12]));
+
+        var partialValue = new Var("partial_qkv", outputType);
+        var combineCall = Assert.IsType<Call>(
+            IR.F.NTT.PackedQKVParallelLinearCombine(partialValue, materializedOutputType));
+        Assert.True(combineCall.InferenceType());
+        var combineContext = new DistributedCandidateContext(
+            CompileOptions,
+            options,
+            PyNTTTarget.Kind,
+            combineCall,
+            [new IRType[] { outputType, materializedOutputType }]);
+        var combineProvider = new PackedQKVParallelLinearCombineCandidateProvider();
+        var combineTarget = Assert.IsType<PackedQKVParallelLinearCombine>(combineCall.Target);
+        Assert.Equal(
+            new IRType[] { materializedOutputType },
+            combineProvider.GetReturnCandidateTypes(combineContext, combineTarget, [materializedOutputType]));
+        Assert.True(combineProvider.TryGetInputTypeTuples(
+            combineContext,
+            combineTarget,
+            materializedOutputType,
+            out var combineTuples));
+        Assert.Equal(2, combineTuples.Count);
+
+        var partialCost = CompilerServices.EvaluateCost(combineCall, CompileOptions);
+        Assert.Equal((UInt128)1, partialCost[CostFactorNames.GridSynchronization]);
+        Assert.True(partialCost[CostFactorNames.BlockLocalMemoryLoadBytes] > 0);
+        var directValue = new Var("direct_qkv", directOutputType);
+        var identityCombine = IR.F.NTT.PackedQKVParallelLinearCombine(directValue, directOutputType);
+        Assert.True(identityCombine.InferenceType());
+        Assert.Empty(CompilerServices.EvaluateCost(identityCombine, CompileOptions).Factors);
+
+        var directCall = CreateTypedPackedQKVCall(target, directArguments, "direct");
+        var splitCall = CreateTypedPackedQKVCall(target, tuple.InputTypes, "split");
+        Assert.True(directCall.InferenceType());
+        Assert.True(splitCall.InferenceType());
+        var directCost = CompilerServices.EvaluateCost(directCall, CompileOptions);
+        var splitCost = CompilerServices.EvaluateCost(splitCall, CompileOptions);
+        Assert.True(directCost[CostFactorNames.PipelineDrainCycles] > 0);
+        Assert.True(splitCost[CostFactorNames.PipelineDrainCycles] > 0);
+        var directLatency = TargetOpCostModelUtility.GetCostLatency(
+            options.TargetCostModel,
+            directCost,
+            directOutputType);
+        var splitLatency = TargetOpCostModelUtility.GetCostLatency(
+            options.TargetCostModel,
+            splitCost,
+            outputType) + TargetOpCostModelUtility.GetCostLatency(
+            options.TargetCostModel,
+            partialCost,
+            materializedOutputType);
+        Assert.True(
+            splitLatency < directLatency,
+            $"Expected the staged split-K QKV plan ({splitLatency}) to beat direct MMA ({directLatency}).");
+
+        static Call CreateTypedPackedQKVCall(
+            PackedQKVParallelLinear op,
+            IReadOnlyList<IRType> argumentTypes,
+            string prefix)
+            => new(
+                op,
+                argumentTypes.Select((type, index) => type is NoneType
+                    ? (Expr)None.Default
+                    : new Var($"{prefix}_{index}", type)).ToArray());
+    }
+
+    [Fact]
     public void TestPagedAttentionPartialCombineDistributionContract()
     {
         var options = new PyNTTTargetOptions();
@@ -1197,6 +1439,97 @@ public sealed class UnitTestDistribAutoDistributed : TestClassBase
             partialMaxType,
             partialSumType,
             partialAccType));
+    }
+
+    [Fact]
+    public void TestPackedMatMulNormStatsCombineEnumeratesReduceScatterOutput()
+    {
+        var options = new PyNTTTargetOptions
+        {
+            HierarchyNames = "yx",
+            HierarchyLevels = "bb",
+            Hierarchies = [new[] { 8, 16 }],
+        };
+        CompileOptions.TargetOptions = options;
+        var placement = new Placement([8, 16], "yx", "bb");
+        var valueTensor = new TensorType(
+            new VectorType(DataTypes.BFloat16, [8]),
+            new RankedShape(1, 256));
+        var value = new Var("value", valueTensor);
+        var addend = new Var("addend", valueTensor);
+        var statsTensor = Assert.IsType<TensorType>(IR.F.NN.NormStats(-1, value, false).CheckedType);
+        var sourceCall = Assert.IsType<Call>(IR.F.NTT.PackedMatMulNormStatsCombine(
+            value,
+            addend,
+            new TupleType([valueTensor, statsTensor]),
+            1,
+            false));
+        Assert.True(sourceCall.InferenceType());
+
+        var splitValue = new DistributedType(
+            valueTensor,
+            [SBP.B, SBP.SBlockCyclic([0], 8)],
+            placement);
+        var partialValue = new DistributedType(
+            valueTensor,
+            [SBP.B, SBP.SBlockCyclic([0], 1)],
+            placement,
+            SBP.P([1], ReduceOp.Sum));
+        var broadcastValue = new DistributedType(
+            valueTensor,
+            [SBP.B, SBP.B],
+            placement);
+        var broadcastStats = new DistributedType(
+            statsTensor,
+            [SBP.B, SBP.B, SBP.B],
+            placement);
+        var context = new DistributedCandidateContext(
+            CompileOptions,
+            options,
+            PyNTTTarget.Kind,
+            sourceCall,
+            [
+                new IRType[] { partialValue, broadcastValue },
+                new IRType[] { splitValue, broadcastValue },
+            ]);
+        var provider = new PackedMatMulNormStatsCombineCandidateProvider();
+        var target = Assert.IsType<PackedMatMulNormStatsCombine>(sourceCall.Target);
+        var returnTypes = provider.GetReturnCandidateTypes(
+            context,
+            target,
+            [new TupleType([broadcastValue, broadcastStats])]);
+        var reduceScatterOutput = Assert.IsType<TupleType>(Assert.Single(
+            returnTypes.Where(type =>
+                type is TupleType tuple && Equals(tuple[0], splitValue))));
+        var splitStats = Assert.IsType<DistributedType>(reduceScatterOutput[1]);
+
+        Assert.Equal(SBP.P([0], ReduceOp.Sum), splitStats.Partial);
+        Assert.True(provider.TryGetInputTypeTuples(
+            context,
+            target,
+            reduceScatterOutput,
+            out var tuples));
+        var tuple = Assert.Single(tuples);
+        Assert.Equal(partialValue, tuple.InputTypes[PackedMatMulNormStatsCombine.Input.Index]);
+        Assert.Equal(splitValue, tuple.InputTypes[PackedMatMulNormStatsCombine.Addend.Index]);
+    }
+
+    [Fact]
+    public void TestPackedMatMulNormStatsCombineCanGatherAndReduceToBroadcast()
+    {
+        var placement = new Placement([8, 16], "yx", "bb");
+        var tensorType = new TensorType(new VectorType(DataTypes.BFloat16, [8]), [1, 256]);
+        var partial = new DistributedType(
+            tensorType,
+            new SBP[] { SBP.B, SBP.SBlockCyclic([0], 1) },
+            placement,
+            SBP.P([1], ReduceOp.Sum));
+        var broadcast = new DistributedType(
+            tensorType,
+            new SBP[] { SBP.B, SBP.B },
+            placement);
+
+        Assert.True(PackedMatMulNormStatsCombineEvaluator.CanMaterialize(partial, broadcast));
     }
 
     [Fact]

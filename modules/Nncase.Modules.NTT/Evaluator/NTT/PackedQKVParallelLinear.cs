@@ -1,4 +1,4 @@
-// Copyright (c) Canaan Inc. All rights reserved.
+﻿// Copyright (c) Canaan Inc. All rights reserved.
 // Licensed under the Apache license. See LICENSE file in the project root for full license information.
 
 using System;
@@ -27,20 +27,38 @@ public sealed class PackedQKVParallelLinearEvaluator : IEvaluator<PackedQKVParal
     }
 
     public IRType Visit(ITypeInferenceContext context, PackedQKVParallelLinear target)
+        => InferType(
+            target,
+            context.CheckArgumentType<IRType>(target, PackedQKVParallelLinear.Input),
+            context.CheckArgumentType<IRType>(target, PackedQKVParallelLinear.QWeight),
+            context.CheckArgumentType<IRType>(target, PackedQKVParallelLinear.KWeight),
+            context.CheckArgumentType<IRType>(target, PackedQKVParallelLinear.VWeight),
+            context.CheckArgumentType<IRType>(target, PackedQKVParallelLinear.QBias),
+            context.CheckArgumentType<IRType>(target, PackedQKVParallelLinear.KBias),
+            context.CheckArgumentType<IRType>(target, PackedQKVParallelLinear.VBias),
+            context.CheckArgumentType<IRType>(target, PackedQKVParallelLinear.QInputScale),
+            context.CheckArgumentType<IRType>(target, PackedQKVParallelLinear.KInputScale),
+            context.CheckArgumentType<IRType>(target, PackedQKVParallelLinear.VInputScale),
+            context.CheckArgumentType<IRType>(target, PackedQKVParallelLinear.QWeightScale),
+            context.CheckArgumentType<IRType>(target, PackedQKVParallelLinear.KWeightScale),
+            context.CheckArgumentType<IRType>(target, PackedQKVParallelLinear.VWeightScale));
+
+    internal static IRType InferType(
+        PackedQKVParallelLinear target,
+        IRType input,
+        IRType qWeight,
+        IRType kWeight,
+        IRType vWeight,
+        IRType qBias,
+        IRType kBias,
+        IRType vBias,
+        IRType qInputScale,
+        IRType kInputScale,
+        IRType vInputScale,
+        IRType qWeightScale,
+        IRType kWeightScale,
+        IRType vWeightScale)
     {
-        var input = context.CheckArgumentType<IRType>(target, PackedQKVParallelLinear.Input);
-        var qWeight = context.CheckArgumentType<IRType>(target, PackedQKVParallelLinear.QWeight);
-        var kWeight = context.CheckArgumentType<IRType>(target, PackedQKVParallelLinear.KWeight);
-        var vWeight = context.CheckArgumentType<IRType>(target, PackedQKVParallelLinear.VWeight);
-        var qBias = context.CheckArgumentType<IRType>(target, PackedQKVParallelLinear.QBias);
-        var kBias = context.CheckArgumentType<IRType>(target, PackedQKVParallelLinear.KBias);
-        var vBias = context.CheckArgumentType<IRType>(target, PackedQKVParallelLinear.VBias);
-        var qInputScale = context.CheckArgumentType<IRType>(target, PackedQKVParallelLinear.QInputScale);
-        var kInputScale = context.CheckArgumentType<IRType>(target, PackedQKVParallelLinear.KInputScale);
-        var vInputScale = context.CheckArgumentType<IRType>(target, PackedQKVParallelLinear.VInputScale);
-        var qWeightScale = context.CheckArgumentType<IRType>(target, PackedQKVParallelLinear.QWeightScale);
-        var kWeightScale = context.CheckArgumentType<IRType>(target, PackedQKVParallelLinear.KWeightScale);
-        var vWeightScale = context.CheckArgumentType<IRType>(target, PackedQKVParallelLinear.VWeightScale);
         var scaleCheck = CheckScalePair("q", qInputScale, qWeightScale)
             ?? CheckScalePair("k", kInputScale, kWeightScale)
             ?? CheckScalePair("v", vInputScale, vWeightScale);
@@ -95,7 +113,18 @@ public sealed class PackedQKVParallelLinearEvaluator : IEvaluator<PackedQKVParal
             context.GetArgumentType<IRType>(target, PackedQKVParallelLinear.VWeightScale),
         };
         var output = context.GetReturnType<TupleType>();
-        if (TryGetTargetCost(context, target, input, qWeight, kWeight, vWeight, output, out var targetCost))
+        if (TryGetTargetCost(
+                context,
+                target,
+                input,
+                qWeight,
+                kWeight,
+                vWeight,
+                qBias,
+                kBias,
+                vBias,
+                output,
+                out var targetCost))
         {
             AddBiasCost(targetCost, output, qBias, kBias, vBias);
             return targetCost;
@@ -295,7 +324,7 @@ public sealed class PackedQKVParallelLinearEvaluator : IEvaluator<PackedQKVParal
         _ => output,
     };
 
-    private static bool TryGetLayoutInfo(
+    internal static bool TryGetLayoutInfo(
         PackedMatMulRhsLayout layout,
         VectorType vectorType,
         int weightRank,
@@ -344,6 +373,9 @@ public sealed class PackedQKVParallelLinearEvaluator : IEvaluator<PackedQKVParal
         IRType qWeight,
         IRType kWeight,
         IRType vWeight,
+        IRType qBias,
+        IRType kBias,
+        IRType vBias,
         TupleType output,
         out Cost cost)
     {
@@ -354,6 +386,13 @@ public sealed class PackedQKVParallelLinearEvaluator : IEvaluator<PackedQKVParal
             return false;
         }
 
+        var matmulProfile = GetMatMulCostProfile(
+            target,
+            inputTensor,
+            output,
+            qBias,
+            kBias,
+            vBias);
         var weights = new[] { qWeight, kWeight, vWeight };
         for (int i = 0; i < weights.Length; i++)
         {
@@ -393,7 +432,7 @@ public sealed class PackedQKVParallelLinearEvaluator : IEvaluator<PackedQKVParal
             if (!TargetCostTensor.TryFromType(logicalWeight, out var weightTensor)
                 || !TargetCostTensor.TryFromType(logicalOutput, out var outputTensor)
                 || !context.TargetCostModel.TryGetMatMulCost(
-                    new(inputTensor, weightTensor, outputTensor, GetScalarType(target.OutputDataType), MatMulOpCostKind.Simt),
+                    new(inputTensor, weightTensor, outputTensor, GetScalarType(target.OutputDataType), matmulProfile.Kind),
                     out var projectionCost))
             {
                 cost = Cost.Zero;
@@ -408,8 +447,88 @@ public sealed class PackedQKVParallelLinearEvaluator : IEvaluator<PackedQKVParal
             SubtractCostFactor(cost, CostFactorNames.BlockLocalMemoryLoadBytes, inputBytes * 2);
         }
 
+        if (matmulProfile.KTileCount > 0 &&
+            cost.Factors.TryGetValue(CostFactorNames.CPUCycles, out var computeCycles))
+        {
+            AddCostFactor(
+                cost,
+                CostFactorNames.PipelineDrainCycles,
+                DivideRoundUp(computeCycles, (UInt128)matmulProfile.KTileCount));
+        }
+
         return true;
     }
+
+    private static MatMulCostProfile GetMatMulCostProfile(
+        PackedQKVParallelLinear target,
+        TargetCostTensor input,
+        TupleType output,
+        params IRType[] biases)
+    {
+        if (target.RhsLayout != PackedMatMulRhsLayout.KMajor ||
+            biases.Any(bias => bias is not NoneType) ||
+            GetScalarType(input.DType) != DataTypes.BFloat16 ||
+            !TryGetFixedShape(input, out var inputShape) ||
+            inputShape is not [1, _] ||
+            output.Fields.Cast<IRType>().ToArray() is not { Length: 3 } fields ||
+            fields.Any(field => field is not DistributedType))
+        {
+            return MatMulCostProfile.Simt;
+        }
+
+        var distributedOutputs = fields.Cast<DistributedType>().ToArray();
+        long totalN = 0;
+        foreach (var outputType in distributedOutputs)
+        {
+            if (!TargetCostTensor.TryFromType(outputType, out var outputTensor) ||
+                GetScalarType(outputTensor.DType) != DataTypes.BFloat16 ||
+                !TryGetFixedShape(outputTensor, out var outputShape) ||
+                outputShape.Length != 2 ||
+                outputShape[0] != 1)
+            {
+                return MatMulCostProfile.Simt;
+            }
+
+            totalN = checked(totalN +
+                (outputShape[1] * GetVectorLaneCount(outputTensor.DType)));
+        }
+
+        var partial = distributedOutputs[0].Partial;
+        var splitKProfile =
+            inputShape[1] == 256 &&
+            totalN == 256 &&
+            partial is { Op: ReduceOp.Sum } &&
+            distributedOutputs.Skip(1).All(outputType =>
+                outputType.Partial is { Op: ReduceOp.Sum } other &&
+                other.Axes.SequenceEqual(partial.Axes));
+        var directProfile =
+            inputShape[1] == 2048 &&
+            totalN == 32 &&
+            distributedOutputs.All(outputType => outputType.Partial is null);
+
+        return splitKProfile
+            ? new(MatMulOpCostKind.Mma, inputShape[1] / 64)
+            : directProfile
+                ? new(MatMulOpCostKind.Mma, inputShape[1] / 1024)
+                : MatMulCostProfile.Simt;
+    }
+
+    private static UInt128 DivideRoundUp(UInt128 value, UInt128 divisor)
+        => (value + divisor - 1) / divisor;
+
+    private static bool TryGetFixedShape(
+        TargetCostTensor tensor,
+        out long[] shape)
+        => CompilerServices.TryGetMaxShape(tensor.Shape, out shape) &&
+            tensor.Shape.IsFixed;
+
+    private static int GetVectorLaneCount(DataType dtype) => dtype switch
+    {
+        VectorType vectorType => checked(
+            vectorType.Lanes.Aggregate(1, static (product, lane) => product * lane) *
+            GetVectorLaneCount(vectorType.ElemType)),
+        _ => 1,
+    };
 
     private static void AddBiasCost(Cost cost, TupleType outputType, IRType qBias, IRType kBias, IRType vBias)
     {
@@ -471,6 +590,11 @@ public sealed class PackedQKVParallelLinearEvaluator : IEvaluator<PackedQKVParal
         DistributedType distributedType => distributedType.TensorType,
         _ => null,
     };
+
+    private readonly record struct MatMulCostProfile(MatMulOpCostKind Kind, long KTileCount)
+    {
+        public static MatMulCostProfile Simt => new(MatMulOpCostKind.Simt, 0);
+    }
 
     private static InvalidType? CheckBiasType(string name, IRType output, IRType bias)
     {

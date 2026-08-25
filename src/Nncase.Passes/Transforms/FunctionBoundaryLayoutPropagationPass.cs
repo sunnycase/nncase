@@ -23,10 +23,14 @@ public sealed class FunctionBoundaryLayoutPropagationPass : ModulePass
     private const int IdentityVariantPenalty = 1000;
     private const int LocalTransformCostScale = 10;
     private readonly bool _enableCallerOutputDemandLayouts;
+    private readonly bool _enableInternalOutputLayouts;
 
-    public FunctionBoundaryLayoutPropagationPass(bool enableCallerOutputDemandLayouts = true)
+    public FunctionBoundaryLayoutPropagationPass(
+        bool enableCallerOutputDemandLayouts = true,
+        bool enableInternalOutputLayouts = true)
     {
         _enableCallerOutputDemandLayouts = enableCallerOutputDemandLayouts;
+        _enableInternalOutputLayouts = enableInternalOutputLayouts;
     }
 
     private enum BoundaryTransformKind
@@ -53,7 +57,8 @@ public sealed class FunctionBoundaryLayoutPropagationPass : ModulePass
                 input,
                 specializer,
                 compilerInsertedRestoreTransforms,
-                enableCallerOutputDemandLayouts);
+                enableCallerOutputDemandLayouts,
+                _enableInternalOutputLayouts);
             if (selectedLayouts.Count == 0)
             {
                 return Task.FromResult(input);
@@ -100,7 +105,8 @@ public sealed class FunctionBoundaryLayoutPropagationPass : ModulePass
         var remainingLayoutMap = ModuleLayoutPlanner.CollectCandidateLayouts(
             input,
             compilerInsertedRestoreTransforms,
-            _enableCallerOutputDemandLayouts);
+            _enableCallerOutputDemandLayouts,
+            _enableInternalOutputLayouts);
         var remainingLayoutFunctions = remainingLayoutMap.Keys.ToArray();
         var remainingLayouts = string.Join(", ", remainingLayoutMap.Select(kv => $"{kv.Key.Name}: {string.Join(" | ", kv.Value.Select(value => value.ToString()))}"));
         var lastSignature = remainingLayoutFunctions.LastOrDefault() is { } last
@@ -141,6 +147,37 @@ public sealed class FunctionBoundaryLayoutPropagationPass : ModulePass
         }
 
         return false;
+    }
+
+    private static Call[] GetFunctionCalls(Function function)
+    {
+        var calls = new HashSet<Call>(ReferenceEqualityComparer.Instance);
+        foreach (var user in function.Users)
+        {
+            if (user is Call call &&
+                TryGetTargetFunction(call.Target, out var directTarget, out _) &&
+                ReferenceEquals(directTarget, function))
+            {
+                calls.Add(call);
+                continue;
+            }
+
+            if (user is not FunctionWrapper { ReturnOutput: true, Target: Function wrapperTarget } wrapper ||
+                !ReferenceEquals(wrapperTarget, function))
+            {
+                continue;
+            }
+
+            foreach (var wrapperCall in wrapper.Users.OfType<Call>())
+            {
+                if (ReferenceEquals(wrapperCall.Target, wrapper))
+                {
+                    calls.Add(wrapperCall);
+                }
+            }
+        }
+
+        return calls.ToArray();
     }
 
     private static bool TryGetTargetFunction(Expr target, out Function function, out FunctionWrapper? wrapper)
@@ -201,9 +238,10 @@ public sealed class FunctionBoundaryLayoutPropagationPass : ModulePass
     private static BaseExpr MakeBoundaryTransform(
         Expr input,
         BoundaryTransform transform,
-        BoundaryReshardContext? reshardContext)
+        BoundaryReshardContext? reshardContext,
+        DistributedReshardUsageKind usageKind = DistributedReshardUsageKind.FunctionBoundary)
     {
-        var expr = transform.Apply(input, reshardContext);
+        var expr = transform.Apply(input, reshardContext, usageKind);
         Infer(expr, $"{transform.Kind} inserted at function boundary");
         return expr;
     }
@@ -247,12 +285,14 @@ public sealed class FunctionBoundaryLayoutPropagationPass : ModulePass
             IRModule module,
             FunctionLayoutSpecializer specializer,
             IReadOnlySet<Call> compilerInsertedRestoreTransforms,
-            bool enableCallerOutputDemandLayouts)
+            bool enableCallerOutputDemandLayouts,
+            bool enableInternalOutputLayouts)
         {
             var candidates = CollectCandidateLayouts(
                 module,
                 compilerInsertedRestoreTransforms,
-                enableCallerOutputDemandLayouts);
+                enableCallerOutputDemandLayouts,
+                enableInternalOutputLayouts);
             if (candidates.Count == 0)
             {
                 return new Dictionary<Function, FunctionBoundaryLayout>(ReferenceEqualityComparer.Instance);
@@ -314,7 +354,8 @@ public sealed class FunctionBoundaryLayoutPropagationPass : ModulePass
         public static Dictionary<Function, FunctionBoundaryLayout[]> CollectCandidateLayouts(
             IRModule module,
             IReadOnlySet<Call>? compilerInsertedRestoreTransforms = null,
-            bool enableCallerOutputDemandLayouts = true)
+            bool enableCallerOutputDemandLayouts = true,
+            bool enableInternalOutputLayouts = true)
         {
             var layouts = new Dictionary<Function, FunctionBoundaryLayout[]>(ReferenceEqualityComparer.Instance);
             foreach (var function in module.Functions.OfType<Function>())
@@ -327,7 +368,8 @@ public sealed class FunctionBoundaryLayoutPropagationPass : ModulePass
                 var candidates = new List<FunctionBoundaryLayout> { FunctionBoundaryLayout.Identity(function) };
                 var internalLayout = FunctionBoundaryLayout.TryCreate(
                     function,
-                    compilerInsertedRestoreTransforms);
+                    compilerInsertedRestoreTransforms,
+                    enableInternalOutputLayouts);
                 if (internalLayout is not null)
                 {
                     candidates.Add(internalLayout);
@@ -357,9 +399,7 @@ public sealed class FunctionBoundaryLayoutPropagationPass : ModulePass
 
         private static IEnumerable<FunctionBoundaryLayout> CollectCallDemandLayouts(Function function, FunctionBoundaryLayout? internalLayout)
         {
-            var calls = function.Users.OfType<Call>()
-                .Where(call => TryGetTargetFunction(call.Target, out var target, out _) && ReferenceEquals(target, function))
-                .ToArray();
+            var calls = GetFunctionCalls(function);
             foreach (var call in calls)
             {
                 var outputs = FunctionBoundaryLayout.CreateEmptyOutputs(call.CheckedType);
@@ -405,7 +445,7 @@ public sealed class FunctionBoundaryLayoutPropagationPass : ModulePass
 
         private static long EstimateVariantCost(Function function, FunctionBoundaryLayout layout, FunctionLayoutSpecializer specializer)
         {
-            var callCount = Math.Max(function.Users.OfType<Call>().Count(call => TryGetTargetFunction(call.Target, out var target, out _) && ReferenceEquals(target, function)), 1);
+            var callCount = Math.Max(GetFunctionCalls(function).Length, 1);
             if (layout.IsIdentity)
             {
                 return checked((IdentityVariantPenalty + (CountBoundaryTransforms(function.Body) * LocalTransformCostScale)) * callCount);
@@ -414,7 +454,57 @@ public sealed class FunctionBoundaryLayoutPropagationPass : ModulePass
             var specialized = specializer.CreateDetached(function, layout);
             var localCost = CountBoundaryTransforms(specialized.Body) * LocalTransformCostScale;
             var adapterCost = layout.AdapterTransformCount;
-            return checked((localCost + adapterCost) * callCount);
+            var satisfiedDemandBenefit = CountSatisfiedCallerOutputDemands(function, layout) * LocalTransformCostScale;
+            return checked(((localCost + adapterCost) * callCount) - satisfiedDemandBenefit);
+        }
+
+        private static int CountSatisfiedCallerOutputDemands(
+            Function function,
+            FunctionBoundaryLayout layout)
+        {
+            var count = 0;
+            foreach (var call in GetFunctionCalls(function))
+            {
+                if (call.CheckedType is TupleType tupleType)
+                {
+                    foreach (var projection in call.Users.OfType<Call>())
+                    {
+                        if (projection.Target is not GetItem ||
+                            !ReferenceEquals(projection[GetItem.Input], call) ||
+                            !TryGetItemIndex(projection[GetItem.Index], out var outputIndex) ||
+                            outputIndex < 0 ||
+                            outputIndex >= tupleType.Count)
+                        {
+                            continue;
+                        }
+
+                        count += CountMatchingDemandTransforms(
+                            projection,
+                            layout.Outputs[outputIndex]?.SourceTransform);
+                    }
+                }
+                else
+                {
+                    count += CountMatchingDemandTransforms(call, layout.Outputs[0]?.SourceTransform);
+                }
+            }
+
+            return count;
+        }
+
+        private static int CountMatchingDemandTransforms(
+            BaseExpr value,
+            BoundaryTransform? sourceTransform)
+        {
+            if (sourceTransform is null)
+            {
+                return 0;
+            }
+
+            return value.Users.OfType<Call>().Count(user =>
+                BoundaryTransform.TryCreate(user, out var transform, out var input) &&
+                ReferenceEquals(input, value) &&
+                transform.Equals(sourceTransform));
         }
 
         private static int CountBoundaryTransforms(BaseExpr expr)
@@ -459,7 +549,28 @@ public sealed class FunctionBoundaryLayoutPropagationPass : ModulePass
                 return folded;
             }
 
+            if (TryFoldBoxingOfInverseShardedView(expr, out folded))
+            {
+                SetMutated();
+                return folded;
+            }
+
             return expr;
+        }
+
+        private static bool TryFoldBoxingOfInverseShardedView(Call expr, out BaseExpr folded)
+        {
+            if (expr.Target is IR.Distributed.Boxing boxing &&
+                expr[IR.Distributed.Boxing.Input] is Call { Target: IR.Distributed.ShardedView } view &&
+                view[IR.Distributed.ShardedView.Input] is Expr viewSource &&
+                Equals(boxing.NewType, viewSource.CheckedType))
+            {
+                folded = viewSource;
+                return true;
+            }
+
+            folded = null!;
+            return false;
         }
     }
 
@@ -560,7 +671,11 @@ public sealed class FunctionBoundaryLayoutPropagationPass : ModulePass
             if (rawCall.CheckedType is not TupleType)
             {
                 var outputLayout = layout.Outputs[0] ?? throw new InvalidOperationException("Single-output call has no output layout to wrap.");
-                return MakeBoundaryTransform(rawCall, outputLayout.Transform, _reshardContext);
+                return MakeBoundaryTransform(
+                    rawCall,
+                    outputLayout.Transform,
+                    _reshardContext,
+                    DistributedReshardUsageKind.Internal);
             }
 
             var fields = new BaseExpr[layout.Outputs.Length];
@@ -575,7 +690,11 @@ public sealed class FunctionBoundaryLayoutPropagationPass : ModulePass
                         throw new InvalidOperationException($"Cannot unpack non-expression output {i} from call to {rawCall.Target}.");
                     }
 
-                    field = MakeBoundaryTransform(fieldExpr, outputLayout.Transform, _reshardContext);
+                    field = MakeBoundaryTransform(
+                        fieldExpr,
+                        outputLayout.Transform,
+                        _reshardContext,
+                        DistributedReshardUsageKind.Internal);
                 }
 
                 fields[i] = field;
@@ -717,7 +836,10 @@ public sealed class FunctionBoundaryLayoutPropagationPass : ModulePass
                         throw new InvalidOperationException($"Cannot apply output source transform {sourceTransform} to non-expression output.");
                     }
 
-                    source = sourceTransform.Apply(sourceExpr, _reshardContext);
+                    source = sourceTransform.Apply(
+                        sourceExpr,
+                        _reshardContext,
+                        DistributedReshardUsageKind.Internal);
                     Infer(source, $"output source transform {sourceTransform}");
                     if (!Equals(source.CheckedType, outputLayout.TransformedType))
                     {
@@ -808,7 +930,11 @@ public sealed class FunctionBoundaryLayoutPropagationPass : ModulePass
                 if (inputLayout.Transform.IsDistributedBoxing
                     && transform.IsDistributedBoxing)
                 {
-                    return MakeBoundaryTransform(_mappedParameters[parameter], transform, _reshardContext);
+                    return MakeBoundaryTransform(
+                        _mappedParameters[parameter],
+                        transform,
+                        _reshardContext,
+                        DistributedReshardUsageKind.Internal);
                 }
             }
 
@@ -868,10 +994,13 @@ public sealed class FunctionBoundaryLayoutPropagationPass : ModulePass
 
         public static FunctionBoundaryLayout? TryCreate(
             Function function,
-            IReadOnlySet<Call>? compilerInsertedRestoreTransforms = null)
+            IReadOnlySet<Call>? compilerInsertedRestoreTransforms = null,
+            bool enableOutputs = true)
         {
             var inputs = AnalyzeInputs(function, compilerInsertedRestoreTransforms);
-            var outputs = AnalyzeOutputs(function.Body);
+            var outputs = enableOutputs
+                ? AnalyzeOutputs(function.Body)
+                : CreateEmptyOutputs(function.Body.CheckedType);
             if (inputs.All(x => x is null) && outputs.All(x => x is null))
             {
                 return null;
@@ -1193,7 +1322,10 @@ public sealed class FunctionBoundaryLayoutPropagationPass : ModulePass
             return false;
         }
 
-        public BaseExpr Apply(Expr input, BoundaryReshardContext? reshardContext)
+        public BaseExpr Apply(
+            Expr input,
+            BoundaryReshardContext? reshardContext,
+            DistributedReshardUsageKind usageKind)
         {
             if (Kind is BoundaryTransformKind.Boxing)
             {
@@ -1218,7 +1350,7 @@ public sealed class FunctionBoundaryLayoutPropagationPass : ModulePass
                             input.CheckedType,
                             distributedType,
                             sourceKind,
-                            DistributedReshardUsageKind.FunctionBoundary));
+                            usageKind));
                     switch (realization)
                     {
                         case DistributedReshardRealization.ShardedView:

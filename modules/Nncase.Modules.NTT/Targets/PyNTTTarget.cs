@@ -73,14 +73,41 @@ public sealed class PyNTTTarget : NTTTarget
     public override void RegisterPostAutoDistributedPass(IPassManager passManager, CompileOptions options)
     {
         base.RegisterPostAutoDistributedPass(passManager, options);
+        passManager.AddWithName<DataflowPass>("LowerMaterializedPackedMatMulNormStatsCombine").Configure(p =>
+        {
+            p.Add<Passes.Rules.NTT.LowerMaterializedPackedMatMulNormStatsCombine>();
+        });
+        passManager.AddWithName<DataflowPass>("FoldMaterializedPackedQKVParallelLinearCombine").Configure(p =>
+        {
+            p.Add<Passes.Rules.NTT.FoldMaterializedPackedQKVParallelLinearCombine>();
+        });
+        passManager.AddWithName<DataflowPass>("LowerPackedQKVParallelLinearCombine").Configure(p =>
+        {
+            p.Add<Passes.Rules.NTT.LowerPackedQKVParallelLinearCombine>();
+        });
         passManager.Add<FusePackedMatMulSamplingPartialPass>();
         passManager.Add<SinkNormStatsBoxingAcrossFunctionBoundariesPass>();
+        passManager.AddWithName<FunctionBoundaryLayoutPropagationPass>(
+            "PropagatePostAutoDistributedFunctionBoundaryLayouts",
+            true,
+            false);
+        passManager.AddWithName<DataflowPass>(
+            "FoldPostAutoDistributedFunctionBoundaryBoxing").Configure(p =>
+        {
+            p.Add<Passes.Rules.Neutral.FoldGetItemTuple>();
+            p.Add<Passes.Rules.FoldBoxingBoxing>();
+            p.Add<Passes.Rules.FoldBoxingShardedView>();
+        });
     }
 
     /// <inheritdoc/>
     public override void RegisterTIRPostBufferizePass(IPassManager passManager, CompileOptions options)
     {
         passManager.AddWithName<InlineSingleCallPrimFunctionsPass>("InlineSingleCallPrimFunctions", Kind);
+        passManager.AddWithName<FuseGatherReduceNormApplyPass>(
+            "FuseGatherReduceNormApplyAfterInlining",
+            Kind);
+        passManager.Add<FusePagedAttentionMergePackedMatMulPass>(Kind);
         passManager.AddWithName<PlanMemorySynchronizationPass>(
             "PlanMemorySynchronization",
             Kind,
@@ -93,6 +120,8 @@ public sealed class PyNTTTarget : NTTTarget
     /// <inheritdoc/>
     public override void RegisterTIRPreBufferizePass(IPassManager passManager, CompileOptions options)
     {
+        passManager.Add<FuseGatherReduceQKVRoPEWithCachePass>(Kind);
+        passManager.Add<FuseGatherReduceAddNormApplyPass>(Kind);
         passManager.Add<FuseGatherReduceNormApplyPass>(Kind);
         passManager.Add<CanonicalizePackedQKVWeightsPass>(Kind);
         passManager.Add<ForwardTerminalStoreDestinationsPass>(Kind);

@@ -615,6 +615,76 @@ public partial class NTT
             qOutput);
     }
 
+    public static Expr GatherReduceQKVRoPEWithCache(
+        Expr q,
+        Expr k,
+        Expr v,
+        Expr qScale,
+        Expr kScale,
+        Expr qBias,
+        Expr kBias,
+        Expr cos,
+        Expr sin,
+        Expr kvCaches,
+        Dimension layerId,
+        Expr qOutput,
+        DistributedType qInType,
+        DistributedType qLogicalType,
+        DistributedType kInType,
+        DistributedType kLogicalType,
+        DistributedType vInType,
+        DistributedType vLogicalType,
+        IRArray<Dimension> qShape,
+        IRArray<Dimension> qStrides,
+        IRArray<Dimension> kShape,
+        IRArray<Dimension> kStrides,
+        IRArray<Dimension> vShape,
+        IRArray<Dimension> vStrides,
+        int qAxis,
+        float qEpsilon,
+        bool qUseMean,
+        int kAxis,
+        float kEpsilon,
+        bool kUseMean,
+        IRArray<IR.NN.AttentionDimKind> qkvLayout,
+        IRArray<IR.NN.AttentionDimKind> attentionLayout)
+    {
+        return KernelCall(
+            new GatherReduceQKVRoPEWithCache(
+                qInType,
+                qLogicalType,
+                kInType,
+                kLogicalType,
+                vInType,
+                vLogicalType,
+                qShape,
+                qStrides,
+                kShape,
+                kStrides,
+                vShape,
+                vStrides,
+                qAxis,
+                qEpsilon,
+                qUseMean,
+                kAxis,
+                kEpsilon,
+                kUseMean,
+                qkvLayout,
+                attentionLayout),
+            q,
+            k,
+            v,
+            qScale,
+            kScale,
+            qBias,
+            kBias,
+            cos,
+            sin,
+            kvCaches,
+            layerId,
+            qOutput);
+    }
+
     public static Expr InstanceNorm(Expr input, Expr scale, Expr bias, Expr output, float epsilon, IRArray<int> vectorizedAxes, IRArray<Dimension> padedNums, DistributedType distributedType)
     {
         return KernelCall(new InstanceNorm(epsilon, vectorizedAxes, padedNums, distributedType), input, scale, bias, output);
@@ -700,6 +770,42 @@ public partial class NTT
             output);
     }
 
+    public static Call PagedAttentionMergePackedMatMul(
+        Expr maxState,
+        Expr sumState,
+        Expr accState,
+        Expr mergeOutputLayout,
+        Expr mergedLhsLayout,
+        Expr rhs,
+        Expr output,
+        Expr loadC,
+        Expr scale,
+        Expr addend,
+        IRArray<IR.NN.AttentionDimKind> layout,
+        int hiddenSize,
+        int splitHierarchyAxis,
+        int splitCount,
+        IR.NTT.PackedMatMulRhsLayout rhsLayout)
+    {
+        return KernelCall(
+            new PagedAttentionMergePackedMatMul(
+                layout,
+                hiddenSize,
+                splitHierarchyAxis,
+                splitCount,
+                rhsLayout),
+            maxState,
+            sumState,
+            accState,
+            mergeOutputLayout,
+            mergedLhsLayout,
+            rhs,
+            output,
+            loadC,
+            scale,
+            addend);
+    }
+
     public static Expr UpdatePagedAttentionKVCache(Expr value, Expr kvcache, Dimension layerId, IR.NN.AttentionCacheKind kind, IRArray<IR.NN.AttentionDimKind> layout)
     {
         return KernelCall(new UpdatePagedAttentionKVCache(kind, layout), value, kvcache, layerId);
@@ -768,6 +874,53 @@ public partial class NTT
     public static Call GatherReduceScatter(Expr input, Expr output, DistributedType inType, DistributedType outType)
     {
         return KernelCall(new TIR.NTT.GatherReduceScatter(inType, outType), input, output);
+    }
+
+    public static Call GatherReduceAddNormStats(
+        Expr input,
+        Expr collective,
+        Expr addend,
+        Expr valueOutput,
+        Expr statsOutput,
+        DistributedType inType,
+        DistributedType outType,
+        int axis,
+        bool useMean)
+    {
+        return KernelCall(
+            new TIR.NTT.GatherReduceAddNormStats(inType, outType, axis, useMean),
+            input,
+            collective,
+            addend,
+            valueOutput,
+            statsOutput);
+    }
+
+    public static Call GatherReduceAddNormApply(
+        Expr input,
+        Expr collective,
+        Expr addend,
+        Expr valueOutput,
+        Expr statsWorkspace,
+        Expr scale,
+        Expr bias,
+        Expr normOutput,
+        DistributedType inType,
+        DistributedType outType,
+        int axis,
+        float epsilon,
+        bool useMean)
+    {
+        return KernelCall(
+            new TIR.NTT.GatherReduceAddNormApply(inType, outType, axis, epsilon, useMean),
+            input,
+            collective,
+            addend,
+            valueOutput,
+            statsWorkspace,
+            scale,
+            bias,
+            normOutput);
     }
 
     public static Call Clamp(Expr input, Expr output, float min, float max)

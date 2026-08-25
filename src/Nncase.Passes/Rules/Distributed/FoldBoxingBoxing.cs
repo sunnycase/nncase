@@ -40,3 +40,22 @@ public partial class FoldBoxingBoxing : RewriteRule<Pattern>
         return null;
     }
 }
+
+[RuleGenerator]
+public partial class FoldBoxingShardedView : RewriteRule<Pattern>
+{
+    /// <inheritdoc/>
+    public override Pattern Pattern { get; } = IsBoxing(
+        target_name: "outer",
+        _ => true,
+        IsShardedView(
+            target_name: "inner",
+            _ => true,
+            IsWildcard("input")));
+
+    private Expr? GetReplace(Boxing outer, ShardedView inner, Expr input)
+    {
+        _ = inner;
+        return Equals(outer.NewType, input.CheckedType) ? input : null;
+    }
+}
