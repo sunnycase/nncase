@@ -473,13 +473,16 @@ public partial class NTT
         Expr upInputScale,
         Expr gateWeightScale,
         Expr upWeightScale,
+        Expr gateOutput,
+        Expr upOutput,
         Expr output,
         IR.NN.GluType gluType,
         IR.NTT.PackedMatMulRhsLayout rhsLayout = IR.NTT.PackedMatMulRhsLayout.NMajor,
         global::Nncase.IR.Math.MatMulQuantizationMode quantizationMode =
             global::Nncase.IR.Math.MatMulQuantizationMode.None,
         long weightBlockN = 0,
-        long weightBlockK = 0)
+        long weightBlockK = 0,
+        bool emitPartialResults = false)
     {
         return KernelCall(
             new PackedMatMulGlu(
@@ -487,7 +490,8 @@ public partial class NTT
                 rhsLayout,
                 quantizationMode,
                 weightBlockN,
-                weightBlockK),
+                weightBlockK,
+                emitPartialResults),
             input,
             gateWeight,
             upWeight,
@@ -497,6 +501,8 @@ public partial class NTT
             upInputScale,
             gateWeightScale,
             upWeightScale,
+            gateOutput,
+            upOutput,
             output);
     }
 
@@ -907,12 +913,13 @@ public partial class NTT
         Expr normOutput,
         DistributedType inType,
         DistributedType outType,
+        DistributedType normOutputType,
         int axis,
         float epsilon,
         bool useMean)
     {
         return KernelCall(
-            new TIR.NTT.GatherReduceAddNormApply(inType, outType, axis, epsilon, useMean),
+            new TIR.NTT.GatherReduceAddNormApply(inType, outType, normOutputType, axis, epsilon, useMean),
             input,
             collective,
             addend,

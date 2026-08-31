@@ -30,6 +30,37 @@ internal static class GatedDeltaNetCandidateUtility
         return axes is not null && AreValidAxes(axes, placementRank);
     }
 
+    public static bool IsSumPartialPartition(
+        DistributedType type,
+        TensorType tensorType,
+        Placement placement,
+        int splitTensorAxis)
+    {
+        if (type.TensorType != tensorType ||
+            type.Placement != placement ||
+            type.Partial is not { Op: ReduceOp.Sum } partial ||
+            partial.Axes.Count == 0 ||
+            type.AxisPolicies.Count != tensorType.Shape.Rank ||
+            type.AxisPolicies.Where((_, axis) => axis != splitTensorAxis)
+                .Any(policy => policy is not SBPBroadCast))
+        {
+            return false;
+        }
+
+        var splitAxes = type.AxisPolicies[splitTensorAxis] switch
+        {
+            SBPBroadCast => Array.Empty<int>(),
+            SBPSplit split => split.HierarchyAxes.ToArray(),
+            _ => null,
+        };
+        var partialAxes = partial.Axes.ToArray();
+        return splitAxes is not null &&
+            AreValidAxes(splitAxes, placement.Rank) &&
+            AreValidAxes(partialAxes, placement.Rank) &&
+            !splitAxes.Intersect(partialAxes).Any() &&
+            CoversPlacement(splitAxes.Concat(partialAxes).ToArray(), placement.Rank);
+    }
+
     public static bool CoversPlacement(IReadOnlyList<int> axes, int placementRank) =>
         axes.OrderBy(axis => axis).SequenceEqual(Enumerable.Range(0, placementRank));
 
@@ -92,6 +123,8 @@ internal static class GatedDeltaNetCandidateUtility
 internal sealed class GatedDeltaNetConvolutionCandidateProvider :
     DistributedCandidateProvider<GatedDeltaNetConvolution>
 {
+    public override bool AllowsPartialInputs => true;
+
     public override bool IsExhaustive => true;
 
     public override IReadOnlyList<IRType> GetReturnCandidateTypes(
@@ -151,29 +184,44 @@ internal sealed class GatedDeltaNetConvolutionCandidateProvider :
 
         var placement = qkvOutput.Placement;
         var channel = GatedDeltaNetCandidateUtility.CreateSplitPolicy(channelAxes);
-        IRType[] inputs = sourceTypes.ToArray();
-        inputs[GatedDeltaNetConvolution.QKV.Index] =
-            GatedDeltaNetCandidateUtility.Create(
-                GatedDeltaNetCandidateUtility.GetTensorType(sourceTypes[GatedDeltaNetConvolution.QKV.Index]),
-                [SBP.B, channel],
-                placement);
-        inputs[GatedDeltaNetConvolution.State.Index] = stateOutput;
-        inputs[GatedDeltaNetConvolution.ConvWeight.Index] =
-            GatedDeltaNetCandidateUtility.Create(
-                GatedDeltaNetCandidateUtility.GetTensorType(sourceTypes[GatedDeltaNetConvolution.ConvWeight.Index]),
-                [channel, SBP.B],
-                placement);
-        if (GatedDeltaNetConvolutionEvaluator.InferType(target, inputs) != output)
+        var qkvTensorType = GatedDeltaNetCandidateUtility.GetTensorType(
+            sourceTypes[GatedDeltaNetConvolution.QKV.Index]);
+        var qkvCandidates = new List<DistributedType>
         {
-            return true;
+            GatedDeltaNetCandidateUtility.Create(qkvTensorType, [SBP.B, channel], placement),
+        };
+        if (context.AvailableInputTypes.Count == target.Parameters.Count)
+        {
+            qkvCandidates.AddRange(context.AvailableInputTypes[GatedDeltaNetConvolution.QKV.Index]
+                .OfType<DistributedType>()
+                .Where(type => GatedDeltaNetCandidateUtility.IsSumPartialPartition(
+                    type,
+                    qkvTensorType,
+                    placement,
+                    1)));
         }
 
-        tuples =
-        [
-            new DistributedCandidateTuple(
-                inputs,
-                $"gated-delta-net-convolution-channel=[{string.Join(',', channelAxes)}]"),
-        ];
+        var convWeightType = GatedDeltaNetCandidateUtility.Create(
+            GatedDeltaNetCandidateUtility.GetTensorType(sourceTypes[GatedDeltaNetConvolution.ConvWeight.Index]),
+            [channel, SBP.B],
+            placement);
+        tuples = qkvCandidates
+            .Distinct()
+            .Select(qkvInput =>
+            {
+                IRType[] inputs = sourceTypes.ToArray();
+                inputs[GatedDeltaNetConvolution.QKV.Index] = qkvInput;
+                inputs[GatedDeltaNetConvolution.State.Index] = stateOutput;
+                inputs[GatedDeltaNetConvolution.ConvWeight.Index] = convWeightType;
+                return (Inputs: inputs, QKV: qkvInput);
+            })
+            .Where(candidate => GatedDeltaNetConvolutionEvaluator.InferType(target, candidate.Inputs) == output)
+            .Select(candidate => new DistributedCandidateTuple(
+                candidate.Inputs,
+                candidate.QKV.Partial is null
+                    ? $"gated-delta-net-convolution-channel=[{string.Join(',', channelAxes)}]"
+                    : $"gated-delta-net-convolution-direct-sum-partial=[{string.Join(',', candidate.QKV.Partial.Axes)}]"))
+            .ToArray();
         return true;
     }
 }
@@ -184,6 +232,8 @@ internal sealed class GatedDeltaNetConvolutionCandidateProvider :
 internal sealed class GatedDeltaNetRecurrentCoreCandidateProvider :
     DistributedCandidateProvider<GatedDeltaNetRecurrentCore>
 {
+    public override bool AllowsPartialInputs => true;
+
     public override bool IsExhaustive => true;
 
     public override IReadOnlyList<IRType> GetReturnCandidateTypes(
@@ -283,35 +333,51 @@ internal sealed class GatedDeltaNetRecurrentCoreCandidateProvider :
             return true;
         }
 
-        IRType[] inputs = sourceTypes.ToArray();
-        inputs[GatedDeltaNetRecurrentCore.State.Index] = stateOutput;
-        inputs[GatedDeltaNetRecurrentCore.QKV.Index] = GatedDeltaNetCandidateUtility.Broadcast(
-            GatedDeltaNetCandidateUtility.GetTensorType(sourceTypes[GatedDeltaNetRecurrentCore.QKV.Index]), placement);
-        inputs[GatedDeltaNetRecurrentCore.Z.Index] = GatedDeltaNetCandidateUtility.Create(
-            zType, [SBP.B, packedValue], placement);
-        inputs[GatedDeltaNetRecurrentCore.ProjectionInput.Index] = GatedDeltaNetCandidateUtility.Broadcast(
-            GatedDeltaNetCandidateUtility.GetTensorType(sourceTypes[GatedDeltaNetRecurrentCore.ProjectionInput.Index]), placement);
-        inputs[GatedDeltaNetRecurrentCore.BWeight.Index] = GatedDeltaNetCandidateUtility.Broadcast(
-            GatedDeltaNetCandidateUtility.GetTensorType(sourceTypes[GatedDeltaNetRecurrentCore.BWeight.Index]), placement);
-        inputs[GatedDeltaNetRecurrentCore.AWeight.Index] = GatedDeltaNetCandidateUtility.Broadcast(
-            GatedDeltaNetCandidateUtility.GetTensorType(sourceTypes[GatedDeltaNetRecurrentCore.AWeight.Index]), placement);
-        inputs[GatedDeltaNetRecurrentCore.ALog.Index] = GatedDeltaNetCandidateUtility.Broadcast(
-            GatedDeltaNetCandidateUtility.GetTensorType(sourceTypes[GatedDeltaNetRecurrentCore.ALog.Index]), placement);
-        inputs[GatedDeltaNetRecurrentCore.DtBias.Index] = GatedDeltaNetCandidateUtility.Broadcast(
-            GatedDeltaNetCandidateUtility.GetTensorType(sourceTypes[GatedDeltaNetRecurrentCore.DtBias.Index]), placement);
-        inputs[GatedDeltaNetRecurrentCore.NormWeight.Index] = GatedDeltaNetCandidateUtility.Broadcast(
-            GatedDeltaNetCandidateUtility.GetTensorType(sourceTypes[GatedDeltaNetRecurrentCore.NormWeight.Index]), placement);
-        if (GatedDeltaNetRecurrentCoreEvaluator.InferType(target, inputs) != output)
+        var zCandidates = new List<DistributedType>
         {
-            return true;
+            GatedDeltaNetCandidateUtility.Create(zType, [SBP.B, packedValue], placement),
+        };
+        if (context.AvailableInputTypes.Count == target.Parameters.Count)
+        {
+            zCandidates.AddRange(context.AvailableInputTypes[GatedDeltaNetRecurrentCore.Z.Index]
+                .OfType<DistributedType>()
+                .Where(type => GatedDeltaNetCandidateUtility.IsSumPartialPartition(
+                    type,
+                    zType,
+                    placement,
+                    1)));
         }
 
-        tuples =
-        [
-            new DistributedCandidateTuple(
-                inputs,
-                $"gated-delta-net-recurrent-core-head=[{string.Join(',', headAxes)}]"),
-        ];
+        tuples = zCandidates
+            .Distinct()
+            .Select(zInput =>
+            {
+                IRType[] inputs = sourceTypes.ToArray();
+                inputs[GatedDeltaNetRecurrentCore.State.Index] = stateOutput;
+                inputs[GatedDeltaNetRecurrentCore.QKV.Index] = GatedDeltaNetCandidateUtility.Broadcast(
+                    GatedDeltaNetCandidateUtility.GetTensorType(sourceTypes[GatedDeltaNetRecurrentCore.QKV.Index]), placement);
+                inputs[GatedDeltaNetRecurrentCore.Z.Index] = zInput;
+                inputs[GatedDeltaNetRecurrentCore.ProjectionInput.Index] = GatedDeltaNetCandidateUtility.Broadcast(
+                    GatedDeltaNetCandidateUtility.GetTensorType(sourceTypes[GatedDeltaNetRecurrentCore.ProjectionInput.Index]), placement);
+                inputs[GatedDeltaNetRecurrentCore.BWeight.Index] = GatedDeltaNetCandidateUtility.Broadcast(
+                    GatedDeltaNetCandidateUtility.GetTensorType(sourceTypes[GatedDeltaNetRecurrentCore.BWeight.Index]), placement);
+                inputs[GatedDeltaNetRecurrentCore.AWeight.Index] = GatedDeltaNetCandidateUtility.Broadcast(
+                    GatedDeltaNetCandidateUtility.GetTensorType(sourceTypes[GatedDeltaNetRecurrentCore.AWeight.Index]), placement);
+                inputs[GatedDeltaNetRecurrentCore.ALog.Index] = GatedDeltaNetCandidateUtility.Broadcast(
+                    GatedDeltaNetCandidateUtility.GetTensorType(sourceTypes[GatedDeltaNetRecurrentCore.ALog.Index]), placement);
+                inputs[GatedDeltaNetRecurrentCore.DtBias.Index] = GatedDeltaNetCandidateUtility.Broadcast(
+                    GatedDeltaNetCandidateUtility.GetTensorType(sourceTypes[GatedDeltaNetRecurrentCore.DtBias.Index]), placement);
+                inputs[GatedDeltaNetRecurrentCore.NormWeight.Index] = GatedDeltaNetCandidateUtility.Broadcast(
+                    GatedDeltaNetCandidateUtility.GetTensorType(sourceTypes[GatedDeltaNetRecurrentCore.NormWeight.Index]), placement);
+                return (Inputs: inputs, Z: zInput);
+            })
+            .Where(candidate => GatedDeltaNetRecurrentCoreEvaluator.InferType(target, candidate.Inputs) == output)
+            .Select(candidate => new DistributedCandidateTuple(
+                candidate.Inputs,
+                candidate.Z.Partial is null
+                    ? $"gated-delta-net-recurrent-core-head=[{string.Join(',', headAxes)}]"
+                    : $"gated-delta-net-recurrent-core-direct-sum-partial=[{string.Join(',', candidate.Z.Partial.Axes)}]"))
+            .ToArray();
         return true;
     }
 }

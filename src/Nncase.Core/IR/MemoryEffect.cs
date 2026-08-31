@@ -45,6 +45,25 @@ public enum MemoryAccessDomainKind
     FixedBlock,
 }
 
+/// <summary>
+/// Describes which distributed-owner components each participating block
+/// accesses through an operand.
+/// </summary>
+public enum MemoryOwnerAccess
+{
+    /// <summary>
+    /// Each block accesses only the component addressed by its own placement
+    /// coordinate.
+    /// </summary>
+    Local,
+
+    /// <summary>
+    /// Each block accesses the owner components in the input distributed
+    /// type's partial-reduction group.
+    /// </summary>
+    PartialGroup,
+}
+
 public enum MemoryAccessPartitionKind
 {
     WholeResource,
@@ -127,7 +146,8 @@ public readonly record struct MemoryEffect(
     MemoryAccessScope Scope = MemoryAccessScope.Inferred,
     MemoryEffectKind Kind = MemoryEffectKind.Direct,
     MemoryAccessDomain AccessDomain = default,
-    MemoryAccessPartition AccessPartition = default)
+    MemoryAccessPartition AccessPartition = default,
+    MemoryOwnerAccess OwnerAccess = default)
 {
     public static MemoryEffect None { get; } = new(MemoryAccessMode.None);
 
@@ -158,6 +178,9 @@ public readonly record struct MemoryEffect(
 
     public MemoryEffect PartitionedByArgument(int argumentIndex)
         => this with { AccessPartition = MemoryAccessPartition.ByArgument(argumentIndex) };
+
+    public MemoryEffect AcrossPartialOwners()
+        => this with { OwnerAccess = MemoryOwnerAccess.PartialGroup };
 }
 
 /// <summary>
@@ -257,7 +280,8 @@ public static class MemoryEffectUtility
             MergeScope(lhs.Scope, rhs.Scope),
             lhs.Kind == rhs.Kind ? lhs.Kind : MemoryEffectKind.Direct,
             MergeAccessDomain(lhs.AccessDomain, rhs.AccessDomain),
-            MergeAccessPartition(lhs.AccessPartition, rhs.AccessPartition));
+            MergeAccessPartition(lhs.AccessPartition, rhs.AccessPartition),
+            MergeOwnerAccess(lhs.OwnerAccess, rhs.OwnerAccess));
     }
 
     public static MemoryAccessScope MergeScope(MemoryAccessScope lhs, MemoryAccessScope rhs)
@@ -280,4 +304,11 @@ public static class MemoryEffectUtility
         => lhs == rhs
             ? lhs
             : MemoryAccessPartition.WholeResource;
+
+    public static MemoryOwnerAccess MergeOwnerAccess(
+        MemoryOwnerAccess lhs,
+        MemoryOwnerAccess rhs)
+        => lhs == MemoryOwnerAccess.PartialGroup || rhs == MemoryOwnerAccess.PartialGroup
+            ? MemoryOwnerAccess.PartialGroup
+            : MemoryOwnerAccess.Local;
 }

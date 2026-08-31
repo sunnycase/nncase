@@ -78,6 +78,8 @@ public partial class NTTAffineSelectionPass
                 upInputScale,
                 gateWeightScale,
                 upWeightScale,
+                None.Default,
+                None.Default,
                 outputTile,
                 matMulGlu.GluType,
                 matMulGlu.RhsLayout))

@@ -366,6 +366,7 @@ public sealed class UnitTestDistribAutoDistributed : TestClassBase
         ]);
         var convolutionProvider = new GatedDeltaNetConvolutionCandidateProvider();
         var convolutionTarget = Assert.IsType<GatedDeltaNetConvolution>(convolutionCall.Target);
+        Assert.True(convolutionProvider.AllowsPartialInputs);
         Assert.True(convolutionProvider.IsExhaustive);
         Assert.Contains(
             convolutionExpectedOutput,
@@ -383,6 +384,29 @@ public sealed class UnitTestDistribAutoDistributed : TestClassBase
         Assert.Equal(
             new SBP[] { SBP.B, SBP.SContiguous([0, 1]) },
             Assert.IsType<DistributedType>(convolutionInputs[GatedDeltaNetConvolution.QKV.Index]).AxisPolicies.ToArray());
+        var qkvPartialType = new DistributedType(
+            Assert.IsType<TensorType>(qkv.CheckedType),
+            [SBP.B, SBP.SContiguous([1])],
+            placement,
+            SBP.P([0], ReduceOp.Sum));
+        var convolutionAvailableTypes = Context(convolutionCall).AvailableInputTypes.ToArray();
+        convolutionAvailableTypes[GatedDeltaNetConvolution.QKV.Index] =
+            [convolutionAvailableTypes[GatedDeltaNetConvolution.QKV.Index][0], qkvPartialType];
+        var convolutionPartialContext = new DistributedCandidateContext(
+            CompileOptions,
+            options,
+            PyNTTTarget.Kind,
+            convolutionCall,
+            convolutionAvailableTypes);
+        Assert.True(convolutionProvider.TryGetInputTypeTuples(
+            convolutionPartialContext,
+            convolutionTarget,
+            convolutionExpectedOutput,
+            out var convolutionPartialTuples));
+        Assert.Equal(2, convolutionPartialTuples.Count);
+        Assert.Contains(
+            convolutionPartialTuples,
+            tuple => tuple.InputTypes[GatedDeltaNetConvolution.QKV.Index] == qkvPartialType);
 
         var recurrentCall = IR.F.NN.GatedDeltaNetRecurrentCore(
             state,
@@ -424,6 +448,7 @@ public sealed class UnitTestDistribAutoDistributed : TestClassBase
         ]);
         var recurrentProvider = new GatedDeltaNetRecurrentCoreCandidateProvider();
         var recurrentTarget = Assert.IsType<GatedDeltaNetRecurrentCore>(recurrentCall.Target);
+        Assert.True(recurrentProvider.AllowsPartialInputs);
         Assert.True(recurrentProvider.IsExhaustive);
         Assert.Contains(
             recurrentExpectedOutput,
@@ -444,6 +469,29 @@ public sealed class UnitTestDistribAutoDistributed : TestClassBase
         Assert.Equal(
             new SBP[] { SBP.B, packedValueSplit },
             Assert.IsType<DistributedType>(recurrentInputs[GatedDeltaNetRecurrentCore.Z.Index]).AxisPolicies.ToArray());
+        var zPartialType = new DistributedType(
+            Assert.IsType<TensorType>(recurrentCall.Arguments[GatedDeltaNetRecurrentCore.Z.Index].CheckedType),
+            [SBP.B, SBP.SContiguous([1])],
+            placement,
+            SBP.P([0], ReduceOp.Sum));
+        var recurrentAvailableTypes = Context(recurrentCall).AvailableInputTypes.ToArray();
+        recurrentAvailableTypes[GatedDeltaNetRecurrentCore.Z.Index] =
+            [recurrentAvailableTypes[GatedDeltaNetRecurrentCore.Z.Index][0], zPartialType];
+        var recurrentPartialContext = new DistributedCandidateContext(
+            CompileOptions,
+            options,
+            PyNTTTarget.Kind,
+            recurrentCall,
+            recurrentAvailableTypes);
+        Assert.True(recurrentProvider.TryGetInputTypeTuples(
+            recurrentPartialContext,
+            recurrentTarget,
+            recurrentExpectedOutput,
+            out var recurrentPartialTuples));
+        Assert.Equal(2, recurrentPartialTuples.Count);
+        Assert.Contains(
+            recurrentPartialTuples,
+            tuple => tuple.InputTypes[GatedDeltaNetRecurrentCore.Z.Index] == zPartialType);
         Assert.All(
             Assert.IsType<DistributedType>(recurrentInputs[GatedDeltaNetRecurrentCore.ProjectionInput.Index]).AxisPolicies,
             policy => Assert.IsType<SBPBroadCast>(policy));
@@ -731,6 +779,103 @@ public sealed class UnitTestDistribAutoDistributed : TestClassBase
         Assert.DoesNotContain(
             returnTypes,
             type => type is DistributedType { Partial: not null });
+    }
+
+    [Fact]
+    public void TestPackedMatMulGluCandidateProviderPreservesNMajorKPackedOutputSplit()
+    {
+        var options = new PyNTTTargetOptions
+        {
+            HierarchyNames = "yx",
+            HierarchyLevels = "bb",
+            Hierarchies = [new[] { 8, 16 }],
+        };
+        CompileOptions.TargetOptions = options;
+        var placement = new Placement([8, 16], "yx", "bb");
+        var inputTensorType = new TensorType(DataTypes.BFloat16, new long[] { 1, 5120 });
+        var weightTensorType = new TensorType(
+            new VectorType(DataTypes.Float8E4M3, [2, 16]),
+            new long[] { 17408, 160 });
+        var weightScaleTensorType = new TensorType(
+            DataTypes.BFloat16,
+            new long[] { 136, 40 });
+        var inputType = new DistributedType(inputTensorType, [SBP.B, SBP.B], placement);
+        var leafWeightType = new DistributedType(
+            weightTensorType,
+            [SBP.SBlockCyclic([0, 1], 4), SBP.B],
+            placement);
+        var expectedWeightType = new DistributedType(
+            weightTensorType,
+            [SBP.SBlockCyclic([0, 1], 8), SBP.B],
+            placement);
+        var weightScaleType = new DistributedType(
+            weightScaleTensorType,
+            [SBP.B, SBP.B],
+            placement);
+
+        var input = new Var("input", inputTensorType);
+        var gateWeight = new Var("gate_weight", weightTensorType);
+        var upWeight = new Var("up_weight", weightTensorType);
+        var gateWeightScale = new Var("gate_weight_scale", weightScaleTensorType);
+        var upWeightScale = new Var("up_weight_scale", weightScaleTensorType);
+        var sourceCall = Assert.IsType<Call>(IR.F.NTT.PackedMatMulGlu(
+            input,
+            gateWeight,
+            upWeight,
+            None.Default,
+            None.Default,
+            None.Default,
+            None.Default,
+            gateWeightScale,
+            upWeightScale,
+            GluType.SwiGLU,
+            DataTypes.BFloat16,
+            PackedMatMulRhsLayout.NMajorKPacked,
+            MatMulQuantizationMode.DynamicBlock,
+            128,
+            128));
+        Assert.True(sourceCall.InferenceType());
+        var context = new DistributedCandidateContext(
+            CompileOptions,
+            options,
+            PyNTTTarget.Kind,
+            sourceCall,
+            [
+                new IRType[] { inputType },
+                new IRType[] { leafWeightType },
+                new IRType[] { leafWeightType },
+                new IRType[] { NoneType.Default },
+                new IRType[] { NoneType.Default },
+                new IRType[] { NoneType.Default },
+                new IRType[] { NoneType.Default },
+                new IRType[] { weightScaleType },
+                new IRType[] { weightScaleType },
+            ]);
+        var provider = new PackedMatMulGluCandidateProvider();
+        var target = Assert.IsType<PackedMatMulGlu>(sourceCall.Target);
+
+        var output = Assert.Single(provider
+            .GetReturnCandidateTypes(context, target, [])
+            .Where(type => type is DistributedType
+            {
+                AxisPolicies: [SBPBroadCast, SBPSplit
+                {
+                    HierarchyAxes: [0, 1],
+                    Stages: [{ Distribution: BlockCyclicSplit { BlockSize: 1 } }],
+                }],
+            }));
+        var distributedOutput = Assert.IsType<DistributedType>(output);
+        Assert.Null(distributedOutput.Partial);
+        Assert.Equal(SBP.B, distributedOutput.AxisPolicies[0]);
+        var outputSplit = Assert.IsType<SBPSplit>(distributedOutput.AxisPolicies[1]);
+        Assert.Equal(new[] { 0, 1 }, outputSplit.HierarchyAxes);
+        Assert.Equal(
+            1,
+            Assert.IsType<BlockCyclicSplit>(Assert.Single(outputSplit.Stages).Distribution).BlockSize);
+        Assert.True(provider.TryGetInputTypeTuples(context, target, output, out var tuples));
+        var tuple = Assert.Single(tuples);
+        Assert.Equal(expectedWeightType, tuple.InputTypes[PackedMatMulGlu.GateWeight.Index]);
+        Assert.Equal(expectedWeightType, tuple.InputTypes[PackedMatMulGlu.UpWeight.Index]);
     }
 
     [Fact]
@@ -2847,7 +2992,8 @@ public sealed class UnitTestDistribAutoDistributed : TestClassBase
         var candidates = new PyNTTDistributedSplitCandidateProvider(128)
             .GetCandidates(context);
 
-        var staged = Assert.Single(candidates);
+        Assert.Equal(2, candidates.Count);
+        var staged = candidates[0];
         Assert.Collection(
             staged.Stages,
             stage =>
@@ -2860,6 +3006,9 @@ public sealed class UnitTestDistribAutoDistributed : TestClassBase
                 Assert.Equal(new[] { 1, 2 }, stage.HierarchyAxes.ToArray());
                 Assert.Equal(64, Assert.IsType<BlockCyclicSplit>(stage.Distribution).BlockSize);
             });
+        Assert.Equal(
+            SBP.SContiguous(context.HierarchyAxes, context.ContiguousGranularity),
+            candidates[1]);
     }
 
     [Fact]

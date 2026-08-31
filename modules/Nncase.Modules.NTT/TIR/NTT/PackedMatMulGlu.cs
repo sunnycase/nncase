@@ -27,7 +27,11 @@ public sealed partial class PackedMatMulGlu : NTTKernelOp
 
     public static readonly ParameterInfo UpWeightScale = new(typeof(PackedMatMulGlu), 8, "up_weight_scale", memoryEffect: MemoryEffect.Read);
 
-    public static readonly ParameterInfo Output = new(typeof(PackedMatMulGlu), 9, "output", memoryEffect: MemoryEffect.ReductionWrite);
+    public static readonly ParameterInfo GateOutput = new(typeof(PackedMatMulGlu), 9, "gate_output", memoryEffect: MemoryEffect.ReductionWrite);
+
+    public static readonly ParameterInfo UpOutput = new(typeof(PackedMatMulGlu), 10, "up_output", memoryEffect: MemoryEffect.ReductionWrite);
+
+    public static readonly ParameterInfo Output = new(typeof(PackedMatMulGlu), 11, "output", memoryEffect: MemoryEffect.ReductionWrite);
 
     public GluType GluType { get; }
 
@@ -39,7 +43,9 @@ public sealed partial class PackedMatMulGlu : NTTKernelOp
 
     public long WeightBlockK { get; }
 
+    public bool EmitPartialResults { get; }
+
     public override string DisplayProperty() =>
         $"GluType: {GluType}, RhsLayout: {RhsLayout}, QuantizationMode: {QuantizationMode}, " +
-        $"WeightBlock: [{WeightBlockN}, {WeightBlockK}]";
+        $"WeightBlock: [{WeightBlockN}, {WeightBlockK}], EmitPartialResults: {EmitPartialResults}";
 }

@@ -189,7 +189,10 @@ public static class NTTTargetMachineCatalog
             chipGlobalBytesPerCycle: 174,
             sharedCapacityBytes: 101_376,
             sharedBytesPerCycle: 512,
+            globalToSharedLatencyCycles: 300,
             supportsCpAsync: true,
+            maximumAsyncStageCount: 4,
+            backendSharedBaselineBytes: GpuBackendSharedBaselineBytes,
             matrixPrimitives:
             [
 
@@ -219,7 +222,10 @@ public static class NTTTargetMachineCatalog
             chipGlobalBytesPerCycle: 1908,
             sharedCapacityBytes: 227 * 1024,
             sharedBytesPerCycle: 1024,
+            globalToSharedLatencyCycles: 600,
             supportsCpAsync: true,
+            maximumAsyncStageCount: 12,
+            backendSharedBaselineBytes: 8L * 1024,
             matrixPrimitives:
             [
                 new MatrixComputePrimitiveSpec(
@@ -252,7 +258,10 @@ public static class NTTTargetMachineCatalog
         long chipGlobalBytesPerCycle,
         long sharedCapacityBytes,
         long sharedBytesPerCycle,
+        long globalToSharedLatencyCycles,
         bool supportsCpAsync,
+        int maximumAsyncStageCount,
+        long backendSharedBaselineBytes,
         ImmutableArray<MatrixComputePrimitiveSpec> matrixPrimitives)
     {
         const long blockLocalWorkspaceBytes = 64L * 1024 * 1024;
@@ -264,7 +273,9 @@ public static class NTTTargetMachineCatalog
         var globalSharedBytesPerCycle = Math.Min(chipGlobalBytesPerCycle, sharedBytesPerCycle);
         var asynchronousGlobalToShared = supportsCpAsync
             ? new TargetAsynchronousTransferSpec(
-                supportedStageCounts: [2, 3, 4],
+                supportedStageCounts: Enumerable.Range(
+                    2,
+                    checked(maximumAsyncStageCount - 1)),
                 commitCycles: 1,
                 waitCycles: 1,
                 maximumTransactionBytes: 16 * 1024)
@@ -290,7 +301,7 @@ public static class NTTTargetMachineCatalog
                     sharedCapacityBytes,
                     16,
                     sharedResource,
-                    GpuBackendSharedBaselineBytes),
+                    backendSharedBaselineBytes),
             ],
             [
                 new(sharedResource, TargetMemorySpaceKind.Shared, sharedCapacityBytes, sharedBytesPerCycle, sharedBytesPerCycle, 20, 16),
@@ -318,7 +329,7 @@ public static class NTTTargetMachineCatalog
                     blockGlobal,
                     shared,
                     globalSharedBytesPerCycle,
-                    300,
+                    globalToSharedLatencyCycles,
                     TargetMemoryTransferMode.ExplicitCopy,
                     Asynchronous: asynchronousGlobalToShared),
                 new(shared, blockGlobal, globalSharedBytesPerCycle, 300, TargetMemoryTransferMode.ExplicitCopy),

@@ -109,6 +109,43 @@ public sealed record TIRTransferPipelineChannel
 }
 
 /// <summary>
+/// Declares the subset of one transfer-pipelined helper that executes in the
+/// enclosing region's fixed auxiliary consumer partition.
+/// </summary>
+public sealed record TIRAuxiliaryConsumerContract
+{
+    public TIRAuxiliaryConsumerContract(
+        IEnumerable<int> channelIndices,
+        IEnumerable<int>? consumerSharedWorkspaceIndices = null)
+    {
+        ArgumentNullException.ThrowIfNull(channelIndices);
+        ChannelIndices = channelIndices.ToImmutableArray();
+        if (ChannelIndices.IsDefaultOrEmpty ||
+            ChannelIndices.Any(index => index < 0) ||
+            ChannelIndices.Distinct().Count() != ChannelIndices.Length)
+        {
+            throw new ArgumentException(
+                "Auxiliary consumer channel indexes must be non-empty, non-negative, and unique.",
+                nameof(channelIndices));
+        }
+
+        ConsumerSharedWorkspaceIndices = consumerSharedWorkspaceIndices?.ToImmutableArray() ??
+            ImmutableArray<int>.Empty;
+        if (ConsumerSharedWorkspaceIndices.Any(index => index < 0) ||
+            ConsumerSharedWorkspaceIndices.Distinct().Count() != ConsumerSharedWorkspaceIndices.Length)
+        {
+            throw new ArgumentException(
+                "Auxiliary consumer Shared workspace indexes must be non-negative and unique.",
+                nameof(consumerSharedWorkspaceIndices));
+        }
+    }
+
+    public ImmutableArray<int> ChannelIndices { get; }
+
+    public ImmutableArray<int> ConsumerSharedWorkspaceIndices { get; }
+}
+
+/// <summary>
 /// Declares independently executable global-to-Shared transfer channels of a
 /// selected microkernel. A Shared workspace is owned either by exactly one
 /// transfer channel or by the consumer role, while multiple channels may read
@@ -118,7 +155,8 @@ public sealed record TIRTransferPipelineContract
 {
     public TIRTransferPipelineContract(
         IEnumerable<TIRTransferPipelineChannel> channels,
-        IEnumerable<int>? consumerSharedWorkspaceIndices = null)
+        IEnumerable<int>? consumerSharedWorkspaceIndices = null,
+        TIRAuxiliaryConsumerContract? auxiliaryConsumer = null)
     {
         ArgumentNullException.ThrowIfNull(channels);
         var values = channels.ToImmutableArray();
@@ -174,6 +212,32 @@ public sealed record TIRTransferPipelineContract
                 nameof(consumerSharedWorkspaceIndices));
         }
 
+        if (auxiliaryConsumer is not null)
+        {
+            var invalidChannel = auxiliaryConsumer.ChannelIndices
+                .Cast<int?>()
+                .FirstOrDefault(index => index >= values.Length);
+            if (invalidChannel is not null)
+            {
+                throw new ArgumentException(
+                    $"Auxiliary consumer channel index {invalidChannel.Value} is outside " +
+                    $"the transfer channel range [0, {values.Length}).",
+                    nameof(auxiliaryConsumer));
+            }
+
+            var invalidWorkspace = auxiliaryConsumer.ConsumerSharedWorkspaceIndices
+                .Except(consumerWorkspaces)
+                .Cast<int?>()
+                .FirstOrDefault();
+            if (invalidWorkspace is not null)
+            {
+                throw new ArgumentException(
+                    $"Auxiliary consumer Shared workspace {invalidWorkspace.Value} is not " +
+                    "owned by the transfer pipeline consumer.",
+                    nameof(auxiliaryConsumer));
+            }
+        }
+
         Channels = values;
         SourceArgumentIndices = values
             .SelectMany(channel => channel.SourceArgumentIndices)
@@ -181,6 +245,7 @@ public sealed record TIRTransferPipelineContract
             .ToImmutableArray();
         SharedWorkspaceIndices = channelWorkspaces;
         ConsumerSharedWorkspaceIndices = consumerWorkspaces;
+        AuxiliaryConsumer = auxiliaryConsumer;
     }
 
     public ImmutableArray<TIRTransferPipelineChannel> Channels { get; }
@@ -201,6 +266,11 @@ public sealed record TIRTransferPipelineContract
     /// by a transfer channel.
     /// </summary>
     public ImmutableArray<int> ConsumerSharedWorkspaceIndices { get; }
+
+    /// <summary>
+    /// Gets the optional fixed auxiliary consumer partition contract.
+    /// </summary>
+    public TIRAuxiliaryConsumerContract? AuxiliaryConsumer { get; }
 }
 
 /// <summary>

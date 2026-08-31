@@ -107,6 +107,39 @@ public sealed class ForwardTerminalStoreDestinationsPass : ModulePass
                 forwardedStores.Add(storeCall);
             }
 
+            foreach (var (field, castIndex) in fields.Select((field, index) => (field, index)))
+            {
+                if (field is not Call { Target: TIR.NTT.Cast cast } castCall ||
+                    castCall[TIR.NTT.Cast.Input] is not TIR.Buffer source ||
+                    castCall[TIR.NTT.Cast.Output] is not TIR.Buffer destination ||
+                    !TryFuseTerminalNormCast(
+                        cast,
+                        castCall,
+                        source,
+                        destination,
+                        directCallIndices,
+                        castIndex,
+                        out var writer,
+                        out var writerArgumentIndex))
+                {
+                    continue;
+                }
+
+                if (!writerReplacements.TryGetValue(writer, out var replacements))
+                {
+                    replacements = new Dictionary<int, TIR.Buffer>();
+                    writerReplacements.Add(writer, replacements);
+                }
+
+                if (!replacements.TryAdd(writerArgumentIndex, destination))
+                {
+                    throw new InvalidOperationException(
+                        $"Terminal cast forwarding selected writer operand {writerArgumentIndex} more than once.");
+                }
+
+                forwardedStores.Add(castCall);
+            }
+
             if (forwardedStores.Count == 0)
             {
                 return expr;
@@ -198,7 +231,8 @@ public sealed class ForwardTerminalStoreDestinationsPass : ModulePass
                 MemoryEffectUtility.GetPhysicalBufferAccessMode(storeDestinationEffect.Value) != MemoryAccessMode.Write ||
                 storeDestinationEffect.Value.Kind != MemoryEffectKind.Direct ||
                 writerAccesses[0].Effect.Scope != storeDestinationEffect.Value.Scope ||
-                writerAccesses[0].Effect.AccessDomain != storeDestinationEffect.Value.AccessDomain)
+                writerAccesses[0].Effect.AccessDomain != storeDestinationEffect.Value.AccessDomain ||
+                writerAccesses[0].Effect.OwnerAccess != storeDestinationEffect.Value.OwnerAccess)
             {
                 return false;
             }
@@ -214,6 +248,134 @@ public sealed class ForwardTerminalStoreDestinationsPass : ModulePass
                 memSpan: forwardedSpan);
             return true;
         }
+
+        private bool TryFuseTerminalNormCast(
+            TIR.NTT.Cast cast,
+            Call castCall,
+            TIR.Buffer source,
+            TIR.Buffer destination,
+            IReadOnlyDictionary<Call, int> directCallIndices,
+            int castIndex,
+            out Call writer,
+            out int writerArgumentIndex)
+        {
+            writer = null!;
+            writerArgumentIndex = -1;
+
+            if (cast.CastMode != CastMode.KDefault ||
+                castCall[TIR.NTT.Cast.PostOps] is not None ||
+                destination.MemSpan.Buffer.Location != MemoryLocation.Output ||
+                destination.MemSpan.Buffer.Start is not BufferVar destinationVar ||
+                destinationVar.Role != BufferVarRole.Output ||
+                destinationVar.Location != MemoryLocation.Output ||
+                destination.DistributedType is not { Partial: null } ||
+                destination.DistributedStorageKind != DistributedBufferStorageKind.CanonicalGlobal ||
+                source.DistributedType is not { Partial: null } sourceType ||
+                source.StorageEncoding is not null ||
+                source.StagedLayout is not null ||
+                destination.StorageEncoding is not null ||
+                destination.StagedLayout is not null ||
+                GetScalarDataType(sourceType.TensorType.DType) != GetScalarDataType(source.ElemType) ||
+                GetScalarDataType(destination.ElemType) != GetScalarDataType(cast.NewType) ||
+                !HasSameLogicalShape(cast, sourceType.TensorType, destination) ||
+                !_physicalAliases.TryGetValue(source.MemSpan.Buffer, out var sourceAliases) ||
+                sourceAliases.Length != 1 ||
+                !_physicalAliases.TryGetValue(destination.MemSpan.Buffer, out var destinationAliases) ||
+                !IsCompatibleOutputAliasSet(destination, destinationAliases) ||
+                !_bufferAccesses.TryGetValue(source, out var accesses) ||
+                accesses.Length != 2 ||
+                !_bufferAccesses.TryGetValue(destination, out var destinationAccesses) ||
+                destinationAccesses.Length != 1 ||
+                !ReferenceEquals(destinationAccesses[0].Call, castCall))
+            {
+                return false;
+            }
+
+            var castSourceAccess = accesses.SingleOrDefault(access =>
+                ReferenceEquals(access.Call, castCall) &&
+                MemoryEffectUtility.GetPhysicalBufferAccessMode(access.Effect) == MemoryAccessMode.Read);
+            var writerAccesses = accesses.Where(access =>
+                !ReferenceEquals(access.Call, castCall) &&
+                MemoryEffectUtility.GetPhysicalBufferAccessMode(access.Effect) == MemoryAccessMode.Write &&
+                access.Effect.Kind == MemoryEffectKind.Direct).ToArray();
+            if (castSourceAccess is null ||
+                writerAccesses.Length != 1 ||
+                writerAccesses[0].Call.Target is not TIR.NTT.GatherReduceAddNormApply ||
+                writerAccesses[0].ArgumentIndex != TIR.NTT.GatherReduceAddNormApply.NormOutput.Index ||
+                !directCallIndices.TryGetValue(writerAccesses[0].Call, out var writerIndex) ||
+                writerIndex >= castIndex)
+            {
+                return false;
+            }
+
+            var activeUsers = source.Users.Where(_functionNodes.Contains).ToArray();
+            if (activeUsers.Length != 2 ||
+                !activeUsers.Any(user => ReferenceEquals(user, castCall)) ||
+                !activeUsers.Any(user => ReferenceEquals(user, writerAccesses[0].Call)))
+            {
+                return false;
+            }
+
+            var castDestinationEffect = GetSingleBufferEffect(castCall, destination);
+            if (castDestinationEffect is null ||
+                MemoryEffectUtility.GetPhysicalBufferAccessMode(castDestinationEffect.Value) != MemoryAccessMode.Write ||
+                castDestinationEffect.Value.Kind != MemoryEffectKind.Direct ||
+                writerAccesses[0].Effect.Scope != castDestinationEffect.Value.Scope ||
+                writerAccesses[0].Effect.AccessDomain != castDestinationEffect.Value.AccessDomain ||
+                writerAccesses[0].Effect.OwnerAccess != castDestinationEffect.Value.OwnerAccess)
+            {
+                return false;
+            }
+
+            writer = writerAccesses[0].Call;
+            writerArgumentIndex = writerAccesses[0].ArgumentIndex;
+            return true;
+        }
+
+        private static bool HasSameLogicalShape(
+            TIR.NTT.Cast cast,
+            TensorType sourceType,
+            TIR.Buffer destination)
+        {
+            var axes = cast.VectorizeAxes.ToArray();
+            if (axes.Length != 1 || sourceType.Shape.Rank != destination.Dimensions.Length)
+            {
+                return false;
+            }
+
+            var axis = axes[0] < 0 ? axes[0] + sourceType.Shape.Rank : axes[0];
+            if (axis < 0 || axis >= sourceType.Shape.Rank)
+            {
+                return false;
+            }
+
+            var sourceShape = sourceType.Shape.ToArray();
+            var destinationType = destination.DistributedType?.TensorType ??
+                new TensorType(destination.ElemType, destination.Dimensions.ToArray());
+            var destinationShape = destinationType.Shape.ToArray();
+            sourceShape[axis] *= GetVectorLaneCount(sourceType.DType);
+            destinationShape[axis] *= GetVectorLaneCount(destinationType.DType);
+            return sourceShape.SequenceEqual(destinationShape);
+        }
+
+        private bool IsCompatibleOutputAliasSet(
+            TIR.Buffer destination,
+            IReadOnlyList<TIR.Buffer> aliases)
+            => aliases.All(alias =>
+                alias.MemSpan.Buffer.Location == MemoryLocation.Output &&
+                alias.MemSpan.Start.Equals(destination.MemSpan.Start) &&
+                alias.MemSpan.Size.Equals(destination.MemSpan.Size) &&
+                (!_bufferAccesses.TryGetValue(alias, out var accesses) ||
+                 ReferenceEquals(alias, destination) ||
+                 accesses.Length == 0));
+
+        private static DataType GetScalarDataType(DataType dataType)
+            => dataType is VectorType vectorType ? GetScalarDataType(vectorType.ElemType) : dataType;
+
+        private static int GetVectorLaneCount(DataType dataType)
+            => dataType is VectorType vectorType
+                ? checked(vectorType.Lanes.Aggregate(1, static (product, lane) => product * lane) * GetVectorLaneCount(vectorType.ElemType))
+                : 1;
 
         private bool IsCompatibleTerminalStore(
             TIR.NTT.TensorStore tensorStore,

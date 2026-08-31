@@ -25,10 +25,17 @@ public sealed partial class GatherReduceScatter : NTTKernelOp
 
         if (ReferenceEquals(parameter, Output))
         {
-            // Output visibility follows its physical backing. CompactLocal
-            // outputs are private replicas, while CanonicalGlobal outputs use
-            // chip-visible storage and are promoted by resource inference.
-            return MemoryEffect.Write;
+            // A CanonicalGlobal reshard may be materialized by one source
+            // owner and consumed by every owner of a broadcast output shard.
+            // Expose that remote publication explicitly so synchronization
+            // planning cannot treat equal producer/consumer layouts as an
+            // owner-local RAW dependence.
+            var isCanonicalGlobal = arguments.Count > Output.Index &&
+                arguments[Output.Index] is TIR.Buffer
+                {
+                    DistributedStorageKind: DistributedBufferStorageKind.CanonicalGlobal,
+                };
+            return isCanonicalGlobal ? MemoryEffect.ChipWrite : MemoryEffect.Write;
         }
 
         return base.GetMemoryEffect(parameter, arguments);

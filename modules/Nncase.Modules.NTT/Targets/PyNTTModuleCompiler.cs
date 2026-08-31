@@ -96,6 +96,7 @@ public sealed class PyNTTModuleCompiler : INTTModuleCompiler
                 or IR.NTT.PackedQKVParallelLinear
                 or IR.NTT.PackedQKVParallelLinearCombine
                 or IR.NTT.PackedMatMulGlu
+                or IR.NTT.PackedMatMulGluCombine
                 or IR.NTT.PagedAttentionPartial
                 or IR.NTT.PagedAttentionCombine
                 or IR.NTT.SamplingPartial

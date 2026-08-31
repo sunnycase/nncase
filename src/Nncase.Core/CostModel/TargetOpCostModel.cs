@@ -31,6 +31,23 @@ public enum MatMulOpCostKind
 }
 
 /// <summary>
+/// LHS preparation performed by a target matmul pipeline.
+/// </summary>
+public enum MatMulLhsPreparationKind
+{
+    /// <summary>
+    /// The matmul consumes the LHS in its memory dtype.
+    /// </summary>
+    None,
+
+    /// <summary>
+    /// The matmul dynamically quantizes fixed-size LHS reduction groups to the
+    /// RHS compute dtype and produces one scale per group.
+    /// </summary>
+    DynamicBlockQuantization,
+}
+
+/// <summary>
 /// Target-provided op cost model. Evaluators build these generic queries and do
 /// not depend on concrete hardware details.
 /// </summary>
@@ -70,6 +87,14 @@ public interface ITargetOpCostModelProvider
 {
     ITargetOpCostModel TargetCostModel { get; }
 }
+
+/// <summary>
+/// Target-independent semantic work performed by a pipelined matmul implementation.
+/// </summary>
+public sealed record MatMulOpCostPipelineProfile(
+    MatMulLhsPreparationKind LhsPreparation,
+    int ReductionGroupK,
+    int SimultaneousRhsTileCount = 1);
 
 /// <summary>
 /// Latency aggregation breakdown in target cycles.
@@ -275,7 +300,10 @@ public sealed record MatMulOpCostQuery(
     MatMulOpCostKind Kind = MatMulOpCostKind.Auto,
     TargetCostMemoryAccessPattern? LhsMemoryAccess = null,
     TargetCostMemoryAccessPattern? RhsMemoryAccess = null,
-    TargetCostMemoryAccessPattern? OutputMemoryAccess = null);
+    TargetCostMemoryAccessPattern? OutputMemoryAccess = null,
+    DataType? LhsComputeDataType = null,
+    DataType? RhsComputeDataType = null,
+    MatMulOpCostPipelineProfile? PipelineProfile = null);
 
 /// <summary>
 /// Describes a tensor access made of independently addressed contiguous segments.

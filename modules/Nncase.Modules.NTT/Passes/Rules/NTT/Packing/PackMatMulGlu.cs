@@ -98,7 +98,11 @@ public sealed partial class PackMatMulGluByN : RewriteRule<Pattern>
             weightBlockN: matmulGlu.WeightBlockN,
             weightBlockK: matmulGlu.WeightBlockK);
 
-        return UnpackOutput(packed, rank, laneCount);
+        var combined = IR.F.NTT.PackedMatMulGluCombine(
+            packed,
+            packed.CheckedType,
+            matmulGlu.GluType);
+        return UnpackOutput(combined, rank, laneCount);
     }
 
     private bool IsNone(Expr expr) => expr is None;
@@ -165,6 +169,158 @@ public sealed partial class PackMatMulGluByN : RewriteRule<Pattern>
         TensorType tensor => tensor.Shape.Rank,
         DistributedType distributed => distributed.TensorType.Shape.Rank,
         _ => throw new NotSupportedException($"PackedMatMulGlu output should be tensor-like, got {type}."),
+    };
+}
+
+[RuleGenerator]
+public sealed partial class PackBlockScaledMatMulGluRhsNMajorKPacked : RewriteRule<Pattern>
+{
+    private readonly int _vectorBytes;
+    private readonly int _kPack;
+
+    public PackBlockScaledMatMulGluRhsNMajorKPacked(int vectorBytes, int kPack)
+    {
+        _vectorBytes = vectorBytes > 0
+            ? vectorBytes
+            : throw new ArgumentOutOfRangeException(nameof(vectorBytes));
+        _kPack = kPack > 0 ? kPack : throw new ArgumentOutOfRangeException(nameof(kPack));
+    }
+
+    public override Pattern Pattern { get; } =
+        IsMatMulGlu(
+            "matmulGlu",
+            "caller",
+            _ => true,
+            IsWildcard("input"),
+            IsWildcard("gateWeight"),
+            IsWildcard("upWeight"),
+            IsWildcard("gateBias"),
+            IsWildcard("upBias"),
+            IsWildcard("gateInputScale"),
+            IsWildcard("upInputScale"),
+            IsWildcard("gateWeightScale"),
+            IsWildcard("upWeightScale"));
+
+    private BaseExpr? GetReplace(
+        MatMulGlu matmulGlu,
+        Call caller,
+        Expr input,
+        Expr gateWeight,
+        Expr upWeight,
+        Expr gateBias,
+        Expr upBias,
+        Expr gateInputScale,
+        Expr upInputScale,
+        Expr gateWeightScale,
+        Expr upWeightScale)
+    {
+        if (matmulGlu.QuantizationMode != MatMulQuantizationMode.DynamicBlock ||
+            input.CheckedDataType is not PrimType ||
+            gateWeight.CheckedDataType != DataTypes.Float8E4M3 ||
+            upWeight.CheckedDataType != DataTypes.Float8E4M3 ||
+            matmulGlu.OutputDataType is not PrimType outputType ||
+            !IsNone(gateInputScale) ||
+            !IsNone(upInputScale) ||
+            IsNone(gateWeightScale) ||
+            IsNone(upWeightScale) ||
+            _vectorBytes % DataTypes.Float8E4M3.SizeInBytes != 0 ||
+            _vectorBytes % outputType.SizeInBytes != 0)
+        {
+            return null;
+        }
+
+        var kVectorLanes = _vectorBytes / DataTypes.Float8E4M3.SizeInBytes;
+        var nVectorLanes = _vectorBytes / outputType.SizeInBytes;
+        if (kVectorLanes <= 0 || nVectorLanes <= 0 ||
+            !TryPackWeight(gateWeight, kVectorLanes, out var packedGateWeight) ||
+            !TryPackWeight(upWeight, kVectorLanes, out var packedUpWeight) ||
+            !TryPackBias(gateBias, outputType, nVectorLanes, out var packedGateBias) ||
+            !TryPackBias(upBias, outputType, nVectorLanes, out var packedUpBias))
+        {
+            return null;
+        }
+
+        var packed = IR.F.NTT.PackedMatMulGlu(
+            input,
+            packedGateWeight,
+            packedUpWeight,
+            packedGateBias,
+            packedUpBias,
+            gateInputScale,
+            upInputScale,
+            gateWeightScale,
+            upWeightScale,
+            matmulGlu.GluType,
+            matmulGlu.OutputDataType,
+            rhsLayout: IR.NTT.PackedMatMulRhsLayout.NMajorKPacked,
+            quantizationMode: matmulGlu.QuantizationMode,
+            weightBlockN: matmulGlu.WeightBlockN,
+            weightBlockK: matmulGlu.WeightBlockK);
+        var combined = IR.F.NTT.PackedMatMulGluCombine(
+            packed,
+            packed.CheckedType,
+            matmulGlu.GluType);
+        return IR.F.Tensors.Unpack(
+            combined,
+            [nVectorLanes],
+            [GetRank(caller.CheckedType) - 1]);
+    }
+
+    private static bool IsNone(Expr expr) => expr is None;
+
+    private bool TryPackWeight(Expr weight, int kVectorLanes, out Expr packedWeight)
+    {
+        packedWeight = weight;
+        if (weight.CheckedDataType != DataTypes.Float8E4M3 ||
+            weight.CheckedShape.IsUnranked ||
+            weight.CheckedShape.Rank < 2 ||
+            !Dimension.TryDivExactly(
+                weight.CheckedShape[^2],
+                checked(_kPack * kVectorLanes),
+                out _))
+        {
+            return false;
+        }
+
+        var rank = weight.CheckedShape.Rank;
+        var permutation = Enumerable.Range(0, rank).ToArray();
+        (permutation[^2], permutation[^1]) = (permutation[^1], permutation[^2]);
+        packedWeight = IR.F.Tensors.Transpose(weight, permutation);
+        packedWeight = IR.F.Tensors.Pack(packedWeight, [kVectorLanes], [rank - 1]);
+        packedWeight = IR.F.Tensors.Pack(packedWeight, [_kPack], [rank - 1]);
+        return packedWeight.CheckedType is not InvalidType;
+    }
+
+    private static bool TryPackBias(
+        Expr bias,
+        PrimType outputType,
+        int nVectorLanes,
+        out Expr packedBias)
+    {
+        packedBias = bias;
+        if (IsNone(bias))
+        {
+            return true;
+        }
+
+        if (bias.CheckedDataType != outputType ||
+            bias.CheckedShape.IsUnranked ||
+            bias.CheckedShape.Rank != 1 ||
+            !Dimension.TryDivExactly(bias.CheckedShape[0], nVectorLanes, out _))
+        {
+            return false;
+        }
+
+        packedBias = IR.F.Tensors.Pack(bias, [nVectorLanes], [0]);
+        return packedBias.CheckedType is not InvalidType;
+    }
+
+    private static int GetRank(IRType type) => type switch
+    {
+        TensorType tensor => tensor.Shape.Rank,
+        DistributedType distributed => distributed.TensorType.Shape.Rank,
+        _ => throw new NotSupportedException(
+            $"PackedMatMulGlu output should be tensor-like, got {type}."),
     };
 }
 
@@ -279,7 +435,11 @@ public sealed partial class PackMatMulGluRhsKMajor : RewriteRule<Pattern>
             weightBlockN: matmulGlu.WeightBlockN,
             weightBlockK: matmulGlu.WeightBlockK);
 
-        return IR.F.Tensors.Unpack(packed, [nVectorLanes], [rank - 1]);
+        var combined = IR.F.NTT.PackedMatMulGluCombine(
+            packed,
+            packed.CheckedType,
+            matmulGlu.GluType);
+        return IR.F.Tensors.Unpack(combined, [nVectorLanes], [rank - 1]);
     }
 
     private static bool IsNone(Expr expr) => expr is None;

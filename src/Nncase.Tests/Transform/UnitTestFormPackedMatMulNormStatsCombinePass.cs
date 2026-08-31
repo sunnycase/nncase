@@ -69,4 +69,71 @@ public sealed class UnitTestFormPackedMatMulNormStatsCombinePass : TestClassBase
         Assert.True(rewritten.InferenceType());
         Assert.Equal(originalType, rewritten.CheckedType);
     }
+
+    [Theory]
+    [InlineData(false)]
+    [InlineData(true)]
+    public async Task TestMakesBlockScaledResidualAndNormStatsExplicit(bool useMean)
+    {
+        var lhs = new Var(
+            "lhs",
+            new TensorType(DataTypes.BFloat16, new long[] { 1, 128 }));
+        var rhs = new Var(
+            "rhs",
+            new TensorType(
+                new VectorType(DataTypes.Float8E4M3, [2, 16]),
+                new long[] { 256, 4 }));
+        var rhsScale = new Var(
+            "rhs_scale",
+            new TensorType(DataTypes.BFloat16, new long[] { 2, 1 }));
+        var outputWithoutAddend = Assert.IsType<Call>(IR.F.NTT.PackedBlockScaledMatMul(
+            lhs,
+            rhs,
+            rhsScale,
+            DataTypes.BFloat16,
+            128,
+            128,
+            PackedMatMulRhsLayout.NMajorKPacked,
+            8));
+        var addend = new Var("addend", outputWithoutAddend.CheckedType);
+        var packed = Assert.IsType<Call>(IR.F.NTT.PackedBlockScaledMatMul(
+            lhs,
+            rhs,
+            rhsScale,
+            DataTypes.BFloat16,
+            128,
+            128,
+            PackedMatMulRhsLayout.NMajorKPacked,
+            8,
+            addend));
+        var stats = IR.F.NN.NormStats(-1, packed, useMean);
+        var function = new Function(
+            "main",
+            string.Empty,
+            new IR.Tuple(packed, stats),
+            new IVar[] { lhs, rhs, rhsScale, addend });
+        Assert.True(function.InferenceType());
+        var originalType = function.CheckedType;
+
+        var rewritten = Assert.IsType<Function>(
+            await new FormPackedMatMulNormStatsCombinePass().RunAsync(function, new()));
+        var calls = ExprCollector.Collect(rewritten.Body).OfType<Call>().ToArray();
+        var combineCall = Assert.Single(
+            calls.Where(call => call.Target is PackedMatMulNormStatsCombine));
+        var combine = Assert.IsType<PackedMatMulNormStatsCombine>(combineCall.Target);
+        var inner = Assert.IsType<Call>(combineCall[PackedMatMulNormStatsCombine.Input]);
+        var innerPacked = Assert.IsType<PackedBlockScaledMatMul>(inner.Target);
+
+        Assert.IsType<NoneType>(inner[PackedBlockScaledMatMul.Addend].CheckedType);
+        Assert.Equal(1, combine.Axis);
+        Assert.Equal(useMean, combine.UseMean);
+        Assert.Equal(addend, combineCall[PackedMatMulNormStatsCombine.Addend]);
+        Assert.DoesNotContain(calls, call => call.Target is NormStats);
+        Assert.DoesNotContain(
+            calls,
+            call => call.Target is PackedBlockScaledMatMul &&
+                    call[PackedBlockScaledMatMul.Addend].CheckedType is not NoneType);
+        Assert.True(rewritten.InferenceType());
+        Assert.Equal(originalType, rewritten.CheckedType);
+    }
 }

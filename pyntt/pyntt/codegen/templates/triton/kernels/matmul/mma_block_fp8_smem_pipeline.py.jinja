@@ -1,27 +1,64 @@
 {% macro pipeline_setup(stage) -%}
 {% set stage_model = stage["Model"] %}
 {% set stage_ctx = packed_block_fp8_mma_gemv_pipeline_context(stage_model) %}
-{% for group in range(stage_ctx["reduction_groups_per_stage"]) %}
-{% for transfer_chunk in range(stage_ctx["transfer_chunks_per_group"]) %}
-{{ stage["StageName"] }}__rhs_group_{{ group }}_chunk_{{ transfer_chunk }}_stages = tle.gpu.alloc(
-    [{{ stage_ctx["num_stages"] }}, {{ stage_ctx["block_n"] }}, {{ stage_ctx["transfer_block_k"] }}],
+{% for transfer in range(stage_ctx["transfers_per_stage"]) %}
+{{ stage["StageName"] }}__rhs_transfer_{{ transfer }}_stages = tle.gpu.alloc(
+    [{{ stage_ctx["num_stages"] }}, {{ stage_ctx["reduction_groups_per_transfer"] }}, {{ stage_ctx["block_n"] }}, {{ stage_ctx["reduction_group"] }}],
     dtype={{ stage_model["RhsTritonDType"] }},
+{% if stage_ctx["use_nv_mma_weight_stage"] %}
+    layout=None,
+{% else %}
+    layout=tle.gpu.nv_tma_shared_layout(
+        [{{ stage_ctx["num_stages"] }}, {{ stage_ctx["reduction_groups_per_transfer"] }}, {{ stage_ctx["block_n"] }}, {{ stage_ctx["reduction_group"] }}],
+        [3, 2, 1, 0],
+        {{ stage_model["RhsTritonDType"] }},
+        [1, 1, 1, 1], [1, 1, 1, 1], [3, 2, 1, 0], False, True,
+    ),
+{% endif %}
+    scope=tle.gpu.smem,
+    alias=pyntt_shared_arena,
+    alias_offset_bytes=({{ stage["SharedWorkspaceOffsets"]["rhs_stage"] }}) + {{ transfer * stage_ctx["transfer_stage_bytes"] }},
+    nv_mma_shared_layout={{ stage_ctx["use_nv_mma_weight_stage"] }},
+)
+{% endfor %}
+{% set lhs_quantized_workspace = stage["ConsumerSharedWorkspaces"][0] %}
+{{ lhs_quantized_workspace["VariableName"] }} = tle.gpu.alloc(
+    [{{ stage_ctx["activation_group_count"] }}, {{ stage_ctx["reduction_group"] }}],
+    dtype=tl.float8e4nv,
     layout=None,
     scope=tle.gpu.smem,
     alias=pyntt_shared_arena,
-    alias_offset_bytes=({{ stage["SharedWorkspaceOffsets"]["rhs_stage"] }}) + {{ (group * stage_ctx["transfer_chunks_per_group"] + transfer_chunk) * stage_ctx["transfer_stage_bytes"] }},
-    nv_mma_shared_layout=True,
+    alias_offset_bytes={{ lhs_quantized_workspace["SharedWorkspaceOffset"] }},
+    nv_mma_shared_layout=False,
 )
-{% endfor %}
-{% endfor %}
+{% set lhs_scale_workspace = stage["ConsumerSharedWorkspaces"][1] %}
+{{ lhs_scale_workspace["VariableName"] }} = tle.gpu.alloc(
+    [{{ stage_ctx["activation_group_count"] }}, 1],
+    dtype=tl.float32,
+    layout=None,
+    scope=tle.gpu.smem,
+    alias=pyntt_shared_arena,
+    alias_offset_bytes={{ lhs_scale_workspace["SharedWorkspaceOffset"] }},
+    nv_mma_shared_layout=False,
+)
+{% if stage_ctx["use_complete_consumer_lhs_stage"] %}
+{% set lhs_workspace = stage["ConsumerSharedWorkspaces"][2] %}
+{{ lhs_workspace["VariableName"] }} = tle.gpu.alloc(
+    [1, {{ stage_ctx["lhs_stage_extent"] }}],
+    dtype={{ stage_model["LhsTritonDType"] }},
+    layout=None,
+    scope=tle.gpu.smem,
+    alias=pyntt_shared_arena,
+    alias_offset_bytes={{ lhs_workspace["SharedWorkspaceOffset"] }},
+    nv_mma_shared_layout=False,
+)
+{% endif %}
 {{ stage["PipeName"] }} = tle.pipe(
     capacity={{ stage_ctx["num_stages"] }},
     scope="cta",
     name="{{ stage["StageName"] }}_weight",
-{% for group in range(stage_ctx["reduction_groups_per_stage"]) %}
-{% for transfer_chunk in range(stage_ctx["transfer_chunks_per_group"]) %}
-    weight_{{ group }}_{{ transfer_chunk }}={{ stage["StageName"] }}__rhs_group_{{ group }}_chunk_{{ transfer_chunk }}_stages,
-{% endfor %}
+{% for transfer in range(stage_ctx["transfers_per_stage"]) %}
+    weight_{{ transfer }}={{ stage["StageName"] }}__rhs_transfer_{{ transfer }}_stages,
 {% endfor %}
 )
 {%- endmacro %}
@@ -29,9 +66,9 @@
 {% import "triton/kernels/_common.py.jinja" as common with context %}
 {% set ctx = packed_block_fp8_mma_gemv_pipeline_context(model) %}
 # generated from PyNTT algorithm triton.matmul/mma_block_fp8_smem_pipeline
-# {{ model["Comment"] }}; lhs_dtype={{ model["LhsDType"] }}, rhs_dtype={{ model["RhsDType"] }}, output_dtype={{ model["OutputDType"] }}, lhs_shape={{ shape_tuple(model["LhsShape"]) }}, rhs_shape={{ shape_tuple(model["RhsShape"]) }}, rhs_scale_shape={{ shape_tuple(model["RhsScaleShape"]) }}, output_shape={{ shape_tuple(model["OutputShape"]) }}, rhs_layout={{ ctx["rhs_layout"] }}, weight_block={{ ctx["weight_block_n"] }}x{{ ctx["weight_block_k"] }}, mma_tile={{ ctx["block_n"] }}x8x{{ ctx["transfer_block_k"] }}, block_k={{ ctx["block_k"] }}, num_stages={{ ctx["num_stages"] }}
+# {{ model["Comment"] }}; lhs_dtype={{ model["LhsDType"] }}, rhs_dtype={{ model["RhsDType"] }}, output_dtype={{ model["OutputDType"] }}, lhs_shape={{ shape_tuple(model["LhsShape"]) }}, rhs_shape={{ shape_tuple(model["RhsShape"]) }}, rhs_scale_shape={{ shape_tuple(model["RhsScaleShape"]) }}, output_shape={{ shape_tuple(model["OutputShape"]) }}, rhs_layout={{ ctx["rhs_layout"] }}, weight_block={{ ctx["weight_block_n"] }}x{{ ctx["weight_block_k"] }}, mma_tile={{ ctx["block_n"] }}x{{ ctx["mma_instruction_n"] }}x{{ ctx["transfer_block_k"] }}, block_k={{ ctx["block_k"] }}, num_stages={{ ctx["num_stages"] }}
 {{ model["FunctionName"] }}__mma_layout = tl.constexpr(
-    tle.gpu.MmaEncoding([2, 0], [{{ model["NumWarps"] }}, 1], [16, 8])
+    tle.gpu.MmaEncoding([2, 0], [{{ ctx["execution_consumer_warps"] }}, 1], [16, 8])
 )
 {{ model["FunctionName"] }}__weight_dot_layout = tl.constexpr(
     tle.gpu.DotOperandEncoding(0, {{ model["FunctionName"] }}__mma_layout, 4)
@@ -42,77 +79,102 @@
 {{ model["FunctionName"] }}__output_layout = tl.constexpr(
     tle.gpu.SlicedEncoding(1, {{ model["FunctionName"] }}__mma_layout)
 )
+{{ model["FunctionName"] }}__activation_quantization_layout = tl.constexpr(
+    tle.gpu.BlockEncoding(
+        [{{ ctx["activation_rows_per_warp"] }}, 4],
+        [1, {{ model["TargetWorkerWidth"] }}],
+        [{{ ctx["execution_consumer_warps"] }}, 1],
+        [1, 0],
+    )
+)
+{% if ctx["use_complete_consumer_lhs_stage"] %}
+{{ model["FunctionName"] }}__input_copy_layout = tl.constexpr(
+    tle.gpu.BlockEncoding(
+        [1, {{ ctx["input_copy_size_per_thread"] }}],
+        [1, {{ model["TargetWorkerWidth"] }}],
+        [1, {{ ctx["execution_consumer_warps"] }}],
+        [0, 1],
+    )
+)
+{% endif %}
 
 
 {{ "@triton.jit(noinline=True)" if model["NoInline"] else "@triton.jit" }}
 def {{ model["FunctionName"] }}__producer(writer, {{ helper_parameters(model) }}):
 {{ common.mesh_coordinates(model["MeshAxes"]) }}
-{% for n_tile in range(ctx["num_n_tiles"]) %}
+    active_n = {{ dim(ctx["n"]) }}
+    runtime_num_n_tiles = {{ ctx["runtime_num_n_tiles"] }}
+    for n_tile in tl.range(0, runtime_num_n_tiles):
 {% for chunk in range(ctx["rhs_descriptor_chunks_per_tile"]) %}
-    rhs_descriptor_entry_{{ n_tile }}_{{ chunk }} = tle.gpu.tensor_map_table_entry(
-        {{ ctx["rhs_descriptor_name"] }},
-        shard_index * {{ ctx["rhs_descriptor_entries_per_owner"] }}
-        + {{ n_tile * ctx["rhs_descriptor_chunks_per_tile"] + chunk }},
-    )
-    tle.gpu.tensor_map_fenceproxy_acquire(rhs_descriptor_entry_{{ n_tile }}_{{ chunk }})
+        rhs_descriptor_entry_{{ chunk }} = tle.gpu.tensor_map_table_entry(
+            {{ ctx["rhs_descriptor_name"] }},
+            shard_index * {{ ctx["rhs_descriptor_entries_per_owner"] }}
+            + n_tile * {{ ctx["rhs_descriptor_chunks_per_tile"] }}
+            + {{ chunk }},
+        )
+        tle.gpu.tensor_map_fenceproxy_acquire(rhs_descriptor_entry_{{ chunk }})
 {% endfor %}
-{% endfor %}
-{% for n_batch_start in range(0, ctx["num_n_tiles"], ctx["n_tiles_per_activation_batch"]) %}
-{% set n_batch_end = [n_batch_start + ctx["n_tiles_per_activation_batch"], ctx["num_n_tiles"]] | min %}
-{% set n_batch_count = n_batch_end - n_batch_start %}
-    for k_tile_{{ n_batch_start }} in tl.range(0, {{ ctx["num_k_tiles"] }}):
-        k_tile = k_tile_{{ n_batch_start }}
-{% for n_tile in range(n_batch_start, n_batch_end) %}
-        sequence_{{ n_tile }} = (
-            {{ n_batch_start * ctx["num_k_tiles"] }}
-            + k_tile * {{ n_batch_count }}
-            + {{ n_tile - n_batch_start }}
-        ).to(tl.int32)
-        slot_{{ n_tile }} = writer.acquire(sequence_{{ n_tile }})
-{% for group in range(ctx["reduction_groups_per_stage"]) %}
-{% for transfer_chunk in range(ctx["transfer_chunks_per_group"]) %}
+        for k_tile in tl.range(0, {{ ctx["num_k_tiles"] }}):
+            sequence = (
+                n_tile * {{ ctx["num_k_tiles"] }} + k_tile
+            ).to(tl.int32)
+            slot = writer.acquire(sequence)
+{% for transfer in range(ctx["transfers_per_stage"]) %}
 {% for chunk in range(ctx["rhs_descriptor_chunks_per_tile"]) %}
-        weight_{{ n_tile }}_{{ group }}_{{ transfer_chunk }}_destination_{{ chunk }} = tle.gpu.alloc(
-            [{{ ctx["tma_block_shape"] | join(", ") }}],
-            dtype={{ model["RhsTritonDType"] }},
-            layout=None,
-            scope=tle.gpu.smem,
-            alias=slot_{{ n_tile }}.weight_{{ group }}_{{ transfer_chunk }},
-            alias_offset_bytes={{ chunk * ctx["tma_n_elements"] * ctx["transfer_block_k"] * ctx["rhs_scalar_bytes"] }},
-            nv_mma_shared_layout=True,
-        )
-        rhs_{{ n_tile }}_{{ group }}_{{ transfer_chunk }}_descriptor_{{ chunk }} = tle.gpu.reinterpret_tensor_map(
-            rhs_descriptor_entry_{{ n_tile }}_{{ chunk }},
-            weight_{{ n_tile }}_{{ group }}_{{ transfer_chunk }}_destination_{{ chunk }},
-        )
-        tle.gpu.copy(
-            rhs_{{ n_tile }}_{{ group }}_{{ transfer_chunk }}_descriptor_{{ chunk }},
-            weight_{{ n_tile }}_{{ group }}_{{ transfer_chunk }}_destination_{{ chunk }},
-            [{{ ctx["tma_block_shape"] | join(", ") }}],
-            offsets=[
-{% for offset in ctx["rhs_descriptor_offsets"][group][transfer_chunk] %}
-                {{ tma_offset(offset) }},
+            weight_{{ transfer }}_destination_{{ chunk }} = tle.gpu.alloc(
+                [{{ ctx["tma_block_shape"] | join(", ") }}],
+                dtype={{ model["RhsTritonDType"] }},
+{% if ctx["use_nv_mma_weight_stage"] %}
+                layout=None,
+{% else %}
+                layout=tle.gpu.nv_tma_shared_layout(
+                    [{{ ctx["tma_block_shape"] | join(", ") }}],
+                    [{{ range(ctx["tma_block_shape"] | length) | reverse | join(", ") }}],
+                    {{ model["RhsTritonDType"] }},
+                    [{{ ([1] * (ctx["tma_block_shape"] | length)) | join(", ") }}],
+                    [{{ ([1] * (ctx["tma_block_shape"] | length)) | join(", ") }}],
+                    [{{ range(ctx["tma_block_shape"] | length) | reverse | join(", ") }}],
+                    False, True,
+                ),
+{% endif %}
+                scope=tle.gpu.smem,
+                alias=slot.weight_{{ transfer }},
+                alias_offset_bytes={{ chunk * ctx["tma_n_elements"] * ctx["transfer_block_k"] * ctx["rhs_scalar_bytes"] }},
+                nv_mma_shared_layout={{ ctx["use_nv_mma_weight_stage"] }},
+            )
+            rhs_{{ transfer }}_descriptor_{{ chunk }} = tle.gpu.reinterpret_tensor_map(
+                rhs_descriptor_entry_{{ chunk }},
+                weight_{{ transfer }}_destination_{{ chunk }},
+            )
+            tle.gpu.copy(
+                rhs_{{ transfer }}_descriptor_{{ chunk }},
+                weight_{{ transfer }}_destination_{{ chunk }},
+                [{{ ctx["tma_block_shape"] | join(", ") }}],
+                offsets=[
+{% for offset in ctx["transfer_descriptor_offsets"][transfer] %}
+                    {{ tma_offset(offset) }},
 {% endfor %}
-            ],
-            eviction_policy="evict_first",
-        )
+                ],
+                eviction_policy="evict_first",
+            )
 {% endfor %}
 {% endfor %}
-{% endfor %}
-        writer.commit(sequence_{{ n_tile }})
-{% endfor %}
-{% endfor %}
+            writer.commit(sequence)
     writer.close(
-        tl.full(
-            (),
-            {{ ctx["num_n_tiles"] * ctx["num_k_tiles"] }},
-            tl.int32,
-        )
+        (runtime_num_n_tiles * {{ ctx["num_k_tiles"] }}).to(tl.int32)
     )
 
 
 {{ "@triton.jit(noinline=True)" if model["NoInline"] else "@triton.jit" }}
-def {{ model["FunctionName"] }}__consumer(reader, {{ helper_parameters(model) }}):
+def {{ model["FunctionName"] }}__{{ "consumer_compute" if ctx["auxiliary_only"] else "consumer" }}(
+    reader,
+    lhs_quantized_stage,
+    lhs_scale_stage,
+{% if ctx["use_complete_consumer_lhs_stage"] %}
+    lhs_stage,
+{% endif %}
+    {{ helper_parameters(model) }}
+):
 {{ common.mesh_coordinates(model["MeshAxes"]) }}
     lhs = {{ ptr(model, "Lhs") }}
     rhs_scale = {{ ptr(model, "RhsScale") }}
@@ -127,177 +189,317 @@ def {{ model["FunctionName"] }}__consumer(reader, {{ helper_parameters(model) }}
 {% endif %}
     stats_square_sum = 0.0
 {% endif %}
-    lhs_quantized_stage = tle.gpu.alloc(
-        [{{ ctx["reduction_groups_per_stage"] }}, {{ ctx["reduction_group"] }}],
-        dtype=tl.float8e4nv,
-        layout=None,
-        scope=tle.gpu.smem,
-        alias=pyntt_shared_arena,
-        alias_offset_bytes={{ ctx["microkernel"]["shared_workspace_offsets"]["lhs_quantized"] }},
-        nv_mma_shared_layout=False,
+    quantization_k = tle.encoding(
+        tl.broadcast_to(
+            tl.arange(0, {{ ctx["reduction_group"] }})[None, :],
+            ({{ ctx["mma_instruction_n"] }}, {{ ctx["reduction_group"] }}),
+        ),
+        {{ model["FunctionName"] }}__activation_quantization_layout,
     )
-    lhs_scale_stage = tle.gpu.alloc(
-        [{{ ctx["reduction_groups_per_stage"] }}, 1],
-        dtype=tl.float32,
-        layout=None,
-        scope=tle.gpu.smem,
-        alias=pyntt_shared_arena,
-        alias_offset_bytes={{ ctx["microkernel"]["shared_workspace_offsets"]["lhs_scale"] }},
-        nv_mma_shared_layout=False,
-    )
-    quantization_k = tl.arange(0, {{ ctx["reduction_group"] }})
-    transfer_k = tl.arange(0, {{ ctx["transfer_block_k"] }})
     local_n = tle.encoding(
         tl.arange(0, {{ ctx["block_n"] }}),
         {{ model["FunctionName"] }}__output_layout,
     )
     local_column = tle.encoding(
-        tl.arange(0, 8)[None, :],
+        tl.arange(0, {{ ctx["mma_instruction_n"] }})[None, :],
         {{ model["FunctionName"] }}__mma_layout,
     )
     active_n = {{ dim(ctx["n"]) }}
-{% for n_batch_start in range(0, ctx["num_n_tiles"], ctx["n_tiles_per_activation_batch"]) %}
-{% set n_batch_end = [n_batch_start + ctx["n_tiles_per_activation_batch"], ctx["num_n_tiles"]] | min %}
-{% set n_batch_count = n_batch_end - n_batch_start %}
-{% for n_tile in range(n_batch_start, n_batch_end) %}
-    output_n_{{ n_tile }} = {{ n_tile * ctx["block_n"] }} + local_n
-    output_n = output_n_{{ n_tile }}
-    global_output_n_{{ n_tile }} = {{ ctx["global_output_n"] }}
-    weight_scale_n_{{ n_tile }} = global_output_n_{{ n_tile }} // {{ ctx["weight_block_n"] }}
-    result_{{ n_tile }} = tle.encoding(
-        tl.zeros(({{ ctx["block_n"] }},), tl.float32),
-        {{ model["FunctionName"] }}__output_layout,
+    runtime_num_n_tiles = {{ ctx["runtime_num_n_tiles"] }}
+{% if ctx["materialize_complete_lhs_quantization"] %}
+    stage_quantization_group = tle.encoding(
+        tl.broadcast_to(
+            tl.arange(0, {{ ctx["mma_instruction_n"] }})[:, None],
+            ({{ ctx["mma_instruction_n"] }}, {{ ctx["reduction_group"] }}),
+        ),
+        {{ model["FunctionName"] }}__activation_quantization_layout,
+    )
+    stage_input_row = tle.encoding(
+        tl.zeros(
+            ({{ ctx["mma_instruction_n"] }}, {{ ctx["reduction_group"] }}),
+            tl.int32,
+        ),
+        {{ model["FunctionName"] }}__activation_quantization_layout,
+    )
+{% if ctx["use_complete_consumer_lhs_stage"] %}
+{% for segment in ctx["lhs_copy_segments"] %}
+    input_copy_offset_{{ loop.index0 }} = tle.encoding(
+        tl.arange(0, {{ segment["extent"] }})[None, :],
+        {{ ctx["consumer_input_copy_layout_name"] }},
+    )
+    pipeline_input_copy_k = {{ segment["offset"] }} + input_copy_offset_{{ loop.index0 }}
+    tle.gpu.copy(
+        {{ access_pointer(model, "Lhs", "lhs", segment["access"]) }},
+        lhs_stage.subslice(
+            [0, {{ segment["offset"] }}],
+            [1, {{ segment["extent"] }}],
+        ),
+        [1, {{ segment["extent"] }}],
+        is_async=True,
+        eviction_policy="evict_last",
     )
 {% endfor %}
-    for k_tile_{{ n_batch_start }} in tl.range(0, {{ ctx["num_k_tiles"] }}):
-        k_tile = k_tile_{{ n_batch_start }}
-{% for group in range(ctx["reduction_groups_per_stage"]) %}
-        pipeline_offs_k = (
-            k_tile * {{ ctx["block_k"] }}
-            + {{ group * ctx["reduction_group"] }}
-            + quantization_k
+    tle.gpu.async_commit_group()
+    tle.gpu.async_wait_group(0)
+    tl.debug_barrier()
+{% endif %}
+    for quantize_group_base in tl.range(
+        0,
+        {{ ctx["logical_activation_group_count"] }},
+        {{ ctx["mma_instruction_n"] }},
+    ):
+        quantize_group = (
+            quantize_group_base + stage_quantization_group
         )
-        lhs_value_{{ group }} = tl.load(
-            {{ access_pointer(model, "Lhs", "lhs", ctx["pipeline_lhs_access"]) }}
+        quantize_group_valid = (
+            quantize_group < {{ ctx["logical_activation_group_count"] }}
+        )
+        pipeline_offs_k = (
+            quantize_group * {{ ctx["reduction_group"] }} + quantization_k
+        )
+        staged_lhs_value = tl.load(
+{% if ctx["use_complete_consumer_lhs_stage"] %}
+            tle.gpu.local_ptr(
+                lhs_stage,
+                (stage_input_row, pipeline_offs_k),
+                shape=({{ ctx["mma_instruction_n"] }}, {{ ctx["reduction_group"] }}),
+            ),
+{% else %}
+            {{ access_pointer(model, "Lhs", "lhs", ctx["pipeline_lhs_access"]) }},
+{% endif %}
+            mask=quantize_group_valid,
+            other=0.0,
         ).to(tl.float32)
-        lhs_group_scale_{{ group }} = tl.maximum(
-            tl.max(tl.abs(lhs_value_{{ group }}), axis=0) / 448.0,
+        staged_lhs_scale = tl.maximum(
+            tl.max(tl.abs(staged_lhs_value), axis=1) / 448.0,
             1.0e-12,
         )
         tl.store(
             tle.gpu.local_ptr(
                 lhs_quantized_stage,
-                ({{ group }}, quantization_k),
-                shape=({{ ctx["reduction_group"] }},),
+                (quantize_group, quantization_k),
+                shape=({{ ctx["mma_instruction_n"] }}, {{ ctx["reduction_group"] }}),
             ),
-            (lhs_value_{{ group }} / lhs_group_scale_{{ group }}).to(tl.float8e4nv),
+            (staged_lhs_value / staged_lhs_scale[:, None]).to(tl.float8e4nv),
+            mask=quantize_group_valid,
         )
         tl.store(
-            tle.gpu.local_ptr(lhs_scale_stage, ({{ group }}, 0)),
-            lhs_group_scale_{{ group }},
-        )
-{% endfor %}
-        tl.debug_barrier()
-{% for n_tile in range(n_batch_start, n_batch_end) %}
-        output_n = output_n_{{ n_tile }}
-        weight_scale_n = weight_scale_n_{{ n_tile }}
-        sequence_{{ n_tile }} = (
-            {{ n_batch_start * ctx["num_k_tiles"] }}
-            + k_tile * {{ n_batch_count }}
-            + {{ n_tile - n_batch_start }}
-        ).to(tl.int32)
-        ready_{{ n_tile }} = reader.wait(sequence_{{ n_tile }})
-{% for group in range(ctx["reduction_groups_per_stage"]) %}
-        lhs_group_scale_{{ n_tile }}_{{ group }} = tl.load(
-            tle.gpu.local_ptr(lhs_scale_stage, ({{ group }}, 0))
-        )
-        weight_scale_k = (
-            k_tile * {{ ctx["reduction_groups_per_stage"] }} + {{ group }}
-        )
-        weight_scale_value_{{ n_tile }}_{{ group }} = tl.load(
-            {{ access_pointer(model, "RhsScale", "rhs_scale", ctx["rhs_scale_access"]) }},
-            mask=output_n < active_n,
-            other=0.0,
-        ).to(tl.float32)
-{% for transfer_chunk in range(ctx["transfer_chunks_per_group"]) %}
-        quantized_k_{{ group }}_{{ transfer_chunk }} = (
-            {{ transfer_chunk * ctx["transfer_block_k"] }} + transfer_k
-        )
-        lhs_quantized_{{ group }}_{{ transfer_chunk }} = tle.encoding(
+            tle.gpu.local_ptr(
+                lhs_scale_stage,
+                (quantize_group, stage_input_row),
+                shape=({{ ctx["mma_instruction_n"] }}, {{ ctx["reduction_group"] }}),
+            ),
             tl.broadcast_to(
+                staged_lhs_scale[:, None],
+                ({{ ctx["mma_instruction_n"] }}, {{ ctx["reduction_group"] }}),
+            ),
+            mask=(
+                quantize_group_valid & (quantization_k == 0)
+            ),
+        )
+    tl.debug_barrier()
+{% endif %}
+    for n_tile in tl.range(0, runtime_num_n_tiles):
+        output_n = n_tile * {{ ctx["block_n"] }} + local_n
+        global_output_n = {{ ctx["global_output_n"] }}
+        weight_scale_n = global_output_n // {{ ctx["weight_block_n"] }}
+{% if ctx["fragment_accumulate_mma"] %}
+        result = tle.encoding(
+            tl.zeros(
+                ({{ ctx["block_n"] }}, {{ ctx["mma_instruction_n"] }}),
+                tl.float32,
+            ),
+            {{ model["FunctionName"] }}__mma_layout,
+        )
+{% else %}
+        result = tle.encoding(
+            tl.zeros(({{ ctx["block_n"] }},), tl.float32),
+            {{ model["FunctionName"] }}__output_layout,
+        )
+{% endif %}
+        for k_tile in tl.range(0, {{ ctx["num_k_tiles"] }}):
+            sequence = (
+                n_tile * {{ ctx["num_k_tiles"] }} + k_tile
+            ).to(tl.int32)
+            ready = reader.wait(sequence)
+{% for group in range(ctx["reduction_groups_per_stage"]) %}
+{% set transfer = group // ctx["reduction_groups_per_transfer"] %}
+{% set transfer_group = group % ctx["reduction_groups_per_transfer"] %}
+{% if ctx["reuse_complete_lhs_quantization"] %}
+            activation_group_{{ group }} = (
+                k_tile * {{ ctx["reduction_groups_per_stage"] }} + {{ group }}
+            )
+            lhs_group_scale_{{ group }} = tl.load(
+                tle.gpu.local_ptr(
+                    lhs_scale_stage,
+                    (activation_group_{{ group }}, 0),
+                ),
+                mask=(activation_group_{{ group }} < {{ ctx["logical_activation_group_count"] }}),
+                other=0.0,
+            )
+            lhs_quantized_{{ group }} = tle.encoding(
+                tl.trans(
+                    tl.load(
+                        tle.gpu.local_ptr(
+                            lhs_quantized_stage,
+                            (
+                                tle.encoding(
+                                    tl.broadcast_to(
+                                        activation_group_{{ group }},
+                                        ({{ ctx["mma_instruction_n"] }}, {{ ctx["reduction_group"] }}),
+                                    ),
+                                    {{ model["FunctionName"] }}__activation_quantization_layout,
+                                ),
+                                quantization_k,
+                            ),
+                            shape=({{ ctx["mma_instruction_n"] }}, {{ ctx["reduction_group"] }}),
+                        ),
+                        mask=(activation_group_{{ group }} < {{ ctx["logical_activation_group_count"] }}),
+                        other=0.0,
+                    )
+                ),
+                {{ model["FunctionName"] }}__activation_dot_layout,
+            )
+            lhs_group_scale_output_{{ group }} = tle.encoding(
+                tl.broadcast_to(
+                    lhs_group_scale_{{ group }},
+                    ({{ ctx["block_n"] }},),
+                ),
+                {{ model["FunctionName"] }}__output_layout,
+            )
+{% else %}
+            pipeline_offs_k = (
+                k_tile * {{ ctx["block_k"] }}
+                + {{ group * ctx["reduction_group"] }}
+                + quantization_k
+            )
+            lhs_value_{{ group }} = tl.load(
+                {{ access_pointer(model, "Lhs", "lhs", ctx["pipeline_lhs_access"]) }}
+            ).to(tl.float32)
+            lhs_group_scale_{{ group }} = tl.maximum(
+                tl.max(tl.abs(lhs_value_{{ group }}), axis=1) / 448.0,
+                1.0e-12,
+            )
+            lhs_quantized_{{ group }} = tle.encoding(
+                tl.trans(
+                    (
+                        lhs_value_{{ group }}
+                        / lhs_group_scale_{{ group }}[:, None]
+                    ).to(tl.float8e4nv)
+                ),
+                {{ model["FunctionName"] }}__activation_dot_layout,
+            )
+            lhs_group_scale_output_{{ group }} = tle.encoding(
+                tl.reshape(
+                    tl.broadcast_to(
+                        lhs_group_scale_{{ group }}[:, None],
+                        (
+                            {{ ctx["mma_instruction_n"] }},
+                            {{ ctx["block_n"] // ctx["mma_instruction_n"] }},
+                        ),
+                    ),
+                    ({{ ctx["block_n"] }},),
+                ),
+                {{ model["FunctionName"] }}__output_layout,
+            )
+{% endif %}
+            group = {{ group }}
+            global_k_start = {{ ctx["global_k_start"] }}
+            weight_scale_k = global_k_start // {{ ctx["weight_block_k"] }}
+            weight_scale_value_{{ group }} = tl.load(
+                {{ access_pointer(model, "RhsScale", "rhs_scale", ctx["rhs_scale_access"]) }},
+                mask=(output_n < active_n){% if ctx["reuse_complete_lhs_quantization"] %} & (activation_group_{{ group }} < {{ ctx["logical_activation_group_count"] }}){% endif %},
+                other=0.0,
+            ).to(tl.float32)
+            weight_value_{{ group }} = tle.encoding(
                 tl.load(
                     tle.gpu.local_ptr(
-                        lhs_quantized_stage,
-                        ({{ group }}, quantized_k_{{ group }}_{{ transfer_chunk }}),
-                        shape=({{ ctx["transfer_block_k"] }},),
+                        ready.slot.weight_{{ transfer }}.subslice(
+                            [{{ transfer_group }}, 0, 0],
+                            [1, {{ ctx["block_n"] }}, {{ ctx["reduction_group"] }}],
+                        )
                     )
-                )[:, None],
-                ({{ ctx["transfer_block_k"] }}, 8),
-            ),
-            {{ model["FunctionName"] }}__activation_dot_layout,
-        )
-        weight_value_{{ n_tile }}_{{ group }}_{{ transfer_chunk }} = tle.encoding(
-            tl.load(tle.gpu.local_ptr(ready_{{ n_tile }}.slot.weight_{{ group }}_{{ transfer_chunk }})),
-            {{ model["FunctionName"] }}__weight_dot_layout,
-        )
-        mma_result_{{ n_tile }}_{{ group }}_{{ transfer_chunk }} = tl.dot(
-            weight_value_{{ n_tile }}_{{ group }}_{{ transfer_chunk }},
-            lhs_quantized_{{ group }}_{{ transfer_chunk }},
-            acc=tle.encoding(
-                tl.zeros(({{ ctx["block_n"] }}, 8), tl.float32),
+                ).reshape(({{ ctx["block_n"] }}, {{ ctx["reduction_group"] }})),
+                {{ model["FunctionName"] }}__weight_dot_layout,
+            )
+            mma_result_{{ group }} = tl.dot(
+                weight_value_{{ group }},
+                lhs_quantized_{{ group }},
+                acc=tle.encoding(
+                    tl.zeros(({{ ctx["block_n"] }}, {{ ctx["mma_instruction_n"] }}), tl.float32),
+                    {{ model["FunctionName"] }}__mma_layout,
+                ),
+                out_dtype=tl.float32,
+            )
+{% if ctx["fragment_accumulate_mma"] %}
+            group_scale_{{ group }} = (
+                weight_scale_value_{{ group }}
+                * lhs_group_scale_output_{{ group }}
+            )
+            group_scale_fragment_{{ group }} = tle.encoding(
+                tl.broadcast_to(
+                    group_scale_{{ group }}[:, None],
+                    ({{ ctx["block_n"] }}, {{ ctx["mma_instruction_n"] }}),
+                ),
                 {{ model["FunctionName"] }}__mma_layout,
-            ),
-            out_dtype=tl.float32,
-        )
-        group_result_{{ n_tile }}_{{ group }}_{{ transfer_chunk }} = tle.encoding(
+            )
+            result += (
+                mma_result_{{ group }}
+                * group_scale_fragment_{{ group }}
+            )
+{% else %}
+            group_result_{{ group }} = tle.encoding(
+                tl.sum(
+                    tl.where(local_column == 0, mma_result_{{ group }}, 0.0),
+                    axis=1,
+                ),
+                {{ model["FunctionName"] }}__output_layout,
+            )
+            result += (
+                group_result_{{ group }}
+                * weight_scale_value_{{ group }}
+                * lhs_group_scale_output_{{ group }}
+            )
+{% endif %}
+{% endfor %}
+            reader.release(sequence)
+
+{% if ctx["fragment_accumulate_mma"] %}
+        result = tle.encoding(
             tl.sum(
-                tl.where(local_column == 0, mma_result_{{ n_tile }}_{{ group }}_{{ transfer_chunk }}, 0.0),
+                tl.where(local_column == 0, result, 0.0),
                 axis=1,
             ),
             {{ model["FunctionName"] }}__output_layout,
         )
-        result_{{ n_tile }} += (
-            group_result_{{ n_tile }}_{{ group }}_{{ transfer_chunk }}
-            * weight_scale_value_{{ n_tile }}_{{ group }}
-            * lhs_group_scale_{{ n_tile }}_{{ group }}
-        )
-{% endfor %}
-{% endfor %}
-        reader.release(sequence_{{ n_tile }})
-{% endfor %}
-        tl.debug_barrier()
-
-{% for n_tile in range(n_batch_start, n_batch_end) %}
-    output_n = output_n_{{ n_tile }}
-    pipeline_output_n = output_n
-    output_value_{{ n_tile }} = (result_{{ n_tile }} * {{ model["Scale"] }}).to({{ model["OutputTritonDType"] }})
+{% endif %}
+        pipeline_output_n = output_n
+        output_value = (result * {{ model["Scale"] }}).to({{ model["OutputTritonDType"] }})
 {% if model["HasAddend"] %}
-    addend_value_{{ n_tile }} = tl.load(
-        {{ access_pointer(model, "Addend", "addend", ctx["pipeline_addend_access"]) }},
-        mask={{ ctx["pipeline_output_mask"] }},
-        other=0.0,
-    )
-    output_value_{{ n_tile }} = (output_value_{{ n_tile }} + addend_value_{{ n_tile }}).to({{ model["OutputTritonDType"] }})
+        addend_value = tl.load(
+            {{ access_pointer(model, "Addend", "addend", ctx["pipeline_addend_access"]) }},
+            mask={{ ctx["pipeline_output_mask"] }},
+            other=0.0,
+        )
+        output_value = (output_value + addend_value).to({{ model["OutputTritonDType"] }})
 {% endif %}
-    tl.store(
-        {{ access_pointer(model, "Output", "output", ctx["pipeline_output_access"]) }},
-        output_value_{{ n_tile }},
-        mask={{ ctx["pipeline_output_mask"] }},
-    )
+        tl.store(
+            {{ access_pointer(model, "Output", "output", ctx["pipeline_output_access"]) }},
+            output_value,
+            mask={{ ctx["pipeline_output_mask"] }},
+        )
 {% if model["HasNormStats"] %}
-    stats_value_{{ n_tile }} = output_value_{{ n_tile }}.to(tl.float32)
-    stats_value_{{ n_tile }} = tl.where(
-        {{ ctx["pipeline_output_mask"] }},
-        stats_value_{{ n_tile }},
-        0.0,
-    )
+        stats_value = output_value.to(tl.float32)
+        stats_value = tl.where(
+            {{ ctx["pipeline_output_mask"] }},
+            stats_value,
+            0.0,
+        )
 {% if model["UseMean"] %}
-    stats_sum += tl.sum(stats_value_{{ n_tile }}, axis=None)
+        stats_sum += tl.sum(stats_value, axis=None)
 {% endif %}
-    stats_square_sum += tl.sum(stats_value_{{ n_tile }} * stats_value_{{ n_tile }}, axis=None)
+        stats_square_sum += tl.sum(stats_value * stats_value, axis=None)
 {% endif %}
-{% endfor %}
-{% endfor %}
 {% if model["HasNormStats"] %}
 {% if model["UseMean"] %}
     tl.store({{ access_pointer(model, "Stats", "stats", ctx["pipeline_stats_accesses"][0]) }}, stats_sum, mask=True)
@@ -305,6 +507,49 @@ def {{ model["FunctionName"] }}__consumer(reader, {{ helper_parameters(model) }}
 {% else %}
     tl.store({{ access_pointer(model, "Stats", "stats", ctx["pipeline_stats_accesses"][0]) }}, stats_square_sum, mask=True)
 {% endif %}
+{% endif %}
+
+
+{% if ctx["auxiliary_only"] %}
+{{ "@triton.jit(noinline=True)" if model["NoInline"] else "@triton.jit" }}
+def {{ model["FunctionName"] }}__consumer(
+    reader,
+    lhs_quantized_stage,
+    lhs_scale_stage,
+{% if ctx["use_complete_consumer_lhs_stage"] %}
+    lhs_stage,
+{% endif %}
+    auxiliary_start_writer,
+    auxiliary_done_reader,
+    {{ helper_parameters(model) }}
+):
+    auxiliary_start_writer.commit(0)
+    auxiliary_done_reader.wait(0)
+
+
+{{ "@triton.jit(noinline=True)" if model["NoInline"] else "@triton.jit" }}
+def {{ model["FunctionName"] }}__auxiliary_consumer(
+    reader,
+    auxiliary_start_reader,
+    auxiliary_done_writer,
+    lhs_quantized_stage,
+    lhs_scale_stage,
+{% if ctx["use_complete_consumer_lhs_stage"] %}
+    lhs_stage,
+{% endif %}
+    {{ helper_parameters(model) }}
+):
+    auxiliary_start_reader.wait(0)
+    {{ model["FunctionName"] }}__consumer_compute(
+        reader,
+        lhs_quantized_stage,
+        lhs_scale_stage,
+{% if ctx["use_complete_consumer_lhs_stage"] %}
+        lhs_stage,
+{% endif %}
+        {{ helper_argument_names(model) }}
+    )
+    auxiliary_done_writer.commit(0)
 {% endif %}
 
 

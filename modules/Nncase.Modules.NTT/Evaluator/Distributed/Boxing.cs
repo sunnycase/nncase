@@ -57,6 +57,12 @@ public sealed class BoxingEvaluator : ITypeInferencer<Boxing>, ICostEvaluator<Bo
                 return new InvalidType("Same DistributedType");
             }
 
+            if (outv.Partial is not null)
+            {
+                return new InvalidType(
+                    "D2D boxing cannot produce a partial value; partial outputs require an operation with explicit reduction semantics.");
+            }
+
             if (inv.AxisPolicies.Any(sbp => sbp is SBPPartial) || outv.AxisPolicies.Any(sbp => sbp is SBPPartial))
             {
                 return new InvalidType("Not Support Partial in Policeis.");

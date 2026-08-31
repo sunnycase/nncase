@@ -21,10 +21,19 @@ namespace Nncase.Passes.Transforms;
 /// </summary>
 public sealed class FusePackedMatMulNormStatsPass : FunctionPass
 {
+    private readonly bool _enablePackedMatMul;
     private readonly bool _enableBlockScaledMatMul;
 
     public FusePackedMatMulNormStatsPass(bool enableBlockScaledMatMul)
+        : this(true, enableBlockScaledMatMul)
     {
+    }
+
+    public FusePackedMatMulNormStatsPass(
+        bool enablePackedMatMul,
+        bool enableBlockScaledMatMul)
+    {
+        _enablePackedMatMul = enablePackedMatMul;
         _enableBlockScaledMatMul = enableBlockScaledMatMul;
     }
 
@@ -185,7 +194,7 @@ public sealed class FusePackedMatMulNormStatsPass : FunctionPass
 
     private bool CanFuseProducer(Op target) => target switch
     {
-        PackedMatMul { FusedReduce: false } => true,
+        PackedMatMul { FusedReduce: false } => _enablePackedMatMul,
         PackedBlockScaledMatMul => _enableBlockScaledMatMul,
         _ => false,
     };

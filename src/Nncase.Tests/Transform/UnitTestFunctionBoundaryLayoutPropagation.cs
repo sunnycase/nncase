@@ -349,6 +349,98 @@ public sealed class UnitTestFunctionBoundaryLayoutPropagation : TestClassBase
     }
 
     [Fact]
+    public async Task TestCallerOutputDemandAbsorbsPartialReductionBoxing()
+    {
+        CompileOptions.TargetOptions = new Nncase.Targets.PyNTTTargetOptions();
+        var placement = new Placement(new[] { 2, 4 }, "yx", "bb");
+        var tensorType = new TensorType(DataTypes.Float32, new RankedShape(1, 1, 1));
+        var materializedType = new DistributedType(
+            tensorType,
+            new SBP[] { SBP.B, SBP.B, SBP.B },
+            placement);
+        var partialType = materializedType with
+        {
+            Partial = SBP.P([0, 1], ReduceOp.Sum),
+        };
+
+        var layerInput = new Var("layer_input", partialType);
+        var layer = new Function("layer", layerInput, layerInput);
+        Assert.True(layer.InferenceType());
+
+        var input = new Var("input", partialType);
+        var layerCall = new Call(layer, input);
+        var main = new Function(
+            "main",
+            IR.F.Distributed.Boxing(layerCall, materializedType),
+            input);
+        Assert.True(main.InferenceType());
+
+        var module = new IRModule(main);
+        module.Add(layer);
+        await new FunctionBoundaryLayoutPropagationPass(
+            enableCallerOutputDemandLayouts: true,
+            enableInternalOutputLayouts: false).RunAsync(module, new());
+
+        var specialized = GetFunction(module, "layer");
+        Assert.Equal(materializedType, specialized.Body.CheckedType);
+        var specializedMaterialize = Assert.IsType<Call>(specialized.Body);
+        Assert.IsType<Boxing>(specializedMaterialize.Target);
+        Assert.Equal(partialType, specializedMaterialize[Boxing.Input].CheckedType);
+
+        var specializedCall = Assert.IsType<Call>(main.Body);
+        Assert.Same(specialized, specializedCall.Target);
+        Assert.Equal(materializedType, specializedCall.CheckedType);
+        Assert.DoesNotContain(
+            ExprCollector.Collect(main.Body).OfType<Call>(),
+            call => call.Target is Boxing);
+    }
+
+    [Fact]
+    public async Task TestCallerOutputDemandKeepsPartialAbiForMixedConsumers()
+    {
+        CompileOptions.TargetOptions = new Nncase.Targets.PyNTTTargetOptions();
+        var placement = new Placement(new[] { 2, 4 }, "yx", "bb");
+        var tensorType = new TensorType(DataTypes.Float32, new RankedShape(1, 1, 1));
+        var materializedType = new DistributedType(
+            tensorType,
+            new SBP[] { SBP.B, SBP.B, SBP.B },
+            placement);
+        var partialType = materializedType with
+        {
+            Partial = SBP.P([0, 1], ReduceOp.Sum),
+        };
+
+        var layerInput = new Var("layer_input", partialType);
+        var layer = new Function("layer", layerInput, layerInput);
+        Assert.True(layer.InferenceType());
+
+        var input = new Var("input", partialType);
+        var layerCall = new Call(layer, input);
+        var main = new Function(
+            "main",
+            new IR.Tuple(
+                IR.F.Distributed.Boxing(layerCall, materializedType),
+                layerCall),
+            input);
+        Assert.True(main.InferenceType());
+
+        var module = new IRModule(main);
+        module.Add(layer);
+        await new FunctionBoundaryLayoutPropagationPass(
+            enableCallerOutputDemandLayouts: true,
+            enableInternalOutputLayouts: false).RunAsync(module, new());
+
+        var unchangedLayer = GetFunction(module, "layer");
+        Assert.Equal(partialType, unchangedLayer.Body.CheckedType);
+        var output = Assert.IsType<IR.Tuple>(main.Body);
+        var materialize = Assert.IsType<Call>(output.Fields[0]);
+        Assert.IsType<Boxing>(materialize.Target);
+        Assert.Equal(partialType, materialize[Boxing.Input].CheckedType);
+        Assert.Equal(materializedType, materialize.CheckedType);
+        Assert.Equal(partialType, output.Fields[1].CheckedType);
+    }
+
+    [Fact]
     public async Task TestWrappedCallerOutputReshardDemandIsDiscovered()
     {
         CompileOptions.TargetOptions = new Nncase.Targets.PyNTTTargetOptions();

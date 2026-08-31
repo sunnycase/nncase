@@ -21,6 +21,16 @@
     alias_offset_bytes={{ stage["SharedWorkspaceOffsets"][weight ~ "_projection_stage"] }},
 )
 {% endfor %}
+{% set projection_workspace = stage["ConsumerSharedWorkspaces"][0] %}
+{{ projection_workspace["VariableName"] }} = tle.gpu.alloc(
+    [2, {{ stage_ctx["projection_capacity"] }}],
+    dtype=tl.float32,
+    layout=None,
+    scope=tle.gpu.smem,
+    alias=pyntt_shared_arena,
+    alias_offset_bytes={{ projection_workspace["SharedWorkspaceOffset"] }},
+    nv_mma_shared_layout=False,
+)
 {{ stage["PipeName"] }} = tle.pipe(
     capacity={{ stage_ctx["num_stages"] }},
     scope="cta",
@@ -31,6 +41,7 @@
 {%- endmacro %}
 {% if model is defined %}
 {% import "triton/kernels/_common.py.jinja" as common with context %}
+{% import "triton/kernels/_sum_partial.py.jinja" as partial_io with context %}
 {% set ctx = gated_delta_net_recurrent_core_context(model) %}
 {% set repeats = ctx["value_heads_per_key_head"] %}
 {% macro state_axis_offset(coordinate, axis) -%}
@@ -60,7 +71,7 @@
     tle.gpu.BlockEncoding(
         [1, 1, {{ model["KeyBlockSize"] // 32 }}],
         [1, 1, 32],
-        [8, 1, 1],
+        [{{ ctx["consumer_warps"] }}, 1, 1],
         [2, 1, 0],
     )
 )
@@ -80,7 +91,7 @@
     tle.gpu.BlockEncoding(
         [1, 1],
         [{{ ctx["state_key_threads"] }}, {{ ctx["state_value_threads"] }}],
-        [8, 1],
+        [{{ ctx["consumer_warps"] }}, 1],
         [1, 0],
     )
 )
@@ -153,17 +164,10 @@ def {{ model["FunctionName"] }}__producer(writer, {{ helper_parameters(model) }}
 
 
 {{ "@triton.jit(noinline=True)" if model["NoInline"] else "@triton.jit" }}
-def {{ model["FunctionName"] }}__consumer(reader, {{ helper_parameters(model) }}):
+def {{ model["FunctionName"] }}__consumer(
+    reader, projection_stage, {{ helper_parameters(model) }}
+):
 {{ common.mesh_coordinates(model["MeshAxes"]) }}
-    projection_stage = tle.gpu.alloc(
-        [2, {{ ctx["projection_capacity"] }}],
-        dtype=tl.float32,
-        layout=None,
-        scope=tle.gpu.smem,
-        alias=pyntt_shared_arena,
-        alias_offset_bytes={{ ctx["microkernel"]["shared_workspace_offsets"]["projection_stage"] }},
-        nv_mma_shared_layout=False,
-    )
     recurrent_state = {{ ptr(model, "RecurrentState") }}
     qkv = {{ ptr(model, "QKV") }}
     z = {{ ptr(model, "Z") }}
@@ -702,11 +706,15 @@ def {{ model["FunctionName"] }}__consumer(reader, {{ helper_parameters(model) }}
             mask=gate_active,
             other=0.0,
         )
+{% if ctx["z_partial"] %}
+{{ partial_io.load(ctx["z_partial"], "z_projection", "gate_active", "        ") }}
+{% else %}
         z_projection = tl.load(
             {{ access_pointer(model, "Z", "z", contiguous_vector_axis_access(["0", "0"], model["ZStrides"], packed_axis=1, logical_index="local_value_index", lane_count=model["ZLaneCount"])) }},
             mask=gate_active,
             other=0.0,
         ).to(tl.float32)
+{% endif %}
         scale = tl.load(
             {{ access_pointer(model, "NormWeight", "norm_weight", tensor_access(["value_lane"], model["NormWeightStrides"])) }},
             mask=gate_active,

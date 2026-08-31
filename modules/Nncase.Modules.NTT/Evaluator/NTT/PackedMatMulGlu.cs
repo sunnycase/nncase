@@ -40,6 +40,31 @@ public sealed class PackedMatMulGluEvaluator : IEvaluator<PackedMatMulGlu>, ITyp
         var upInputScale = context.CheckArgumentType<IRType>(target, PackedMatMulGlu.UpInputScale);
         var gateWeightScale = context.CheckArgumentType<IRType>(target, PackedMatMulGlu.GateWeightScale);
         var upWeightScale = context.CheckArgumentType<IRType>(target, PackedMatMulGlu.UpWeightScale);
+        return InferType(
+            target,
+            input,
+            gateWeight,
+            upWeight,
+            gateBias,
+            upBias,
+            gateInputScale,
+            upInputScale,
+            gateWeightScale,
+            upWeightScale);
+    }
+
+    public static IRType InferType(
+        PackedMatMulGlu target,
+        IRType input,
+        IRType gateWeight,
+        IRType upWeight,
+        IRType gateBias,
+        IRType upBias,
+        IRType gateInputScale,
+        IRType upInputScale,
+        IRType gateWeightScale,
+        IRType upWeightScale)
+    {
         var scaleCheck = CheckScaleContract(
             target,
             gateInputScale,
@@ -68,14 +93,19 @@ public sealed class PackedMatMulGluEvaluator : IEvaluator<PackedMatMulGlu>, ITyp
             return new InvalidType($"PackedMatMulGlu gate/up projections must have the same distributed type, got gate={gate}, up={up}.");
         }
 
-        if (RejectPartialProjection("gate", gate) is { } partialCheck)
+        if (IsPartialProjection(gate))
         {
-            return partialCheck;
-        }
+            if (gateBias is not NoneType || upBias is not NoneType)
+            {
+                return new InvalidType(
+                    "PackedMatMulGlu split-K projections cannot apply bias before their partial sums are materialized.");
+            }
 
-        if (RejectPartialProjection("up", up) is { } upPartialCheck)
-        {
-            return upPartialCheck;
+            return target.GluType switch
+            {
+                GluType.SwiGLU => new TupleType(new[] { gate, up }),
+                _ => new InvalidType($"Unsupported PackedMatMulGlu type: {target.GluType}."),
+            };
         }
 
         var biasCheck = CheckBiasType("gate", gate, gateBias) ?? CheckBiasType("up", up, upBias);
@@ -106,21 +136,44 @@ public sealed class PackedMatMulGluEvaluator : IEvaluator<PackedMatMulGlu>, ITyp
             context.GetArgumentType<IRType>(target, PackedMatMulGlu.UpWeightScale),
         };
         var output = context.GetReturnType<IRType>();
-        if (TryGetTargetCost(context, target, input, gateWeight, upWeight, output, out var targetCost))
+        var partialOutput = output as TupleType;
+        var isPartial = partialOutput is { Count: 2 };
+        var projectionOutput = isPartial ? partialOutput![0] : output;
+        if (TryGetTargetCost(
+                context,
+                target,
+                input,
+                gateWeight,
+                upWeight,
+                projectionOutput,
+                includeGlu: !isPartial,
+                out var targetCost))
         {
-            AddBiasCost(targetCost, output, gateBias, upBias);
+            if (!isPartial)
+            {
+                AddBiasCost(targetCost, output, gateBias, upBias);
+            }
+
             return targetCost;
         }
 
         var macPerElement = GetK(input);
+        var outputAccess = output is TupleType tuple
+            ? tuple.Fields.Aggregate((UInt128)0, (sum, field) => sum + CostUtility.GetMemoryAccess(field))
+            : CostUtility.GetMemoryAccess(output);
+        var outputCycles = output is TupleType outputTuple
+            ? outputTuple.Fields.Aggregate(
+                (UInt128)0,
+                (sum, field) => sum + CostUtility.GetCPUCycles(field, macPerElement))
+            : CostUtility.GetCPUCycles(output, checked((macPerElement * 2U) + 9U));
         return new()
         {
             [CostFactorNames.BlockLocalMemoryLoadBytes] = CostUtility.GetMemoryAccess(input)
                 + CostUtility.GetMemoryAccess(gateWeight) + CostUtility.GetMemoryAccess(upWeight)
                 + CostUtility.GetMemoryAccess(gateBias) + CostUtility.GetMemoryAccess(upBias)
                 + scales.Aggregate((UInt128)0, (sum, scale) => sum + CostUtility.GetMemoryAccess(scale)),
-            [CostFactorNames.BlockLocalMemoryStoreBytes] = CostUtility.GetMemoryAccess(output),
-            [CostFactorNames.CPUCycles] = CostUtility.GetCPUCycles(output, checked(macPerElement * 2U + 9U)),
+            [CostFactorNames.BlockLocalMemoryStoreBytes] = outputAccess,
+            [CostFactorNames.CPUCycles] = outputCycles,
         };
     }
 
@@ -138,6 +191,7 @@ public sealed class PackedMatMulGluEvaluator : IEvaluator<PackedMatMulGlu>, ITyp
                 target.RhsLayout,
                 weightVectorType,
                 packedWeight.Rank,
+                target.OutputDataType,
                 out var rhsUnpackAxes,
                 out var outputLanes,
                 out var transposeB,
@@ -192,7 +246,7 @@ public sealed class PackedMatMulGluEvaluator : IEvaluator<PackedMatMulGlu>, ITyp
         return result.ToTensor(new VectorType(target.OutputDataType, outputLanes));
     }
 
-    private static Tensor ApplyGlu(Tensor gate, Tensor up, GluType gluType)
+    internal static Tensor ApplyGlu(Tensor gate, Tensor up, GluType gluType)
     {
         return gluType switch
         {
@@ -228,6 +282,7 @@ public sealed class PackedMatMulGluEvaluator : IEvaluator<PackedMatMulGlu>, ITyp
                             target.RhsLayout,
                             vectorType,
                             b.TensorType.Shape.Rank,
+                            target.OutputDataType,
                             out var rhsUnpackAxes,
                             out var outputLanes,
                             out var transposeB,
@@ -256,6 +311,14 @@ public sealed class PackedMatMulGluEvaluator : IEvaluator<PackedMatMulGlu>, ITyp
                             $"weight={unpackedWeight.AxisPolicies[dimInfo.Rk]}.");
                     }
 
+                    var quantizedWeight = target.QuantizationMode == MatMulQuantizationMode.None || !transposeB
+                        ? unpackedWeight
+                        : TransposeLastTwo(unpackedWeight);
+                    if (quantizedWeight is InvalidType)
+                    {
+                        return quantizedWeight;
+                    }
+
                     var projection = target.QuantizationMode switch
                     {
                         MatMulQuantizationMode.None => Math.MatMulEvaluator.VisitDistributedType(
@@ -268,7 +331,7 @@ public sealed class PackedMatMulGluEvaluator : IEvaluator<PackedMatMulGlu>, ITyp
                         MatMulQuantizationMode.StaticTensor => ScaledMatMulEvaluator.InferType(
                             new ScaledMatMul(target.OutputDataType),
                             a,
-                            unpackedWeight,
+                            quantizedWeight,
                             inputScale,
                             weightScale),
                         MatMulQuantizationMode.DynamicBlock => BlockScaledMatMulEvaluator.InferType(
@@ -277,7 +340,7 @@ public sealed class PackedMatMulGluEvaluator : IEvaluator<PackedMatMulGlu>, ITyp
                                 target.WeightBlockN,
                                 target.WeightBlockK),
                             a,
-                            unpackedWeight,
+                            quantizedWeight,
                             weightScale),
                         _ => new InvalidType(
                             $"Unsupported PackedMatMulGlu quantization mode: {target.QuantizationMode}."),
@@ -293,6 +356,7 @@ public sealed class PackedMatMulGluEvaluator : IEvaluator<PackedMatMulGlu>, ITyp
                             target.RhsLayout,
                             vectorType,
                             b.Shape.Rank,
+                            target.OutputDataType,
                             out var rhsUnpackAxes,
                             out var outputLanes,
                             out var transposeB,
@@ -313,6 +377,14 @@ public sealed class PackedMatMulGluEvaluator : IEvaluator<PackedMatMulGlu>, ITyp
                         transposeB,
                         a.Shape.Rank,
                         unpackedWeight.Shape.Rank);
+                    var quantizedWeight = target.QuantizationMode == MatMulQuantizationMode.None || !transposeB
+                        ? unpackedWeight
+                        : TransposeLastTwo(unpackedWeight);
+                    if (quantizedWeight is InvalidType)
+                    {
+                        return quantizedWeight;
+                    }
+
                     var projection = target.QuantizationMode switch
                     {
                         MatMulQuantizationMode.None => Math.MatMulEvaluator.VisitTensorType(
@@ -324,7 +396,7 @@ public sealed class PackedMatMulGluEvaluator : IEvaluator<PackedMatMulGlu>, ITyp
                         MatMulQuantizationMode.StaticTensor => ScaledMatMulEvaluator.InferType(
                             new ScaledMatMul(target.OutputDataType),
                             a,
-                            unpackedWeight,
+                            quantizedWeight,
                             inputScale,
                             weightScale),
                         MatMulQuantizationMode.DynamicBlock => BlockScaledMatMulEvaluator.InferType(
@@ -333,7 +405,7 @@ public sealed class PackedMatMulGluEvaluator : IEvaluator<PackedMatMulGlu>, ITyp
                                 target.WeightBlockN,
                                 target.WeightBlockK),
                             a,
-                            unpackedWeight,
+                            quantizedWeight,
                             weightScale),
                         _ => new InvalidType(
                             $"Unsupported PackedMatMulGlu quantization mode: {target.QuantizationMode}."),
@@ -360,25 +432,15 @@ public sealed class PackedMatMulGluEvaluator : IEvaluator<PackedMatMulGlu>, ITyp
         _ => output,
     };
 
-    private static InvalidType? RejectPartialProjection(string name, IRType projection)
-    {
-        if (projection is DistributedType { Partial: not null } distributed)
-        {
-            return new InvalidType($"PackedMatMulGlu does not support reduction-axis sharding because SwiGLU is nonlinear; {name} projection type has partial {distributed.Partial}.");
-        }
+    private static bool IsPartialProjection(IRType projection)
+        => projection is DistributedType distributed &&
+            (distributed.Partial is not null || distributed.AxisPolicies.Any(policy => policy is SBPPartial));
 
-        if (projection is DistributedType { AxisPolicies: var policies } && policies.Any(policy => policy is SBPPartial))
-        {
-            return new InvalidType($"PackedMatMulGlu does not support partial axis policies because SwiGLU is nonlinear; {name} projection is partial.");
-        }
-
-        return null;
-    }
-
-    private static bool TryGetLayoutInfo(
+    internal static bool TryGetLayoutInfo(
         PackedMatMulRhsLayout layout,
         VectorType vectorType,
         int weightRank,
+        DataType outputDataType,
         out int[] rhsUnpackAxes,
         out int[] outputLanes,
         out bool transposeB,
@@ -398,16 +460,31 @@ public sealed class PackedMatMulGluEvaluator : IEvaluator<PackedMatMulGlu>, ITyp
                 transposeB = false;
                 errorMessage = null;
                 return true;
+            case (PackedMatMulRhsLayout.NMajorKPacked, 2)
+                when outputDataType is PrimType { SizeInBytes: > 0 }:
+                var vectorBytes = checked(
+                    vectorType.Lanes[1] * vectorType.ElemType.SizeInBytes);
+                if (vectorBytes % outputDataType.SizeInBytes != 0)
+                {
+                    break;
+                }
+
+                rhsUnpackAxes = [weightRank - 1, weightRank - 1];
+                outputLanes = [vectorBytes / outputDataType.SizeInBytes];
+                transposeB = true;
+                errorMessage = null;
+                return true;
             default:
-                rhsUnpackAxes = [];
-                outputLanes = [];
-                transposeB = false;
-                errorMessage =
-                    $"PackedMatMulGlu {layout} expects " +
-                    $"{(layout == PackedMatMulRhsLayout.NMajor ? 2 : 3)} weight vector lanes, " +
-                    $"got [{string.Join(",", vectorType.Lanes)}].";
-                return false;
+                break;
         }
+
+        rhsUnpackAxes = [];
+        outputLanes = [];
+        transposeB = false;
+        errorMessage =
+            $"PackedMatMulGlu {layout} has incompatible weight lanes " +
+            $"[{string.Join(",", vectorType.Lanes)}] and output dtype {outputDataType}.";
+        return false;
     }
 
     private static IRType UnpackType(IRType input, int[] axes) => input switch
@@ -417,7 +494,49 @@ public sealed class PackedMatMulGluEvaluator : IEvaluator<PackedMatMulGlu>, ITyp
         _ => new InvalidType($"Cannot unpack {input} with axes [{string.Join(",", axes)}]."),
     };
 
-    private static bool TryGetTargetCost(ICostEvaluateContext context, PackedMatMulGlu target, IRType input, IRType gateWeight, IRType upWeight, IRType output, out Cost cost)
+    private static IRType TransposeLastTwo(IRType input)
+    {
+        var tensor = input switch
+        {
+            TensorType tensorType => tensorType,
+            DistributedType distributedType => distributedType.TensorType,
+            _ => null,
+        };
+        if (tensor?.Shape is not RankedShape { Rank: >= 2 } shape)
+        {
+            return new InvalidType($"Cannot transpose PackedMatMulGlu logical weight type {input}.");
+        }
+
+        var permutation = Enumerable.Range(0, shape.Rank).ToArray();
+        (permutation[^2], permutation[^1]) = (permutation[^1], permutation[^2]);
+        var permutationShape = new RankedShape(
+            permutation.Select(axis => (Dimension)axis).ToArray());
+        if (TypeInference.TransposeType(tensor, permutationShape) is not TensorType transposed)
+        {
+            return new InvalidType($"Cannot transpose PackedMatMulGlu logical weight type {input}.");
+        }
+
+        return input switch
+        {
+            TensorType => transposed,
+            DistributedType distributed => new DistributedType(
+                transposed,
+                permutation.Select(axis => distributed.AxisPolicies[axis]).ToArray(),
+                distributed.Placement,
+                distributed.Partial),
+            _ => new InvalidType($"Cannot transpose PackedMatMulGlu logical weight type {input}."),
+        };
+    }
+
+    private static bool TryGetTargetCost(
+        ICostEvaluateContext context,
+        PackedMatMulGlu target,
+        IRType input,
+        IRType gateWeight,
+        IRType upWeight,
+        IRType output,
+        bool includeGlu,
+        out Cost cost)
     {
         cost = Cost.Zero;
         if (!TargetCostTensor.TryFromType(input, out var inputTensor))
@@ -426,7 +545,7 @@ public sealed class PackedMatMulGluEvaluator : IEvaluator<PackedMatMulGlu>, ITyp
         }
 
         var logicalOutput = output;
-        if (target.RhsLayout == PackedMatMulRhsLayout.KMajor)
+        if (target.RhsLayout != PackedMatMulRhsLayout.NMajor)
         {
             var outputTensorType = GetTensorType(output);
             var gateWeightTensorType = GetTensorType(gateWeight);
@@ -436,6 +555,7 @@ public sealed class PackedMatMulGluEvaluator : IEvaluator<PackedMatMulGlu>, ITyp
                     target.RhsLayout,
                     gateWeightVectorType,
                     gateWeightTensorType.Shape.Rank,
+                    target.OutputDataType,
                     out _,
                     out var outputLanes,
                     out _,
@@ -462,7 +582,7 @@ public sealed class PackedMatMulGluEvaluator : IEvaluator<PackedMatMulGlu>, ITyp
         foreach (var weight in new[] { gateWeight, upWeight })
         {
             var logicalWeight = weight;
-            if (target.RhsLayout == PackedMatMulRhsLayout.KMajor)
+            if (target.RhsLayout != PackedMatMulRhsLayout.NMajor)
             {
                 var weightTensorType = GetTensorType(weight);
                 if (weightTensorType?.DType is not VectorType vectorType ||
@@ -470,6 +590,7 @@ public sealed class PackedMatMulGluEvaluator : IEvaluator<PackedMatMulGlu>, ITyp
                         target.RhsLayout,
                         vectorType,
                         weightTensorType.Shape.Rank,
+                        target.OutputDataType,
                         out var rhsUnpackAxes,
                         out _,
                         out _,
@@ -499,11 +620,11 @@ public sealed class PackedMatMulGluEvaluator : IEvaluator<PackedMatMulGlu>, ITyp
             cost += projectionCost;
         }
 
-        if (context.TargetCostModel.TryGetElementwiseCost(new("packed_matmul_glu", [outputTensor, outputTensor], outputTensor, WorkPerElement: 9.0), out var gluCost))
+        if (includeGlu && context.TargetCostModel.TryGetElementwiseCost(new("packed_matmul_glu", [outputTensor, outputTensor], outputTensor, WorkPerElement: 9.0), out var gluCost))
         {
             cost += gluCost;
         }
-        else
+        else if (includeGlu)
         {
             AddCostFactor(cost, CostFactorNames.CPUCycles, CostUtility.GetCPUCycles(output, 9));
             AddCostFactor(cost, CostFactorNames.BlockLocalMemoryLoadBytes, CostUtility.GetMemoryAccess(output));

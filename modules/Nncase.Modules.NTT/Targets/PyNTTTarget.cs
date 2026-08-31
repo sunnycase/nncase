@@ -40,6 +40,7 @@ public sealed class PyNTTTarget : NTTTarget
         pass.Add<Passes.Rules.NTT.PackNVFP4MatMulRhsKMajor>(vectorBytes, kPack);
         pass.Add<Passes.Rules.NTT.PackNVFP4MatMulGluRhsKMajor>(vectorBytes, kPack);
         pass.Add<Passes.Rules.NTT.PackQKVParallelLinearRhsKMajor>(vectorBytes, kPack);
+        pass.Add<Passes.Rules.NTT.PackBlockScaledMatMulGluRhsNMajorKPacked>(vectorBytes, kPack);
         pass.Add<Passes.Rules.NTT.PackMatMulGluRhsKMajor>(vectorBytes, kPack);
     }
 
@@ -66,7 +67,7 @@ public sealed class PyNTTTarget : NTTTarget
             p.Add<Passes.Rules.NTT.FusePackedMatMulAdd>();
             p.Add<Passes.Rules.NTT.FusePackedBlockScaledMatMulAdd>();
         });
-        passManager.Add<FusePackedMatMulNormStatsPass>(true);
+        passManager.Add<FormPackedMatMulNormStatsCombinePass>();
     }
 
     /// <inheritdoc/>
@@ -80,6 +81,14 @@ public sealed class PyNTTTarget : NTTTarget
         passManager.AddWithName<DataflowPass>("FoldMaterializedPackedQKVParallelLinearCombine").Configure(p =>
         {
             p.Add<Passes.Rules.NTT.FoldMaterializedPackedQKVParallelLinearCombine>();
+        });
+        passManager.AddWithName<DataflowPass>("FoldMaterializedPackedMatMulGluCombine").Configure(p =>
+        {
+            p.Add<Passes.Rules.NTT.FoldMaterializedPackedMatMulGluCombine>();
+        });
+        passManager.AddWithName<DataflowPass>("LowerPackedMatMulGluCombine").Configure(p =>
+        {
+            p.Add<Passes.Rules.NTT.LowerPackedMatMulGluCombine>();
         });
         passManager.AddWithName<DataflowPass>("LowerPackedQKVParallelLinearCombine").Configure(p =>
         {
@@ -122,6 +131,7 @@ public sealed class PyNTTTarget : NTTTarget
     {
         passManager.Add<FuseGatherReduceQKVRoPEWithCachePass>(Kind);
         passManager.Add<FuseGatherReduceAddNormApplyPass>(Kind);
+        passManager.Add<ForwardGatherReduceAddNormValuesPass>(Kind);
         passManager.Add<FuseGatherReduceNormApplyPass>(Kind);
         passManager.Add<CanonicalizePackedQKVWeightsPass>(Kind);
         passManager.Add<ForwardTerminalStoreDestinationsPass>(Kind);

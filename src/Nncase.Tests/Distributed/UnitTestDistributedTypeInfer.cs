@@ -113,6 +113,21 @@ public sealed class UnitTestDistributedTypeInfer : TestClassBase
     }
 
     [Fact]
+    public void TestD2DBoxingRejectsPartialOutput()
+    {
+        var placement = new Placement([4, 8], "yx", "bb");
+        var tensorType = new TensorType(DataTypes.Float32, [1, 1, 1]);
+        var sourceType = new DistributedType(tensorType, [SBP.B, SBP.B, SBP.B], placement);
+        var targetType = sourceType with { Partial = SBP.P([0, 1], ReduceOp.Sum) };
+        var input = new Var("input", sourceType);
+
+        var boxing = IR.F.Distributed.Boxing(input, targetType);
+
+        var invalid = Assert.IsType<InvalidType>(boxing.CheckedType);
+        Assert.Contains("cannot produce a partial value", invalid.Reason, System.StringComparison.Ordinal);
+    }
+
+    [Fact]
     public void TestGenerateReduceGroups()
     {
         Assert.Single(LinqUtility.Combination(1));

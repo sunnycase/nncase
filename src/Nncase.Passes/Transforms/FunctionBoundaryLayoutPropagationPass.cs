@@ -279,6 +279,20 @@ public sealed class FunctionBoundaryLayoutPropagationPass : ModulePass
         return false;
     }
 
+    private static bool TryFoldNoOpBoxing(Call expr, out BaseExpr folded)
+    {
+        if (expr.Target is IR.Distributed.Boxing boxing
+            && expr[IR.Distributed.Boxing.Input] is Expr input
+            && Equals(input.CheckedType, boxing.NewType))
+        {
+            folded = input;
+            return true;
+        }
+
+        folded = null!;
+        return false;
+    }
+
     private sealed class ModuleLayoutPlanner
     {
         public static IReadOnlyDictionary<Function, FunctionBoundaryLayout> Plan(
@@ -434,13 +448,36 @@ public sealed class FunctionBoundaryLayoutPropagationPass : ModulePass
             foreach (var user in value.Users.OfType<Call>())
             {
                 if (BoundaryTransform.TryCreate(user, out var consumerTransform, out var input)
-                    && ReferenceEquals(input, value)
-                    && consumerTransform.TryCreateRestoreTransform(value.CheckedType, out var restoreTransform))
+                    && ReferenceEquals(input, value))
                 {
-                    outputs[outputIndex] = new PortLayout(restoreTransform, user.CheckedType, consumerTransform);
-                    return;
+                    if (consumerTransform.TryCreateRestoreTransform(value.CheckedType, out var restoreTransform))
+                    {
+                        outputs[outputIndex] = new PortLayout(restoreTransform, user.CheckedType, consumerTransform);
+                        return;
+                    }
+
+                    if (consumerTransform.IsMaterializingCollective(value.CheckedType)
+                        && AllValueConsumersMatch(value, consumerTransform))
+                    {
+                        outputs[outputIndex] = new PortLayout(
+                            consumerTransform,
+                            user.CheckedType,
+                            consumerTransform,
+                            restoreAtCaller: false);
+                        return;
+                    }
                 }
             }
+        }
+
+        private static bool AllValueConsumersMatch(BaseExpr value, BoundaryTransform expectedTransform)
+        {
+            var consumers = value.Users.Where(user => user is not BaseFunction).ToArray();
+            return consumers.Length != 0 && consumers.All(user =>
+                user is Call call
+                && BoundaryTransform.TryCreate(call, out var transform, out var input)
+                && ReferenceEquals(input, value)
+                && transform.Equals(expectedTransform));
         }
 
         private static long EstimateVariantCost(Function function, FunctionBoundaryLayout layout, FunctionLayoutSpecializer specializer)
@@ -555,6 +592,12 @@ public sealed class FunctionBoundaryLayoutPropagationPass : ModulePass
                 return folded;
             }
 
+            if (FunctionBoundaryLayoutPropagationPass.TryFoldNoOpBoxing(expr, out folded))
+            {
+                SetMutated();
+                return folded;
+            }
+
             return expr;
         }
 
@@ -594,6 +637,11 @@ public sealed class FunctionBoundaryLayoutPropagationPass : ModulePass
         protected override BaseExpr RewriteLeafCall(Call expr)
         {
             if (TryFoldPackUnpack(expr, out var folded))
+            {
+                return folded;
+            }
+
+            if (FunctionBoundaryLayoutPropagationPass.TryFoldNoOpBoxing(expr, out folded))
             {
                 return folded;
             }
@@ -671,6 +719,11 @@ public sealed class FunctionBoundaryLayoutPropagationPass : ModulePass
             if (rawCall.CheckedType is not TupleType)
             {
                 var outputLayout = layout.Outputs[0] ?? throw new InvalidOperationException("Single-output call has no output layout to wrap.");
+                if (!outputLayout.RestoreAtCaller)
+                {
+                    return rawCall;
+                }
+
                 return MakeBoundaryTransform(
                     rawCall,
                     outputLayout.Transform,
@@ -683,7 +736,7 @@ public sealed class FunctionBoundaryLayoutPropagationPass : ModulePass
             {
                 BaseExpr field = IR.F.Tensors.GetItem(rawCall, i);
                 Infer(field, $"tuple field {i} from {rawCall.Target}");
-                if (layout.Outputs[i] is { } outputLayout)
+                if (layout.Outputs[i] is { RestoreAtCaller: true } outputLayout)
                 {
                     if (field is not Expr fieldExpr)
                     {
@@ -985,7 +1038,7 @@ public sealed class FunctionBoundaryLayoutPropagationPass : ModulePass
 
         public bool HasOutputLayout => Outputs.Any(x => x is not null);
 
-        public int AdapterTransformCount => Inputs.Count(input => input is not null) + Outputs.Count(output => output is not null);
+        public int AdapterTransformCount => Inputs.Count(input => input is not null) + Outputs.Count(output => output is { RestoreAtCaller: true });
 
         public static FunctionBoundaryLayout Identity(Function function)
         {
@@ -1193,11 +1246,16 @@ public sealed class FunctionBoundaryLayoutPropagationPass : ModulePass
 
     private sealed class PortLayout : IEquatable<PortLayout>
     {
-        public PortLayout(BoundaryTransform transform, IRType transformedType, BoundaryTransform? sourceTransform = null)
+        public PortLayout(
+            BoundaryTransform transform,
+            IRType transformedType,
+            BoundaryTransform? sourceTransform = null,
+            bool restoreAtCaller = true)
         {
             Transform = transform;
             TransformedType = transformedType;
             SourceTransform = sourceTransform;
+            RestoreAtCaller = restoreAtCaller;
         }
 
         public BoundaryTransform Transform { get; }
@@ -1206,23 +1264,28 @@ public sealed class FunctionBoundaryLayoutPropagationPass : ModulePass
 
         public BoundaryTransform? SourceTransform { get; }
 
+        public bool RestoreAtCaller { get; }
+
         public bool Equals(PortLayout? other)
         {
             return other is not null
                 && Transform.Equals(other.Transform)
                 && Equals(TransformedType, other.TransformedType)
-                && Equals(SourceTransform, other.SourceTransform);
+                && Equals(SourceTransform, other.SourceTransform)
+                && RestoreAtCaller == other.RestoreAtCaller;
         }
 
         public override bool Equals(object? obj) => Equals(obj as PortLayout);
 
-        public override int GetHashCode() => HashCode.Combine(Transform, TransformedType, SourceTransform);
+        public override int GetHashCode() => HashCode.Combine(Transform, TransformedType, SourceTransform, RestoreAtCaller);
 
         public override string ToString()
         {
             return SourceTransform is null
                 ? $"{Transform}->{TransformedType}"
-                : $"{SourceTransform}=>{TransformedType}; restore {Transform}";
+                : RestoreAtCaller
+                    ? $"{SourceTransform}=>{TransformedType}; restore {Transform}"
+                    : $"{SourceTransform}=>{TransformedType}; direct";
         }
     }
 
@@ -1444,11 +1507,20 @@ public sealed class FunctionBoundaryLayoutPropagationPass : ModulePass
                 BoundaryTransformKind.Unpack => new BoundaryTransform(BoundaryTransformKind.Pack, lanes: Lanes, axes: Axes),
                 BoundaryTransformKind.Transpose => Transpose(InvertPerm(Perm)),
                 BoundaryTransformKind.Bitcast => BitcastToType(originalType),
-                BoundaryTransformKind.Boxing => BoxingToType(originalType),
+                BoundaryTransformKind.Boxing when CanProduceBoxingTarget(originalType) => BoxingToType(originalType),
                 _ => null!,
             };
 
             return restoreTransform is not null;
+        }
+
+        public bool IsMaterializingCollective(IRType sourceType)
+        {
+            return Kind is BoundaryTransformKind.Boxing
+                && sourceType is DistributedType sourceDistributed
+                && HasPartial(sourceDistributed)
+                && NewIRType is { } targetType
+                && CanProduceBoxingTarget(targetType);
         }
 
         public bool Equals(BoundaryTransform? other)
@@ -1502,6 +1574,19 @@ public sealed class FunctionBoundaryLayoutPropagationPass : ModulePass
                 _ => Kind.ToString(),
             };
         }
+
+        private static bool CanProduceBoxingTarget(IRType type)
+            => type switch
+            {
+                TensorType => true,
+                DistributedType distributed => distributed.Partial is null &&
+                    distributed.AxisPolicies.All(policy => policy is not SBPPartial),
+                TupleType tuple => tuple.Fields.All(CanProduceBoxingTarget),
+                _ => false,
+            };
+
+        private static bool HasPartial(DistributedType type)
+            => type.Partial is not null || type.AxisPolicies.Any(policy => policy is SBPPartial);
 
         private static bool TryGetFixedPerm(BaseExpr expr, out int[] perm)
         {

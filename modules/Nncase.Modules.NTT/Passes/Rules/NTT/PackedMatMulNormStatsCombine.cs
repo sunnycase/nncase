@@ -30,9 +30,8 @@ public sealed partial class LowerMaterializedPackedMatMulNormStatsCombine : IRew
         Expr input,
         Expr addend)
     {
-        if (input is not Call { Target: PackedMatMul packed } packedCall ||
+        if (input is not Call packedCall ||
             input.CheckedType is DistributedType { Partial: not null } ||
-            packedCall[PackedMatMul.Addend].CheckedType is not NoneType ||
             combineCall.CheckedType is not TupleType { Count: 2 } output ||
             !Equals(input.CheckedType, output[0]) ||
             !Equals(addend.CheckedType, output[0]))
@@ -40,15 +39,34 @@ public sealed partial class LowerMaterializedPackedMatMulNormStatsCombine : IRew
             return null;
         }
 
-        return IR.F.NTT.PackedMatMulNormStats(
-                (Expr)packedCall[PackedMatMul.Lhs],
-                (Expr)packedCall[PackedMatMul.Rhs],
-                packed.OutputDataType,
-                packed.RhsLayout,
-                combine.Axis,
-                combine.UseMean,
-                (Expr)packedCall[PackedMatMul.Scale],
-                addend)
-            .InheritMetaData(combineCall);
+        return packedCall.Target switch
+        {
+            PackedMatMul packed
+                when packedCall[PackedMatMul.Addend].CheckedType is NoneType =>
+                IR.F.NTT.PackedMatMulNormStats(
+                    (Expr)packedCall[PackedMatMul.Lhs],
+                    (Expr)packedCall[PackedMatMul.Rhs],
+                    packed.OutputDataType,
+                    packed.RhsLayout,
+                    combine.Axis,
+                    combine.UseMean,
+                    (Expr)packedCall[PackedMatMul.Scale],
+                    addend).InheritMetaData(combineCall),
+            PackedBlockScaledMatMul packed
+                when packedCall[PackedBlockScaledMatMul.Addend].CheckedType is NoneType =>
+                IR.F.NTT.PackedBlockScaledMatMulNormStats(
+                    (Expr)packedCall[PackedBlockScaledMatMul.Lhs],
+                    (Expr)packedCall[PackedBlockScaledMatMul.Rhs],
+                    (Expr)packedCall[PackedBlockScaledMatMul.RhsScale],
+                    packed.OutputDataType,
+                    packed.WeightBlockN,
+                    packed.WeightBlockK,
+                    packed.RhsLayout,
+                    packed.OutputNVectorLaneCount,
+                    combine.Axis,
+                    combine.UseMean,
+                    addend).InheritMetaData(combineCall),
+            _ => null,
+        };
     }
 }

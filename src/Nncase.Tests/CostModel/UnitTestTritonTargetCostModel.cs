@@ -127,6 +127,64 @@ public sealed class UnitTestTritonTargetCostModel : TestClassBase
     }
 
     [Fact]
+    public void TestPersistentMmaGemvAccountsForWarpTileUnderfill()
+    {
+        var costModel = new TritonTargetOpCostModel(CreateGpuMachine(supportsAsyncTransfer: true));
+        var directLhs = new TargetCostTensor(
+            DataTypes.BFloat16,
+            new RankedShape(1, 6144));
+        var directRhs = new TargetCostTensor(
+            DataTypes.Float8E4M3,
+            new RankedShape(6144, 40));
+        var directOutput = new TargetCostTensor(
+            DataTypes.BFloat16,
+            new RankedShape(1, 40));
+        var splitLhs = new TargetCostTensor(
+            DataTypes.BFloat16,
+            new RankedShape(1, 768));
+        var splitRhs = new TargetCostTensor(
+            DataTypes.Float8E4M3,
+            new RankedShape(768, 320));
+        var splitOutput = new TargetCostTensor(
+            DataTypes.BFloat16,
+            new RankedShape(1, 320));
+
+        Assert.True(costModel.TryGetMatMulCost(
+            new(
+                directLhs,
+                directRhs,
+                directOutput,
+                DataTypes.BFloat16,
+                MatMulOpCostKind.Mma,
+                LhsComputeDataType: DataTypes.Float8E4M3,
+                RhsComputeDataType: DataTypes.Float8E4M3,
+                PipelineProfile: new(
+                    MatMulLhsPreparationKind.DynamicBlockQuantization,
+                    128)),
+            out var directCost));
+        Assert.True(costModel.TryGetMatMulCost(
+            new(
+                splitLhs,
+                splitRhs,
+                splitOutput,
+                DataTypes.BFloat16,
+                MatMulOpCostKind.Mma,
+                LhsComputeDataType: DataTypes.Float8E4M3,
+                RhsComputeDataType: DataTypes.Float8E4M3,
+                PipelineProfile: new(
+                    MatMulLhsPreparationKind.DynamicBlockQuantization,
+                    128)),
+            out var splitCost));
+
+        Assert.True(
+            splitCost[CostFactorNames.CPUCycles] <
+            directCost[CostFactorNames.CPUCycles]);
+        Assert.True(
+            splitCost[CostFactorNames.BlockLocalMemoryLoadBytes] <
+            directCost[CostFactorNames.BlockLocalMemoryLoadBytes]);
+    }
+
+    [Fact]
     public async Task TestAutoVectorizeExtractsVectorizedMatMul()
     {
         CompileOptions.TargetOptions = CreateOptions(CreateGpuMachine(rootBytesPerCycle: 174));
@@ -478,7 +536,7 @@ public sealed class UnitTestTritonTargetCostModel : TestClassBase
         var h800Shared = h800.TilingMemorySpaces.Single(space => space.TIRBinding?.Location == MemoryLocation.Shared);
         Assert.Equal(227 * 1024, h800Shared.MaxAllocationBytesPerScope);
         Assert.Equal(TargetMemoryAllocationSizePolicy.GranularityAligned, h800Shared.AllocationSizePolicy);
-        Assert.Equal(195 * 1024, h800.GetMaximumUsableAllocationBytes(h800Shared));
+        Assert.Equal(219 * 1024, h800.GetMaximumUsableAllocationBytes(h800Shared));
         Assert.Equal(192 * 1024, h800.GetAllocationSizeBytes(h800Shared, 192 * 1024));
         Assert.Equal(227 * 1024, h800.GetMemoryResource(h800Shared).CapacityBytes);
         Assert.Equal(
@@ -581,7 +639,7 @@ public sealed class UnitTestTritonTargetCostModel : TestClassBase
         Assert.Equal(0, registerMma.IsLegal.Var().Max());
         Assert.Contains(register.Resources, usage => usage.Resource == NTTTargetMachineCatalog.GpuRegisterFile);
         Assert.Equal(
-            (2048 / machine.Execution.WorkerWidth) *
+            2048 / machine.Execution.WorkerWidth *
                 machine.Execution.ThreadsPerBlock * DataTypes.Float32.SizeInBytes,
             register.Resources.Single(usage =>
                 usage.Resource == NTTTargetMachineCatalog.GpuBackendSharedMemory).Units.Var().Min());
@@ -1171,14 +1229,15 @@ public sealed class UnitTestTritonTargetCostModel : TestClassBase
         double wgmmaInstructionsPerCycle = 1,
         double matrixDependencyLatencyCycles = 16,
         double matrixReciprocalThroughputCycles = 8,
-        long gridSynchronizationCycles = 2200)
+        long gridSynchronizationCycles = 2200,
+        bool supportsAsyncTransfer = false)
     {
         var sharedResource = new TargetMemoryResourceId("test.shared-memory");
         var globalResource = new TargetMemoryResourceId("test.global-memory");
         var shared = new TargetMemorySpaceId("test.shared");
         var blockGlobal = new TargetMemorySpaceId("test.block-global");
         var global = new TargetMemorySpaceId("test.global");
-        var operandTypes = ImmutableArray.Create<DataType>(DataTypes.Float16, DataTypes.BFloat16, DataTypes.Float32, DataTypes.Int8);
+        var operandTypes = ImmutableArray.Create<DataType>(DataTypes.Float16, DataTypes.BFloat16, DataTypes.Float8E4M3, DataTypes.Float32, DataTypes.Int8);
         return new TargetMachineModel(
             "test-gpu",
             new(BlockExecutionKind.PersistentGpuBlock, 128, 1, 8, 32, 1.0, 128, 4),
@@ -1233,7 +1292,15 @@ public sealed class UnitTestTritonTargetCostModel : TestClassBase
             [
                 new(global, blockGlobal, rootBytesPerCycle, 0, TargetMemoryTransferMode.DirectAccess),
                 new(blockGlobal, global, rootBytesPerCycle, 0, TargetMemoryTransferMode.DirectAccess),
-                new(blockGlobal, shared, blockBytesPerCycle, 300, TargetMemoryTransferMode.ExplicitCopy),
+                new(
+                    blockGlobal,
+                    shared,
+                    blockBytesPerCycle,
+                    300,
+                    TargetMemoryTransferMode.ExplicitCopy,
+                    Asynchronous: supportsAsyncTransfer
+                        ? new TargetAsynchronousTransferSpec([2, 3, 4], 1, 1, 16 * 1024)
+                        : null),
                 new(shared, blockGlobal, blockBytesPerCycle, 300, TargetMemoryTransferMode.ExplicitCopy),
             ]);
     }

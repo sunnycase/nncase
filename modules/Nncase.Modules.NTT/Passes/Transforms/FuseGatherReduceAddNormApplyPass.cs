@@ -112,6 +112,7 @@ public sealed class FuseGatherReduceAddNormApplyPass : ModulePass
                 gatherArguments[4] is not TIR.Buffer statsOutput ||
                 normArguments[0] is not TIR.Buffer normInput ||
                 normArguments[1] is not TIR.Buffer normStats ||
+                normArguments[4] is not TIR.Buffer { DistributedType: { Partial: null } normOutputType } ||
                 !ReferenceEquals(valueOutput.MemSpan.Buffer, normInput.MemSpan.Buffer) ||
                 !ReferenceEquals(statsOutput.MemSpan.Buffer, normStats.MemSpan.Buffer) ||
                 !_useCounts.TryGetValue(statsOutput.MemSpan.Buffer, out var statsUseCount) ||
@@ -133,6 +134,7 @@ public sealed class FuseGatherReduceAddNormApplyPass : ModulePass
                     (Expr)normArguments[4],
                     gather.InType,
                     gather.OutType,
+                    normOutputType,
                     gather.Axis,
                     norm.Epsilon,
                     gather.UseMean)

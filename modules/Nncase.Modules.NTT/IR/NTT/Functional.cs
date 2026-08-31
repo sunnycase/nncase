@@ -342,6 +342,9 @@ public partial class NTT
     public static Expr PackedQKVParallelLinearCombine(Expr qkv, IRType outputType)
         => new Call(new PackedQKVParallelLinearCombine(outputType), qkv);
 
+    public static Expr PackedMatMulGluCombine(Expr projections, IRType outputType, IR.NN.GluType gluType)
+        => new Call(new PackedMatMulGluCombine(outputType, gluType), projections);
+
     public static Expr PackedMatMulGlu(
         Expr input,
         Expr gateWeight,

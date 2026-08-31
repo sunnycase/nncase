@@ -1088,7 +1088,14 @@ internal sealed class PyNTTKernelSourceConvertVisitor : ExprFunctor<Unit, Unit>
                     state.PipeStages.ToArray(),
                     state.Handoffs.ToArray(),
                     state.ProducerEndpointNames.ToArray(),
-                    state.ConsumerEndpointNames.ToArray());
+                    state.ConsumerEndpointNames.ToArray())
+                {
+                    AuxiliaryConsumerFunctionName = state.HasAuxiliaryConsumer
+                        ? $"{helperName}__auxiliary_consumer"
+                        : null,
+                    AuxiliaryConsumerBodySource = state.AuxiliaryConsumerBodySource,
+                    AuxiliaryConsumerEndpointNames = state.AuxiliaryConsumerEndpointNames.ToArray(),
+                };
                 WriteHelperTemplate(
                     "triton/kernels/_producer_consumer_region.py.jinja",
                     templateModel,
@@ -1176,7 +1183,9 @@ internal sealed class PyNTTKernelSourceConvertVisitor : ExprFunctor<Unit, Unit>
                 .GetStage(expr.StageId);
             var endpoints = _pipelineRole switch
             {
-                PipelineExecutionRole.Consumer => stage.ConsumerDrainEndpointNames,
+                PipelineExecutionRole.Consumer => stage.ConsumerDrainEndpointNames
+                    .Where(name => !stage.AuxiliaryConsumerDrainEndpointNames.Contains(name))
+                    .ToArray(),
                 PipelineExecutionRole.Producer => stage.ProducerDrainEndpointNames,
                 _ => throw new InvalidOperationException(
                     $"Pipeline drain {expr.StageId} was visited outside a producer or consumer role."),
@@ -1772,6 +1781,15 @@ internal sealed class PyNTTKernelSourceConvertVisitor : ExprFunctor<Unit, Unit>
                 .ConsumerSharedWorkspaceIndices
                 .Select(index => selection.SharedWorkspaces[index].Name)
                 .ToArray() ?? Array.Empty<string>();
+            var auxiliaryConsumer = selection.TransferPipeline?.AuxiliaryConsumer is { } auxiliary
+                ? new PyNTTAuxiliaryConsumerTemplateModel(
+                    auxiliary.ChannelIndices
+                        .Select(index => transferChannels[index].Name)
+                        .ToArray(),
+                    auxiliary.ConsumerSharedWorkspaceIndices
+                        .Select(index => selection.SharedWorkspaces[index].Name)
+                        .ToArray())
+                : null;
             return new(
                 selection.Family,
                 selection.Variant,
@@ -1779,7 +1797,8 @@ internal sealed class PyNTTKernelSourceConvertVisitor : ExprFunctor<Unit, Unit>
                 offsets,
                 shapes,
                 transferChannels,
-                consumerSharedWorkspaceNames);
+                consumerSharedWorkspaceNames,
+                auxiliaryConsumer);
         }
 
         private long GetFixedSharedWorkspaceOffsetBytes(
@@ -3778,7 +3797,10 @@ internal sealed class PyNTTKernelSourceConvertVisitor : ExprFunctor<Unit, Unit>
 
             if (gatherReduceScatter.OutType.Partial is not null)
             {
-                throw new NotSupportedException("PyNTT GatherReduceScatter cannot materialize a partial output; partial reduction must be carried by the input type.");
+                throw new NotSupportedException(
+                    $"PyNTT GatherReduceScatter in {_currentFunction.Name} cannot materialize a partial output; " +
+                    $"partial reduction must be carried by the input type. Input={gatherReduceScatter.InType}, " +
+                    $"output={gatherReduceScatter.OutType}.");
             }
 
             var partialAxes = Array.Empty<int>();
@@ -6374,13 +6396,12 @@ internal sealed class PyNTTKernelSourceConvertVisitor : ExprFunctor<Unit, Unit>
             IReadOnlyList<BaseExpr> args,
             PyNTTMicroKernelTemplateModel microKernel)
         {
-            if (args.Count < 10 ||
+            if (args.Count != 12 ||
                 args[0] is not TIR.Buffer input ||
                 args[1] is not TIR.Buffer gateWeight ||
-                args[2] is not TIR.Buffer upWeight ||
-                args[9] is not TIR.Buffer output)
+                args[2] is not TIR.Buffer upWeight)
             {
-                throw new NotSupportedException("PyNTT PackedMatMulGlu codegen expects input, packed gate/up weights, optional packed gate/up bias and scale values, and packed output TIR buffers.");
+                throw new NotSupportedException("PyNTT PackedMatMulGlu codegen expects input, packed gate/up weights, optional packed gate/up bias and scale values, and direct or gate/up partial output TIR buffers.");
             }
 
             TIR.Buffer? GetOptionalBuffer(int index, string name) => args[index] switch
@@ -6396,6 +6417,27 @@ internal sealed class PyNTTKernelSourceConvertVisitor : ExprFunctor<Unit, Unit>
             var upInputScale = GetOptionalBuffer(6, "up input scale");
             var gateWeightScale = GetOptionalBuffer(7, "gate weight scale");
             var upWeightScale = GetOptionalBuffer(8, "up weight scale");
+            var gateOutput = GetOptionalBuffer(9, "gate output");
+            var upOutput = GetOptionalBuffer(10, "up output");
+            var directOutput = GetOptionalBuffer(11, "output");
+            var output = matMulGlu.EmitPartialResults ? gateOutput : directOutput;
+            if (output is null ||
+                (matMulGlu.EmitPartialResults
+                    ? upOutput is null || directOutput is not null
+                    : gateOutput is not null || upOutput is not null))
+            {
+                throw new NotSupportedException(
+                    "PyNTT PackedMatMulGlu direct mode requires only output, while split-K mode requires only gate/up outputs.");
+            }
+
+            if (matMulGlu.EmitPartialResults &&
+                (microKernel.Family != "triton.matmul_glu" ||
+                 microKernel.Variant != "mma_n_major_block_fp8_smem_pipeline"))
+            {
+                throw new NotSupportedException(
+                    "PyNTT PackedMatMulGlu split-K currently requires the selected N-major block-FP8 MMA pipeline.");
+            }
+
             var inputScales = new[]
             {
                 gateInputScale,
@@ -6462,10 +6504,25 @@ internal sealed class PyNTTKernelSourceConvertVisitor : ExprFunctor<Unit, Unit>
             var gateBiasShape = gateBias is null ? Array.Empty<PyNTTDimExpression>() : GetBufferActiveShape(gateBias);
             var upBiasShape = upBias is null ? Array.Empty<PyNTTDimExpression>() : GetBufferActiveShape(upBias);
             var outputShape = GetBufferActiveShape(output);
+            var upOutputShape = upOutput is null
+                ? Array.Empty<PyNTTDimExpression>()
+                : GetBufferActiveShape(upOutput);
             ValidateMinimumRank("PyNTT PackedMatMulGlu input", inputShape, 2);
             ValidateMinimumRank("PyNTT PackedMatMulGlu gate weight", gateWeightShape, 2);
             ValidateMinimumRank("PyNTT PackedMatMulGlu up weight", upWeightShape, 2);
             ValidateMinimumRank("PyNTT PackedMatMulGlu output", outputShape, 2);
+            if (upOutput is not null)
+            {
+                ValidateSameShape(
+                    "PyNTT PackedMatMulGlu split-K outputs",
+                    outputShape,
+                    upOutputShape);
+                if (output.ElemType != upOutput.ElemType)
+                {
+                    throw new NotSupportedException(
+                        $"PyNTT PackedMatMulGlu split-K outputs must have the same dtype, got {output.ElemType}/{upOutput.ElemType}.");
+                }
+            }
 
             var inputVectorLanes = GetVectorLanes(input.ElemType);
             if (inputVectorLanes.Length != 0)
@@ -6491,8 +6548,14 @@ internal sealed class PyNTTKernelSourceConvertVisitor : ExprFunctor<Unit, Unit>
                 }
             }
 
-            ValidatePackedMatMulGluProjectionShape("gate", matMulGlu.RhsLayout, gateWeightLanes, inputShape, gateWeightShape, outputShape);
-            ValidatePackedMatMulGluProjectionShape("up", matMulGlu.RhsLayout, upWeightLanes, inputShape, upWeightShape, outputShape);
+            if (matMulGlu.EmitPartialResults && (gateBias is not null || upBias is not null))
+            {
+                throw new NotSupportedException(
+                    "PyNTT PackedMatMulGlu split-K cannot apply bias before materialization.");
+            }
+
+            ValidatePackedMatMulGluProjectionShape("gate", matMulGlu.RhsLayout, gateWeightLanes, outputLanes, inputShape, gateWeightShape, outputShape);
+            ValidatePackedMatMulGluProjectionShape("up", matMulGlu.RhsLayout, upWeightLanes, outputLanes, inputShape, upWeightShape, outputShape);
             ValidateMatMulGluBiasShape("gate", gateBiasShape, outputShape);
             ValidateMatMulGluBiasShape("up", upBiasShape, outputShape);
             ValidateBroadcastable("PyNTT PackedMatMulGlu input/output batch", inputShape[..^2], outputShape[..^2]);
@@ -6526,20 +6589,31 @@ internal sealed class PyNTTKernelSourceConvertVisitor : ExprFunctor<Unit, Unit>
             {
                 Nncase.IR.NTT.PackedMatMulRhsLayout.NMajor => "n_major",
                 Nncase.IR.NTT.PackedMatMulRhsLayout.KMajor => "k_major",
+                Nncase.IR.NTT.PackedMatMulRhsLayout.NMajorKPacked => "n_major_k_packed",
                 _ => throw new NotSupportedException($"PyNTT PackedMatMulGlu does not support RHS layout {matMulGlu.RhsLayout}."),
             };
             var nPackedLaneCount = matMulGlu.RhsLayout == Nncase.IR.NTT.PackedMatMulRhsLayout.NMajor
                 ? gateWeightLanes[0]
                 : 1;
-            var nVectorLaneCount = matMulGlu.RhsLayout == Nncase.IR.NTT.PackedMatMulRhsLayout.NMajor
-                ? gateWeightLanes[1]
-                : gateWeightLanes[0];
-            var kPackedLaneCount = matMulGlu.RhsLayout == Nncase.IR.NTT.PackedMatMulRhsLayout.KMajor
-                ? gateWeightLanes[1]
-                : 1;
-            var kVectorLaneCount = matMulGlu.RhsLayout == Nncase.IR.NTT.PackedMatMulRhsLayout.KMajor
-                ? gateWeightLanes[2]
-                : 1;
+            var nVectorLaneCount = matMulGlu.RhsLayout switch
+            {
+                Nncase.IR.NTT.PackedMatMulRhsLayout.NMajor => gateWeightLanes[1],
+                Nncase.IR.NTT.PackedMatMulRhsLayout.KMajor => gateWeightLanes[0],
+                Nncase.IR.NTT.PackedMatMulRhsLayout.NMajorKPacked => outputLanes[0],
+                _ => throw new NotSupportedException(),
+            };
+            var kPackedLaneCount = matMulGlu.RhsLayout switch
+            {
+                Nncase.IR.NTT.PackedMatMulRhsLayout.KMajor => gateWeightLanes[1],
+                Nncase.IR.NTT.PackedMatMulRhsLayout.NMajorKPacked => gateWeightLanes[0],
+                _ => 1,
+            };
+            var kVectorLaneCount = matMulGlu.RhsLayout switch
+            {
+                Nncase.IR.NTT.PackedMatMulRhsLayout.KMajor => gateWeightLanes[2],
+                Nncase.IR.NTT.PackedMatMulRhsLayout.NMajorKPacked => gateWeightLanes[1],
+                _ => 1,
+            };
             _attrs["op"] = "packed_matmul_glu";
             _attrs["dtype"] = GetPyNTTScalarDTypeName(output.ElemType);
             _attrs["has_bias"] = gateBias is not null || upBias is not null;
@@ -6567,7 +6641,9 @@ internal sealed class PyNTTKernelSourceConvertVisitor : ExprFunctor<Unit, Unit>
                 microKernel.Family == "triton.matmul_glu" &&
                 microKernel.Variant is "simt_fma_smem_pipeline" or
                     "simt_fp8_fma_smem_pipeline" or
-                    "simt_block_fp8_fma_smem_pipeline";
+                    "simt_block_fp8_fma_smem_pipeline" or
+                    "mma_block_fp8_smem_pipeline" or
+                    "mma_n_major_block_fp8_smem_pipeline";
             var gateWeightDescriptor = usesHostWeightDescriptors
                 ? RegisterHostTensorDescriptor(gateWeight, $"{helperName}__gate_weight_descriptor")
                 : null;
@@ -6648,6 +6724,15 @@ internal sealed class PyNTTKernelSourceConvertVisitor : ExprFunctor<Unit, Unit>
                 GateWeightDescriptorOriginElements = gateWeightDescriptor?.OriginElements ?? "0",
                 UpWeightDescriptorName = upWeightDescriptor?.Name,
                 UpWeightDescriptorOriginElements = upWeightDescriptor?.OriginElements ?? "0",
+                EmitPartialResults = matMulGlu.EmitPartialResults,
+                UpOutput = upOutput is null ? null : GetBufferScalarPointer(upOutput),
+                UpOutputShape = upOutputShape,
+                UpOutputStrides = upOutput is null
+                    ? Array.Empty<PyNTTDimExpression>()
+                    : GetBufferStrides(upOutput),
+                UpOutputGlobalOffsets = upOutput is null
+                    ? Array.Empty<PyNTTDimExpression>()
+                    : GetBufferGlobalOffsets(upOutput),
             };
 
             WriteSelectedMicroKernelHelper(
@@ -6760,22 +6845,29 @@ internal sealed class PyNTTKernelSourceConvertVisitor : ExprFunctor<Unit, Unit>
             {
                 Nncase.IR.NTT.PackedMatMulRhsLayout.NMajor => 2,
                 Nncase.IR.NTT.PackedMatMulRhsLayout.KMajor => 3,
+                Nncase.IR.NTT.PackedMatMulRhsLayout.NMajorKPacked => 2,
                 _ => throw new NotSupportedException($"PyNTT PackedMatMulGlu does not support RHS layout {rhsLayout}."),
             };
             if (weightLanes.Count != expectedWeightLaneCount)
             {
                 var expected = rhsLayout == Nncase.IR.NTT.PackedMatMulRhsLayout.NMajor
                     ? "[NPack,NVector]"
-                    : "[NVector,KPack,KVector]";
+                    : rhsLayout == Nncase.IR.NTT.PackedMatMulRhsLayout.KMajor
+                        ? "[NVector,KPack,KVector]"
+                        : "[KPack,KVector]";
                 throw new NotSupportedException($"PyNTT PackedMatMulGlu expects {name} {rhsLayout} weight lanes {expected}, got [{string.Join(",", weightLanes)}].");
             }
 
-            var expectedOutputLanes = rhsLayout == Nncase.IR.NTT.PackedMatMulRhsLayout.NMajor
-                ? weightLanes
-                : weightLanes.Take(1);
-            if (!expectedOutputLanes.SequenceEqual(outputLanes))
+            var outputMatches = rhsLayout switch
             {
-                throw new NotSupportedException($"PyNTT PackedMatMulGlu expects {name} output lanes [{string.Join(",", expectedOutputLanes)}], got [{string.Join(",", outputLanes)}].");
+                Nncase.IR.NTT.PackedMatMulRhsLayout.NMajor => weightLanes.SequenceEqual(outputLanes),
+                Nncase.IR.NTT.PackedMatMulRhsLayout.KMajor => weightLanes.Take(1).SequenceEqual(outputLanes),
+                Nncase.IR.NTT.PackedMatMulRhsLayout.NMajorKPacked => outputLanes.Count == 1,
+                _ => false,
+            };
+            if (!outputMatches)
+            {
+                throw new NotSupportedException($"PyNTT PackedMatMulGlu {name} {rhsLayout} output lanes are incompatible with weight lanes [{string.Join(",", weightLanes)}], got [{string.Join(",", outputLanes)}].");
             }
         }
 
@@ -6783,6 +6875,7 @@ internal sealed class PyNTTKernelSourceConvertVisitor : ExprFunctor<Unit, Unit>
             string name,
             Nncase.IR.NTT.PackedMatMulRhsLayout rhsLayout,
             IReadOnlyList<int> weightLanes,
+            IReadOnlyList<int> outputLanes,
             PyNTTDimExpression[] inputShape,
             PyNTTDimExpression[] weightShape,
             PyNTTDimExpression[] outputShape)
@@ -6795,18 +6888,30 @@ internal sealed class PyNTTKernelSourceConvertVisitor : ExprFunctor<Unit, Unit>
                 Nncase.IR.NTT.PackedMatMulRhsLayout.KMajor => MultiplyDim(
                     weightShape[^2],
                     checked(weightLanes[1] * weightLanes[2])),
+                Nncase.IR.NTT.PackedMatMulRhsLayout.NMajorKPacked => MultiplyDim(
+                    weightShape[^1],
+                    checked(weightLanes[0] * weightLanes[1])),
                 _ => throw new NotSupportedException($"PyNTT PackedMatMulGlu does not support RHS layout {rhsLayout}."),
             };
-            var weightN = rhsLayout == Nncase.IR.NTT.PackedMatMulRhsLayout.NMajor
-                ? weightShape[^2]
-                : weightShape[^1];
+            var weightN = rhsLayout switch
+            {
+                Nncase.IR.NTT.PackedMatMulRhsLayout.NMajor => weightShape[^2],
+                Nncase.IR.NTT.PackedMatMulRhsLayout.KMajor => weightShape[^1],
+                Nncase.IR.NTT.PackedMatMulRhsLayout.NMajorKPacked => weightShape[^2],
+                _ => throw new NotSupportedException(),
+            };
+            var outputN = rhsLayout == Nncase.IR.NTT.PackedMatMulRhsLayout.NMajorKPacked
+                ? MultiplyDim(outputShape[^1], outputLanes[0])
+                : outputShape[^1];
             if (!SameDim(inputK, weightK) ||
                 !SameDim(outputShape[^2], inputM) ||
-                !SameDim(outputShape[^1], weightN))
+                !SameDim(outputN, weightN))
             {
                 var expectedWeight = rhsLayout == Nncase.IR.NTT.PackedMatMulRhsLayout.NMajor
                     ? "weight=[...,N,K]<NPack,NVector>, output=[...,M,N]<NPack,NVector>"
-                    : "weight=[...,K,N]<NVector,KPack,KVector>, output=[...,M,N]<NVector>";
+                    : rhsLayout == Nncase.IR.NTT.PackedMatMulRhsLayout.KMajor
+                        ? "weight=[...,K,N]<NVector,KPack,KVector>, output=[...,M,N]<NVector>"
+                        : "weight=[...,N,K]<KPack,KVector>, output=[...,M,N]<NVector>";
                 throw new NotSupportedException($"PyNTT PackedMatMulGlu {name} projection expects input=[...,M,K], {expectedWeight}, got input=[{ShapeText(inputShape)}], weight=[{ShapeText(weightShape)}], output=[{ShapeText(outputShape)}].");
             }
         }
@@ -7170,12 +7275,41 @@ internal sealed class PyNTTKernelSourceConvertVisitor : ExprFunctor<Unit, Unit>
                 microKernel.TransferPipelineChannels,
                 microKernel.ConsumerSharedWorkspaceNames,
                 microKernel.SharedWorkspaceOffsets);
+            var consumerEndpoints = stage.PipeStages
+                .Select(pipeStage => pipeStage.ReaderName)
+                .Concat(stage.ConsumerSharedWorkspaceNames)
+                .ToArray();
+            if (microKernel.AuxiliaryConsumer is { } auxiliaryConsumer)
+            {
+                var binding = _activePipelineRegion.BindAuxiliaryConsumer(
+                    stage,
+                    auxiliaryConsumer);
+                WriteLine(
+                    BuildHelperRoleCall(
+                        helperName,
+                        "consumer",
+                        consumerEndpoints.Concat(binding.PrimaryConsumerEndpointNames),
+                        recordMetadata: true));
+                _activePipelineRegion.AppendAuxiliaryConsumerLine(
+                    BuildHelperRoleCall(
+                        helperName,
+                        "auxiliary_consumer",
+                        binding.AuxiliaryConsumerEndpointNames,
+                        recordMetadata: false));
+                foreach (var endpoint in binding.DrainEndpointNames)
+                {
+                    _activePipelineRegion.AppendAuxiliaryConsumerLine(
+                        $"{endpoint}.pipe.wait_drained()");
+                }
+
+                return;
+            }
+
             WriteLine(
                 BuildHelperRoleCall(
                     helperName,
                     "consumer",
-                    stage.PipeStages.Select(pipeStage => pipeStage.ReaderName)
-                        .Concat(stage.ConsumerSharedWorkspaceNames),
+                    consumerEndpoints,
                     recordMetadata: true));
         }
 
@@ -7200,6 +7334,8 @@ internal sealed class PyNTTKernelSourceConvertVisitor : ExprFunctor<Unit, Unit>
                 ("triton.matmul_glu", "simt_fma_smem_pipeline") => "triton/kernels/matmul_glu/simt_fma_smem_pipeline.py.jinja",
                 ("triton.matmul_glu", "simt_fp8_fma_smem_pipeline") => "triton/kernels/matmul_glu/simt_fp8_fma_smem_pipeline.py.jinja",
                 ("triton.matmul_glu", "simt_block_fp8_fma_smem_pipeline") => "triton/kernels/matmul_glu/simt_block_fp8_fma_smem_pipeline.py.jinja",
+                ("triton.matmul_glu", "mma_block_fp8_smem_pipeline") => "triton/kernels/matmul_glu/mma_block_fp8_smem_pipeline.py.jinja",
+                ("triton.matmul_glu", "mma_n_major_block_fp8_smem_pipeline") => "triton/kernels/matmul_glu/mma_n_major_block_fp8_smem_pipeline.py.jinja",
                 ("triton.matmul_glu", "mma") => "triton/kernels/matmul_glu/mma.py.jinja",
                 ("triton.nvfp4_matmul_glu", "mma_tma_smem_pipeline") => "triton/kernels/nvfp4_matmul_glu/mma_tma_smem_pipeline.py.jinja",
                 ("triton.gated_delta_net", "convolution") =>
@@ -7681,7 +7817,12 @@ internal sealed class PyNTTKernelSourceConvertVisitor : ExprFunctor<Unit, Unit>
                 op.InType,
                 op.OutType,
                 context);
-            ValidateGatherReduceAddNormValueBuffers(context, collective, addend, valueOutput);
+            ValidateGatherReduceAddNormValueBuffers(
+                context,
+                collective,
+                addend,
+                valueOutput,
+                op.OutType);
             var normStats = BuildNormStatsTemplateModel(
                 helperName,
                 valueOutput,
@@ -7694,6 +7835,7 @@ internal sealed class PyNTTKernelSourceConvertVisitor : ExprFunctor<Unit, Unit>
                 reshard,
                 addend,
                 normStats,
+                statsOutput,
                 null,
                 op.UseMean,
                 context);
@@ -7728,7 +7870,12 @@ internal sealed class PyNTTKernelSourceConvertVisitor : ExprFunctor<Unit, Unit>
                 op.InType,
                 op.OutType,
                 context);
-            ValidateGatherReduceAddNormValueBuffers(context, collective, addend, valueOutput);
+            ValidateGatherReduceAddNormValueBuffers(
+                context,
+                collective,
+                addend,
+                valueOutput,
+                op.OutType);
             var normStats = BuildNormStatsTemplateModel(
                 helperName,
                 valueOutput,
@@ -7746,12 +7893,14 @@ internal sealed class PyNTTKernelSourceConvertVisitor : ExprFunctor<Unit, Unit>
                 scale,
                 bias,
                 normOutput,
-                context);
+                context,
+                op.NormOutputType);
             WriteGatherReduceAddNormHelper(
                 helperName,
                 reshard,
                 addend,
                 normStats,
+                statsWorkspace,
                 normApply,
                 op.UseMean,
                 context);
@@ -7764,6 +7913,7 @@ internal sealed class PyNTTKernelSourceConvertVisitor : ExprFunctor<Unit, Unit>
             PyNTTReshardTemplateModel reshard,
             TIR.Buffer addend,
             PyNTTNormStatsTemplateModel normStats,
+            TIR.Buffer statsBuffer,
             PyNTTNormApplyTemplateModel? normApply,
             bool useMean,
             string context)
@@ -7791,6 +7941,8 @@ internal sealed class PyNTTKernelSourceConvertVisitor : ExprFunctor<Unit, Unit>
                     reshard,
                     GetBufferScalarPointer(addend),
                     normStats,
+                    GetPooledByteAddressTemplateModel(
+                        ResolveByteAddressedBufferRef(statsBuffer)),
                     normApply,
                     context));
             WriteHelperInvocation(helperName);
@@ -7840,13 +7992,22 @@ internal sealed class PyNTTKernelSourceConvertVisitor : ExprFunctor<Unit, Unit>
             string context,
             TIR.Buffer collective,
             TIR.Buffer addend,
-            TIR.Buffer valueOutput)
+            TIR.Buffer valueOutput,
+            DistributedType outputType)
         {
-            var collectiveShape = collective.DistributedStorageKind == DistributedBufferStorageKind.CanonicalGlobal
-                ? GetBufferGlobalShape(collective)
-                : GetBufferActiveShape(collective);
-            ValidateSameShape($"{context} collective/addend", collectiveShape, GetBufferActiveShape(addend));
-            ValidateSameShape($"{context} collective/value", collectiveShape, GetBufferActiveShape(valueOutput));
+            var collectiveShape = GetBufferGlobalShape(collective);
+            var globalOutputShape = GetDistributedGlobalShape(outputType, $"{context} output");
+            var localOutputType = DistributedUtility.GetDividedTensorType(
+                outputType,
+                DistributedUtility.DivideFlags.MaxShape);
+            var localOutputShape = GetRankedShapeDimensions(
+                    localOutputType.Shape,
+                    $"{context} local output")
+                .Select(GetDimensionExpression)
+                .ToArray();
+            ValidateSameShape($"{context} collective/output", collectiveShape, globalOutputShape);
+            ValidateSameShape($"{context} addend/output", GetBufferActiveShape(addend), localOutputShape);
+            ValidateSameShape($"{context} value/output", GetBufferActiveShape(valueOutput), localOutputShape);
             ValidateSameShape($"{context} collective/addend strides", GetBufferStrides(collective), GetBufferStrides(addend));
             ValidateSameShape($"{context} collective/value strides", GetBufferStrides(collective), GetBufferStrides(valueOutput));
             var dtypes = new[] { collective, addend, valueOutput }
@@ -7979,44 +8140,81 @@ internal sealed class PyNTTKernelSourceConvertVisitor : ExprFunctor<Unit, Unit>
             TIR.Buffer scale,
             TIR.Buffer bias,
             TIR.Buffer output,
-            string context)
+            string context,
+            DistributedType? semanticOutputType = null)
         {
             var inputShape = GetBufferActiveShape(input);
             var inputGlobalShape = GetBufferGlobalShape(input);
+            var outputGlobalShape = GetBufferGlobalShape(output);
             var statsShape = GetBufferActiveShape(stats);
             var scaleShape = GetBufferActiveShape(scale);
             var biasShape = GetBufferActiveShape(bias);
             var outputShape = GetBufferActiveShape(output);
-            var normalizedAxis = NormalizeAxis(axis, outputShape.Length, context);
             var inputVectorLaneCount = GetSingleVectorLaneCount(input.ElemType, $"{context} input");
             var statsVectorLaneCount = GetSingleVectorLaneCount(stats.ElemType, $"{context} stats");
             var scaleVectorLaneCount = GetSingleVectorLaneCount(scale.ElemType, $"{context} scale");
             var biasVectorLaneCount = GetSingleVectorLaneCount(bias.ElemType, $"{context} bias");
             var outputVectorLaneCount = GetSingleVectorLaneCount(output.ElemType, $"{context} output");
+            var resultDataType = semanticOutputType?.TensorType.DType ?? output.ElemType;
+            var resultVectorLaneCount = GetSingleVectorLaneCount(resultDataType, $"{context} semantic output");
             if (statsVectorLaneCount != 1)
             {
                 throw new NotSupportedException($"{context} expects scalar stats buffer dtype.");
             }
 
-            if (new[] { inputVectorLaneCount, scaleVectorLaneCount, biasVectorLaneCount, outputVectorLaneCount }.Distinct().Count() != 1)
+            if (new[] { inputVectorLaneCount, scaleVectorLaneCount, biasVectorLaneCount, resultVectorLaneCount }.Distinct().Count() != 1)
             {
-                throw new NotSupportedException($"{context} expects matching input/scale/bias/output vector lanes, got input={inputVectorLaneCount}, scale={scaleVectorLaneCount}, bias={biasVectorLaneCount}, output={outputVectorLaneCount}.");
+                throw new NotSupportedException($"{context} expects matching input/scale/bias/semantic-output vector lanes, got input={inputVectorLaneCount}, scale={scaleVectorLaneCount}, bias={biasVectorLaneCount}, semantic_output={resultVectorLaneCount}.");
             }
 
-            if (inputVectorLaneCount != 1 && normalizedAxis > outputShape.Length - 1)
+            var requiresCooperativeOwnerDirect =
+                GetScalarDataType(resultDataType) != GetScalarDataType(output.ElemType) ||
+                resultVectorLaneCount != outputVectorLaneCount;
+            if (requiresCooperativeOwnerDirect && semanticOutputType is null)
+            {
+                throw new NotSupportedException(
+                    $"{context} cannot repack or cast its output without a semantic distributed output contract.");
+            }
+
+            var semanticOutputShape = semanticOutputType is null
+                ? outputShape
+                : GetRankedShapeDimensions(
+                        DistributedUtility.GetDividedTensorType(
+                            semanticOutputType,
+                            DistributedUtility.DivideFlags.MaxShape).Shape,
+                        $"{context} semantic local output")
+                    .Select(GetDimensionExpression)
+                    .ToArray();
+            var semanticOutputGlobalShape = semanticOutputType is null
+                ? outputGlobalShape
+                : GetDistributedGlobalShape(semanticOutputType, $"{context} semantic global output");
+            var normalizedAxis = NormalizeAxis(axis, semanticOutputShape.Length, context);
+            if (inputVectorLaneCount != 1 && normalizedAxis > semanticOutputShape.Length - 1)
             {
                 throw new NotSupportedException($"{context} vectorized axis must be inside the normalized dimensions.");
             }
 
             var logicalInputShape = GetLogicalVectorShape(inputShape, inputVectorLaneCount);
+            var logicalInputGlobalShape = GetLogicalVectorShape(inputGlobalShape, inputVectorLaneCount);
             var logicalStatsShape = GetLogicalVectorShape(statsShape, statsVectorLaneCount);
             var logicalScaleShape = GetLogicalVectorShape(scaleShape, scaleVectorLaneCount);
             var logicalBiasShape = GetLogicalVectorShape(biasShape, biasVectorLaneCount);
-            var logicalOutputShape = GetLogicalVectorShape(outputShape, outputVectorLaneCount);
-            ValidateSameShape(context, logicalInputShape, logicalOutputShape);
-            ValidateNormStatsShape($"{context} stats", logicalOutputShape, logicalStatsShape, normalizedAxis, useMean);
-            ValidateLayerNormShape($"{context} scale", logicalScaleShape, logicalOutputShape, normalizedAxis);
-            ValidateLayerNormShape($"{context} bias", logicalBiasShape, logicalOutputShape, normalizedAxis);
+            var logicalOutputGlobalShape = GetLogicalVectorShape(outputGlobalShape, outputVectorLaneCount);
+            var logicalSemanticOutputShape = GetLogicalVectorShape(semanticOutputShape, resultVectorLaneCount);
+            var logicalSemanticOutputGlobalShape = GetLogicalVectorShape(semanticOutputGlobalShape, resultVectorLaneCount);
+            ValidateSameShape($"{context} logical input/semantic output", logicalInputGlobalShape, logicalSemanticOutputGlobalShape);
+            ValidateSameShape($"{context} logical physical/semantic output", logicalOutputGlobalShape, logicalSemanticOutputGlobalShape);
+            var inputUsesOutputGlobalCoordinates =
+                logicalInputShape.Length != logicalSemanticOutputShape.Length ||
+                logicalInputShape.Zip(logicalSemanticOutputShape).Any(pair => !SameDim(pair.First, pair.Second));
+            if (inputUsesOutputGlobalCoordinates)
+            {
+                ValidateSameShape($"{context} replicated input", logicalInputShape, logicalInputGlobalShape);
+            }
+
+            ValidateNormStatsShape($"{context} stats", logicalSemanticOutputShape, logicalStatsShape, normalizedAxis, useMean);
+            ValidateLayerNormShape($"{context} scale", logicalScaleShape, logicalSemanticOutputShape, normalizedAxis);
+            ValidateLayerNormShape($"{context} bias", logicalBiasShape, logicalSemanticOutputShape, normalizedAxis);
             return new PyNTTNormApplyTemplateModel(
                 helperName,
                 GetBufferScalarPointer(input),
@@ -8034,6 +8232,8 @@ internal sealed class PyNTTKernelSourceConvertVisitor : ExprFunctor<Unit, Unit>
                 GetScalarTritonDType(scale.ElemType),
                 GetScalarTritonDType(bias.ElemType),
                 GetScalarTritonDType(output.ElemType),
+                GetPyNTTScalarDTypeName(resultDataType),
+                GetScalarTritonDType(resultDataType),
                 inputShape,
                 inputGlobalShape,
                 statsShape,
@@ -8045,6 +8245,7 @@ internal sealed class PyNTTKernelSourceConvertVisitor : ExprFunctor<Unit, Unit>
                 GetBufferStrides(scale),
                 GetBufferStrides(bias),
                 GetBufferStrides(output),
+                inputUsesOutputGlobalCoordinates,
                 inputVectorLaneCount,
                 statsVectorLaneCount,
                 scaleVectorLaneCount,
@@ -8058,6 +8259,7 @@ internal sealed class PyNTTKernelSourceConvertVisitor : ExprFunctor<Unit, Unit>
                 normalizedAxis,
                 epsilon,
                 useMean,
+                requiresCooperativeOwnerDirect,
                 $"{input.Name}, {stats.Name}, {scale.Name}, {bias.Name} -> {output.Name}");
         }
 
@@ -8229,9 +8431,9 @@ internal sealed class PyNTTKernelSourceConvertVisitor : ExprFunctor<Unit, Unit>
                 fused.KUseMean,
                 fused.QKVLayout,
                 fused.AttentionLayout,
-                BuildQKVPartialInputTemplateModel(qPartial, fused.QInType, "Q"),
-                BuildQKVPartialInputTemplateModel(kPartial, fused.KInType, "K"),
-                BuildQKVPartialInputTemplateModel(vPartial, fused.VInType, "V"),
+                BuildSumPartialInputTemplateModel(qPartial, fused.QInType, "GatherReduceQKVRoPEWithCache Q"),
+                BuildSumPartialInputTemplateModel(kPartial, fused.KInType, "GatherReduceQKVRoPEWithCache K"),
+                BuildSumPartialInputTemplateModel(vPartial, fused.VInType, "GatherReduceQKVRoPEWithCache V"),
                 "gather_reduce_qkv_rope_with_cache");
         }
 
@@ -8250,32 +8452,32 @@ internal sealed class PyNTTKernelSourceConvertVisitor : ExprFunctor<Unit, Unit>
                 combinedType,
                 distributedStorageKind: DistributedBufferStorageKind.CanonicalGlobal);
 
-        private PyNTTQKVPartialInputTemplateModel BuildQKVPartialInputTemplateModel(
+        private PyNTTSumPartialInputTemplateModel BuildSumPartialInputTemplateModel(
             TIR.Buffer input,
             DistributedType inType,
-            string field)
+            string context)
         {
             if (inType.Partial is not { Op: ReduceOp.Sum } partial || partial.Axes.Count == 0)
             {
                 throw new NotSupportedException(
-                    $"PyNTT GatherReduceQKVRoPEWithCache {field} input must carry a non-empty Sum partial reduction.");
+                    $"PyNTT {context} input must carry a non-empty Sum partial reduction.");
             }
 
             if (input.DistributedStorageKind != DistributedBufferStorageKind.CompactPerOwner ||
                 !IsCompactPerOwnerBacking(input.MemSpan.Buffer))
             {
                 throw new NotSupportedException(
-                    $"PyNTT GatherReduceQKVRoPEWithCache {field} input must use compact per-owner storage.");
+                    $"PyNTT {context} input must use compact per-owner storage.");
             }
 
             var address = ResolveByteAddressedBufferRef(input);
             if (IsZeroOffset(address.PoolStrideBytes))
             {
                 throw new NotSupportedException(
-                    $"PyNTT GatherReduceQKVRoPEWithCache {field} input requires distinct per-owner storage.");
+                    $"PyNTT {context} input requires distinct per-owner storage.");
             }
 
-            return new PyNTTQKVPartialInputTemplateModel(
+            return new PyNTTSumPartialInputTemplateModel(
                 GetPooledByteAddressTemplateModel(address),
                 GetScalarElementSizeBytes(input.ElemType),
                 GetPyNTTScalarDTypeName(input.ElemType),
@@ -8303,9 +8505,9 @@ internal sealed class PyNTTKernelSourceConvertVisitor : ExprFunctor<Unit, Unit>
             bool kUseMean,
             IRArray<AttentionDimKind> qkvLayout,
             IRArray<AttentionDimKind> attentionLayout,
-            PyNTTQKVPartialInputTemplateModel? qPartial,
-            PyNTTQKVPartialInputTemplateModel? kPartial,
-            PyNTTQKVPartialInputTemplateModel? vPartial,
+            PyNTTSumPartialInputTemplateModel? qPartial,
+            PyNTTSumPartialInputTemplateModel? kPartial,
+            PyNTTSumPartialInputTemplateModel? vPartial,
             string opName)
         {
             var qScale = GetBufferOperand(args[3], "PyNTT QKVRoPEWithCache Q scale");
@@ -8682,7 +8884,7 @@ internal sealed class PyNTTKernelSourceConvertVisitor : ExprFunctor<Unit, Unit>
             _attrs["split_count"] = pagedAttention.SplitCount;
             _attrs["direct_context_threshold"] = pagedAttention.DirectContextThreshold;
             var queryShape = GetBufferShape(query);
-            var queryGlobalShape = GetBufferGlobalShape(query);
+            _ = GetBufferGlobalShape(query);
             var queryStrides = GetBufferStrides(query);
             var queryVectorLanes = GetVectorLanes(query.ElemType);
             var templateModel = new PyNTTPagedAttentionPartialTemplateModel(
@@ -9379,11 +9581,17 @@ internal sealed class PyNTTKernelSourceConvertVisitor : ExprFunctor<Unit, Unit>
             }
 
             var laneCount = GetVectorLaneProduct(expectedLanes);
+            var qkvPartial = qkv.DistributedType?.Partial is null
+                ? null
+                : BuildSumPartialInputTemplateModel(
+                    qkv,
+                    qkv.DistributedType,
+                    "GatedDeltaNetConvolution QKV");
             var localPackedConvDim = RequireFixedDim(
-                GetBufferShape(qkv)[1],
+                GetBufferShape(qkvOutput)[1],
                 "PyNTT GatedDeltaNetConvolution local packed convolution-channel capacity");
             var localConvDim = checked(localPackedConvDim * laneCount);
-            var activeLocalPackedConvDim = GetBufferActiveShape(qkv)[1];
+            var activeLocalPackedConvDim = GetBufferActiveShape(qkvOutput)[1];
             if (activeLocalPackedConvDim.MinValue is not { } activeConvMin ||
                 activeLocalPackedConvDim.MaxValue is not { } activeConvMax ||
                 activeConvMin < 0 ||
@@ -9396,7 +9604,22 @@ internal sealed class PyNTTKernelSourceConvertVisitor : ExprFunctor<Unit, Unit>
                     $"[{activeLocalPackedConvDim.MinValue}, {activeLocalPackedConvDim.MaxValue}].");
             }
 
-            ValidateFixedShape(GetBufferShape(qkv), new long[] { 1, localPackedConvDim }, "PyNTT GatedDeltaNetConvolution QKV");
+            if (qkvPartial is null)
+            {
+                ValidateFixedShape(GetBufferShape(qkv), new long[] { 1, localPackedConvDim }, "PyNTT GatedDeltaNetConvolution QKV");
+            }
+            else
+            {
+                ValidateFixedShape(
+                    GetBufferGlobalShape(qkv),
+                    new long[]
+                    {
+                        1,
+                        stateConfig.GetDimension(GatedDeltaNetStateDimKind.ConvChannels) / laneCount,
+                    },
+                    "PyNTT GatedDeltaNetConvolution partial QKV global shape");
+            }
+
             ValidateFixedShape(GetBufferShape(convWeight), new long[] { localConvDim, convolution.ConvKernelSize }, "PyNTT GatedDeltaNetConvolution convolution weight");
             ValidateFixedShape(GetBufferShape(qkvOutput), new long[] { 1, localPackedConvDim }, "PyNTT GatedDeltaNetConvolution QKV output");
             if (stateConfig.ConvKernelSize != convolution.ConvKernelSize)
@@ -9425,6 +9648,7 @@ internal sealed class PyNTTKernelSourceConvertVisitor : ExprFunctor<Unit, Unit>
             var templateModel = new PyNTTGatedDeltaNetConvolutionTemplateModel(
                     helperName,
                     GetBufferScalarPointer(qkv),
+                    qkvPartial,
                     new PyNTTBufferPointerTemplateModel(
                         GetGatedDeltaNetStateFieldArgument(
                             args[1],
@@ -9551,7 +9775,24 @@ internal sealed class PyNTTKernelSourceConvertVisitor : ExprFunctor<Unit, Unit>
             }
 
             ValidateFixedShape(GetBufferShape(qkv), new long[] { 1, convDim / qkvLaneCount }, "PyNTT GatedDeltaNetRecurrentCore QKV");
-            ValidateFixedShape(GetBufferShape(z), new long[] { 1, localValueCapacity / zLaneCount }, "PyNTT GatedDeltaNetRecurrentCore Z");
+            var zPartial = z.DistributedType?.Partial is null
+                ? null
+                : BuildSumPartialInputTemplateModel(
+                    z,
+                    z.DistributedType,
+                    "GatedDeltaNetRecurrentCore Z");
+            if (zPartial is null)
+            {
+                ValidateFixedShape(GetBufferShape(z), new long[] { 1, localValueCapacity / zLaneCount }, "PyNTT GatedDeltaNetRecurrentCore Z");
+            }
+            else
+            {
+                ValidateFixedShape(
+                    GetBufferGlobalShape(z),
+                    new long[] { 1, valueDim / zLaneCount },
+                    "PyNTT GatedDeltaNetRecurrentCore partial Z global shape");
+            }
+
             ValidateFixedShape(GetBufferShape(projectionInput), new long[] { 1, hiddenSize / projectionInputLaneCount }, "PyNTT GatedDeltaNetRecurrentCore projection input");
             ValidateFixedShape(GetBufferShape(bWeight), new long[] { recurrentCore.NumValueHeads, hiddenSize }, "PyNTT GatedDeltaNetRecurrentCore B weight");
             ValidateFixedShape(GetBufferShape(aWeight), new long[] { recurrentCore.NumValueHeads, hiddenSize }, "PyNTT GatedDeltaNetRecurrentCore A weight");
@@ -9645,6 +9886,7 @@ internal sealed class PyNTTKernelSourceConvertVisitor : ExprFunctor<Unit, Unit>
                             stateConfig)),
                     GetBufferScalarPointer(qkv),
                     GetBufferScalarPointer(z),
+                    zPartial,
                     GetBufferScalarPointer(projectionInput),
                     GetBufferScalarPointer(bWeight),
                     GetBufferScalarPointer(aWeight),
@@ -9702,6 +9944,7 @@ internal sealed class PyNTTKernelSourceConvertVisitor : ExprFunctor<Unit, Unit>
             {
                 _attrs["requires_grid_barrier"] = true;
             }
+
             WriteSelectedMicroKernelHelper(microKernel, templateModel, helperName);
             MarkStoredOutput(gatedOutput, "PyNTT GatedDeltaNetRecurrentCore");
         }
@@ -13512,10 +13755,15 @@ internal sealed class PyNTTKernelSourceConvertVisitor : ExprFunctor<Unit, Unit>
         private sealed class PipelineRegionCodegenState
         {
             private readonly IReadOnlyList<PipelineStageCodegenState> _stageOrder;
-            private readonly IReadOnlyList<PipelineHandoffCodegenState> _handoffOrder;
+            private readonly List<PipelineHandoffCodegenState> _handoffOrder;
             private readonly IReadOnlyDictionary<string, PipelineStageCodegenState> _stages;
-            private readonly IReadOnlyDictionary<string, PipelineHandoffCodegenState> _handoffs;
+            private readonly Dictionary<string, PipelineHandoffCodegenState> _handoffs;
+            private readonly IReadOnlySet<string> _semanticHandoffIds;
             private readonly IReadOnlySet<string> _drainedStageIds;
+            private readonly List<string> _primaryAuxiliaryConsumerEndpointNames = new();
+            private readonly List<string> _auxiliaryConsumerBody = new();
+            private readonly List<string> _auxiliaryConsumerEndpointNames = new();
+            private readonly HashSet<string> _auxiliaryConsumerEndpointNameSet = new(StringComparer.Ordinal);
 
             public PipelineRegionCodegenState(
                 IEnumerable<PipelineStageCodegenState> stages,
@@ -13523,15 +13771,17 @@ internal sealed class PyNTTKernelSourceConvertVisitor : ExprFunctor<Unit, Unit>
                 IReadOnlySet<string> drainedStageIds)
             {
                 _stageOrder = stages.ToArray();
-                _handoffOrder = handoffs.ToArray();
+                _handoffOrder = handoffs.ToList();
                 _stages = ToUniqueDictionary(
                     _stageOrder,
                     stage => stage.StageId,
                     "pipeline stage");
-                _handoffs = ToUniqueDictionary(
+                _handoffs = new Dictionary<string, PipelineHandoffCodegenState>(
+                    ToUniqueDictionary(
                     _handoffOrder,
                     handoff => handoff.HandoffId,
-                    "pipeline handoff");
+                    "pipeline handoff"), StringComparer.Ordinal);
+                _semanticHandoffIds = _handoffs.Keys.ToHashSet(StringComparer.Ordinal);
                 _drainedStageIds = drainedStageIds;
             }
 
@@ -13551,13 +13801,26 @@ internal sealed class PyNTTKernelSourceConvertVisitor : ExprFunctor<Unit, Unit>
                     .Concat(PipeStages
                         .SelectMany(stage => stage.ConsumerSharedWorkspaces)
                         .Select(workspace => workspace.VariableName))
-                    .Concat(Handoffs.Select(handoff => handoff.WriterName))
+                    .Concat(_handoffOrder
+                        .Where(handoff => _semanticHandoffIds.Contains(handoff.HandoffId))
+                        .Select(handoff => handoff.WriterName))
+                    .Concat(_primaryAuxiliaryConsumerEndpointNames)
                     .ToArray();
 
             public IReadOnlyList<string> ProducerEndpointNames
                 => PipeStages.Select(stage => stage.WriterName)
-                    .Concat(Handoffs.Select(handoff => handoff.ReaderName))
+                    .Concat(_handoffOrder
+                        .Where(handoff => _semanticHandoffIds.Contains(handoff.HandoffId))
+                        .Select(handoff => handoff.ReaderName))
                     .ToArray();
+
+            public bool HasAuxiliaryConsumer => _auxiliaryConsumerBody.Count != 0;
+
+            public string AuxiliaryConsumerBodySource
+                => string.Join(Environment.NewLine, _auxiliaryConsumerBody);
+
+            public IReadOnlyList<string> AuxiliaryConsumerEndpointNames
+                => _auxiliaryConsumerEndpointNames;
 
             public IReadOnlyList<string> ConsumerDrainEndpointNames
                 => _stageOrder
@@ -13582,6 +13845,84 @@ internal sealed class PyNTTKernelSourceConvertVisitor : ExprFunctor<Unit, Unit>
                     ? handoff
                     : throw new InvalidOperationException(
                         $"Producer/consumer region references unknown pipeline handoff {handoffId}.");
+
+            public AuxiliaryConsumerBinding BindAuxiliaryConsumer(
+                PipelineStageCodegenState stage,
+                PyNTTAuxiliaryConsumerTemplateModel contract)
+            {
+                var selectedChannels = contract.TransferPipelineChannelNames
+                    .Select(name => stage.PipeStages.SingleOrDefault(pipeStage =>
+                        string.Equals(pipeStage.ChannelName, name, StringComparison.Ordinal))
+                        ?? throw new InvalidOperationException(
+                            $"Pipeline stage {stage.StageId} auxiliary consumer references unknown " +
+                            $"transfer channel {name}."))
+                    .ToArray();
+                var consumerWorkspaces = stage.PipeStages
+                    .SelectMany(pipeStage => pipeStage.ConsumerSharedWorkspaces)
+                    .ToDictionary(workspace => workspace.Name, StringComparer.Ordinal);
+                var selectedWorkspaces = contract.SharedWorkspaceNames
+                    .Select(name => consumerWorkspaces.TryGetValue(name, out var workspace)
+                        ? workspace
+                        : throw new InvalidOperationException(
+                            $"Pipeline stage {stage.StageId} auxiliary consumer references unknown " +
+                            $"consumer Shared workspace {name}."))
+                    .ToArray();
+
+                var start = AddAuxiliaryHandoff(stage, "start");
+                var done = AddAuxiliaryHandoff(stage, "done");
+                var auxiliaryEndpoints = selectedChannels
+                    .Select(channel => channel.ReaderName)
+                    .Concat(new[] { start.ReaderName, done.WriterName })
+                    .Concat(selectedWorkspaces.Select(workspace => workspace.VariableName))
+                    .ToArray();
+                _primaryAuxiliaryConsumerEndpointNames.Add(start.WriterName);
+                _primaryAuxiliaryConsumerEndpointNames.Add(done.ReaderName);
+                foreach (var endpoint in auxiliaryEndpoints)
+                {
+                    if (_auxiliaryConsumerEndpointNameSet.Add(endpoint))
+                    {
+                        _auxiliaryConsumerEndpointNames.Add(endpoint);
+                    }
+                }
+
+                var selectedReaderNames = selectedChannels
+                    .Select(channel => channel.ReaderName)
+                    .ToArray();
+                var drainEndpointNames = _drainedStageIds.Contains(stage.StageId)
+                    ? selectedReaderNames
+                    : Array.Empty<string>();
+                if (drainEndpointNames.Length != 0)
+                {
+                    stage.BindAuxiliaryConsumerDrain(drainEndpointNames);
+                }
+
+                return new(
+                    new[] { start.WriterName, done.ReaderName },
+                    auxiliaryEndpoints,
+                    drainEndpointNames);
+            }
+
+            public void AppendAuxiliaryConsumerLine(string source)
+                => _auxiliaryConsumerBody.Add(source);
+
+            private PipelineHandoffCodegenState AddAuxiliaryHandoff(
+                PipelineStageCodegenState stage,
+                string role)
+            {
+                var handoff = PipelineHandoffCodegenState.CreateAuxiliary(
+                    stage.StageId,
+                    stage.StageName,
+                    role);
+                if (!_handoffs.TryAdd(handoff.HandoffId, handoff))
+                {
+                    throw new InvalidOperationException(
+                        $"Pipeline stage {stage.StageId} emitted duplicate auxiliary " +
+                        $"consumer handoff {handoff.HandoffId}.");
+                }
+
+                _handoffOrder.Add(handoff);
+                return handoff;
+            }
 
             private static IReadOnlyDictionary<string, T> ToUniqueDictionary<T>(
                 IEnumerable<T> values,
@@ -13626,6 +13967,9 @@ internal sealed class PyNTTKernelSourceConvertVisitor : ExprFunctor<Unit, Unit>
             private IReadOnlyDictionary<string, string> _invocationBindings =
                 new Dictionary<string, string>(StringComparer.Ordinal);
 
+            private IReadOnlySet<string> _auxiliaryConsumerDrainEndpointNames =
+                new HashSet<string>(StringComparer.Ordinal);
+
             private PipelineStageCodegenState(
                 string stageId,
                 string stageName)
@@ -13655,6 +13999,9 @@ internal sealed class PyNTTKernelSourceConvertVisitor : ExprFunctor<Unit, Unit>
             public IReadOnlyList<string> ConsumerDrainEndpointNames => _consumerDrainEndpointNames;
 
             public IReadOnlyList<string> ProducerDrainEndpointNames => _producerDrainEndpointNames;
+
+            public IReadOnlySet<string> AuxiliaryConsumerDrainEndpointNames
+                => _auxiliaryConsumerDrainEndpointNames;
 
             public IReadOnlyDictionary<string, string> ConsumerEndpointBindings => _consumerEndpointBindings;
 
@@ -13835,6 +14182,20 @@ internal sealed class PyNTTKernelSourceConvertVisitor : ExprFunctor<Unit, Unit>
                     .ToArray();
             }
 
+            public void BindAuxiliaryConsumerDrain(IEnumerable<string> endpointNames)
+            {
+                var names = endpointNames.ToHashSet(StringComparer.Ordinal);
+                if (names.Count == 0 ||
+                    names.Any(name => !_consumerDrainEndpointNames.Contains(name, StringComparer.Ordinal)))
+                {
+                    throw new InvalidOperationException(
+                        $"Pipeline stage {StageId} auxiliary consumer must own one or more " +
+                        "consumer drain endpoints from the selected transfer channels.");
+                }
+
+                _auxiliaryConsumerDrainEndpointNames = names;
+            }
+
             private static string GetRequiredBinding(
                 IReadOnlyDictionary<string, string> bindings,
                 string formalName,
@@ -13867,6 +14228,22 @@ internal sealed class PyNTTKernelSourceConvertVisitor : ExprFunctor<Unit, Unit>
                     $"{handoffName}__writer");
             }
 
+            public static PipelineHandoffCodegenState CreateAuxiliary(
+                string stageId,
+                string stageName,
+                string role)
+            {
+                var handoffId = $"{stageId}/auxiliary/{role}";
+                var handoffName = SanitizeBoundedPythonIdentifier(
+                    $"{stageName}__auxiliary_{role}");
+                return new(
+                    handoffId,
+                    handoffName,
+                    $"{handoffName}__pipe",
+                    $"{handoffName}__reader",
+                    $"{handoffName}__writer");
+            }
+
             public PyNTTPipelineHandoffTemplateModel ToTemplateModel()
                 => new(
                     HandoffId,
@@ -13875,6 +14252,11 @@ internal sealed class PyNTTKernelSourceConvertVisitor : ExprFunctor<Unit, Unit>
                     ReaderName,
                     WriterName);
         }
+
+        private sealed record AuxiliaryConsumerBinding(
+            IReadOnlyList<string> PrimaryConsumerEndpointNames,
+            IReadOnlyList<string> AuxiliaryConsumerEndpointNames,
+            IReadOnlyList<string> DrainEndpointNames);
 
         public enum DeviceFunctionFormalParameterKind
         {

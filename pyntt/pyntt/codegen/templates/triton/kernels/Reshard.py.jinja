@@ -14,14 +14,8 @@
 {{ "    " * loop.index }}for destination_shard_coord{{ axis }} in tl.range(0, {{ model["Hierarchy"][axis] }}):
 {% endfor %}
 {% if ctx["partial"] is not none %}
-{{ "    " * (ctx["prefix_depth"] + 1) }}partial_reduction_width: tl.constexpr = min({{ model["TargetWorkerWidth"] }}, {{ ctx["partial"]["reduction_width_cap"] }})
-{{ "    " * (ctx["prefix_depth"] + 1) }}partial_worker_thread_id = tl.inline_asm_elementwise("mov.u32 $0, %tid.x;", "=r", [], dtype=tl.int32, is_pure=True, pack=1)
 {% endif %}
-{% call(body) elementwise.iterate(ctx, ctx["prefix_depth"], physical_width_divisor="partial_reduction_width" if ctx["partial"] is not none else "1") %}
-{% if ctx["partial"] is not none %}
-{{ body }}partial_worker_count: tl.constexpr = min({{ model["NumWarps"] * model["TargetWorkerWidth"] }}, elementwise_physical_tile_width * {{ ctx["lane_count"] }} * partial_reduction_width)
-{{ body }}mask = mask & (partial_worker_thread_id < partial_worker_count)
-{% endif %}
+{% call(body) elementwise.iterate(ctx, ctx["prefix_depth"]) %}
 {% for axis in range(model["GlobalShape"] | length) %}
 {{ body }}global_idx{{ axis }} = {{ ctx["global_coordinates"][axis] }}
 {{ body }}mask = mask & (global_idx{{ axis }} < {{ dim(model["GlobalShape"][axis]) }})
@@ -59,11 +53,7 @@
 {{ body }}source_shard_coord{{ axis }} = shard_coord{{ axis }}
 {% endif %}
 {% endfor %}
-{{ body }}for partial_start in tl.range(0, {{ ctx["partial"]["reduction_extent"] }}, partial_reduction_width):
-{{ body }}    partial_lane = partial_start + tl.arange(0, partial_reduction_width)
-{{ body }}    partial_lane_mask = partial_lane < {{ ctx["partial"]["reduction_extent"] }}
-{{ body }}    partial_lane = partial_lane{{ ctx["partial"]["reduction_lane_reshape"] }}
-{{ body }}    partial_lane_mask = partial_lane_mask{{ ctx["partial"]["reduction_lane_reshape"] }}
+{{ body }}for partial_lane in tl.static_range(0, {{ ctx["partial"]["reduction_extent"] }}):
 {% for axis in ctx["partial"]["axes"] %}
 {{ body }}    source_shard_coord{{ axis }} = (partial_lane // {{ ctx["partial"]["axis_strides"][axis] }}) % {{ model["Hierarchy"][axis] }}
 {% endfor %}
@@ -72,8 +62,8 @@
 {{ reduce_body }}source_pool_index = {{ ctx["partial"]["source_pool_index"] }}
 {{ reduce_body }}source_byte_offset = source_pool_index * {{ ctx["partial"]["address"]["PoolStrideBytes"] }} + {{ ctx["partial"]["address"]["OffsetBytes"] }}
 {{ reduce_body }}source = ({{ ctx["partial"]["address"]["BaseName"] }} + source_byte_offset).to({{ ctx["partial"]["pointer_type"] }})
-{{ reduce_body }}source_value = tl.load(source + {{ ctx["input_access"]["ScalarOffset"] }}{{ ctx["partial"]["append_reduction_axis"] }}, mask=mask{{ ctx["partial"]["append_reduction_axis"] }} & partial_lane_mask, other={{ ctx["partial"]["zero"] }}).to({{ ctx["partial"]["accumulator_dtype"] }})
-{{ reduce_body }}acc += tl.sum(source_value, axis={{ ctx["partial"]["reduction_axis"] }})
+{{ reduce_body }}source_value = tl.load(source + {{ ctx["input_access"]["ScalarOffset"] }}, mask=mask, other={{ ctx["partial"]["zero"] }}).to({{ ctx["partial"]["accumulator_dtype"] }})
+{{ reduce_body }}acc += source_value
 {{ body }}value = acc
 {% endif %}
 {{ body }}tl.store(({{ model["OutputAddress"]["BaseName"] }} + output_byte_offsets).to({{ ctx["output_pointer_type"] }}), value, mask=mask)

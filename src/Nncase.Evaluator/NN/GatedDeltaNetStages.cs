@@ -151,7 +151,8 @@ public sealed class GatedDeltaNetConvolutionEvaluator :
                 GatedDeltaNetConvolution.LayerId.Index,
                 GatedDeltaNetConvolution.State.Index,
                 out var distributed,
-                out var placement))
+                out var placement,
+                GatedDeltaNetConvolution.QKV.Index))
         {
             return new InvalidType(
                 "GatedDeltaNetConvolution inputs must be either all tensors or compatible distributed tensors.");
@@ -164,22 +165,34 @@ public sealed class GatedDeltaNetConvolutionEvaluator :
             return tensorResult;
         }
 
-        var channel = distributed[GatedDeltaNetConvolution.QKV.Index].AxisPolicies[1];
-        if (!GatedDeltaNetStageUtility.TryGetContiguousAxes(channel, placement.Rank, out var channelAxes))
+        var qkv = distributed[GatedDeltaNetConvolution.QKV.Index];
+        SBP channel;
+        if (qkv.Partial is null)
         {
-            return new InvalidType(
-                "GatedDeltaNetConvolution QKV channels must be broadcast or contiguously split.");
+            channel = qkv.AxisPolicies[1];
+            if (!GatedDeltaNetStageUtility.TryGetContiguousAxes(channel, placement.Rank, out var channelAxes) ||
+                !GatedDeltaNetStageUtility.CoversPlacement(channelAxes, placement.Rank))
+            {
+                return new InvalidType(
+                    "GatedDeltaNetConvolution materialized QKV channels must be contiguously split over the block placement.");
+            }
         }
-
-        if (!GatedDeltaNetStageUtility.CoversPlacement(channelAxes, placement.Rank))
+        else
         {
-            return new InvalidType(
-                "GatedDeltaNetConvolution channel split must cover the block placement so each state channel has one writer.");
+            if (!GatedDeltaNetStageUtility.IsSumPartialPartition(qkv, 1))
+            {
+                return new InvalidType(
+                    "GatedDeltaNetConvolution partial QKV must use disjoint channel-split and Sum-partial axes that cover the block placement.");
+            }
+
+            channel = SBP.SContiguous(Enumerable.Range(0, placement.Rank).ToArray());
         }
 
         var expected = new Dictionary<int, DistributedType>
         {
-            [GatedDeltaNetConvolution.QKV.Index] = GatedDeltaNetStageUtility.Create(distributed[GatedDeltaNetConvolution.QKV.Index].TensorType, [SBP.B, channel], placement),
+            [GatedDeltaNetConvolution.QKV.Index] = qkv.Partial is null
+                ? GatedDeltaNetStageUtility.Create(qkv.TensorType, [SBP.B, channel], placement)
+                : qkv,
             [GatedDeltaNetConvolution.ConvWeight.Index] = GatedDeltaNetStageUtility.Create(distributed[GatedDeltaNetConvolution.ConvWeight.Index].TensorType, [channel, SBP.B], placement),
         };
         foreach (var (index, expectedType) in expected)
@@ -519,7 +532,8 @@ public sealed class GatedDeltaNetRecurrentCoreEvaluator :
                 GatedDeltaNetRecurrentCore.LayerId.Index,
                 GatedDeltaNetRecurrentCore.State.Index,
                 out var distributed,
-                out var placement))
+                out var placement,
+                GatedDeltaNetRecurrentCore.Z.Index))
         {
             return new InvalidType(
                 "GatedDeltaNetRecurrentCore inputs must be either all tensors or compatible distributed tensors.");
@@ -532,23 +546,33 @@ public sealed class GatedDeltaNetRecurrentCoreEvaluator :
             return tensorResult;
         }
 
-        if (!GatedDeltaNetStageUtility.TryGetContiguousAxes(
-                distributed[GatedDeltaNetRecurrentCore.Z.Index].AxisPolicies[1],
-                placement.Rank,
-                out var headAxes))
+        var z = distributed[GatedDeltaNetRecurrentCore.Z.Index];
+        int[] headAxes;
+        if (z.Partial is null)
         {
-            return new InvalidType(
-                "GatedDeltaNetRecurrentCore value-head split must be contiguous.");
+            if (!GatedDeltaNetStageUtility.TryGetContiguousAxes(
+                    z.AxisPolicies[1],
+                    placement.Rank,
+                    out headAxes) ||
+                !GatedDeltaNetStageUtility.CoversPlacement(headAxes, placement.Rank))
+            {
+                return new InvalidType(
+                    "GatedDeltaNetRecurrentCore materialized Z values must be contiguously split over the block placement.");
+            }
         }
-
-        if (!GatedDeltaNetStageUtility.CoversPlacement(headAxes, placement.Rank))
+        else
         {
-            return new InvalidType(
-                "GatedDeltaNetRecurrentCore value-head split must cover the block placement so each state head has one writer.");
+            if (!GatedDeltaNetStageUtility.IsSumPartialPartition(z, 1))
+            {
+                return new InvalidType(
+                    "GatedDeltaNetRecurrentCore partial Z must use disjoint value-split and Sum-partial axes that cover the block placement.");
+            }
+
+            headAxes = Enumerable.Range(0, placement.Rank).ToArray();
         }
 
         var zLaneCount = GatedDeltaNetStageUtility.GetVectorLaneCount(
-            distributed[GatedDeltaNetRecurrentCore.Z.Index].TensorType.DType);
+            z.TensorType.DType);
         var scalarValueElements = checked(target.NumValueHeads * target.ValueHeadDim);
         if (scalarValueElements % zLaneCount != 0)
         {
@@ -570,13 +594,15 @@ public sealed class GatedDeltaNetRecurrentCoreEvaluator :
         {
             return new InvalidType(
                 $"GatedDeltaNetRecurrentCore value-head split {value} is not representable " +
-                $"in Z's packed dtype {distributed[GatedDeltaNetRecurrentCore.Z.Index].TensorType.DType}.");
+                $"in Z's packed dtype {z.TensorType.DType}.");
         }
 
         var expected = new Dictionary<int, DistributedType>
         {
             [GatedDeltaNetRecurrentCore.QKV.Index] = GatedDeltaNetStageUtility.CreateBroadcast(distributed[GatedDeltaNetRecurrentCore.QKV.Index].TensorType, placement),
-            [GatedDeltaNetRecurrentCore.Z.Index] = GatedDeltaNetStageUtility.Create(distributed[GatedDeltaNetRecurrentCore.Z.Index].TensorType, [SBP.B, packedValue], placement),
+            [GatedDeltaNetRecurrentCore.Z.Index] = z.Partial is null
+                ? GatedDeltaNetStageUtility.Create(z.TensorType, [SBP.B, packedValue], placement)
+                : z,
             [GatedDeltaNetRecurrentCore.ProjectionInput.Index] = GatedDeltaNetStageUtility.CreateBroadcast(distributed[GatedDeltaNetRecurrentCore.ProjectionInput.Index].TensorType, placement),
             [GatedDeltaNetRecurrentCore.BWeight.Index] = GatedDeltaNetStageUtility.CreateBroadcast(distributed[GatedDeltaNetRecurrentCore.BWeight.Index].TensorType, placement),
             [GatedDeltaNetRecurrentCore.AWeight.Index] = GatedDeltaNetStageUtility.CreateBroadcast(distributed[GatedDeltaNetRecurrentCore.AWeight.Index].TensorType, placement),
@@ -758,7 +784,8 @@ internal static class GatedDeltaNetStageUtility
         int dimensionIndex,
         int invariantTensorIndex,
         out DistributedType[] distributed,
-        out Placement placement)
+        out Placement placement,
+        params int[] partialInputIndices)
     {
         distributed = new DistributedType[arguments.Count];
         var values = arguments
@@ -783,7 +810,7 @@ internal static class GatedDeltaNetStageUtility
         {
             if (type is not DistributedType distributedType ||
                 distributedType.Placement != commonPlacement ||
-                distributedType.Partial is not null ||
+                (distributedType.Partial is not null && !partialInputIndices.Contains(index)) ||
                 distributedType.AxisPolicies.Count != distributedType.TensorType.Shape.Rank)
             {
                 return false;
@@ -826,6 +853,31 @@ internal static class GatedDeltaNetStageUtility
     public static bool CoversPlacement(IReadOnlyList<int> axes, int placementRank) =>
         axes.OrderBy(axis => axis).SequenceEqual(Enumerable.Range(0, placementRank));
 
+    public static bool IsSumPartialPartition(DistributedType type, int splitTensorAxis)
+    {
+        if (type.Partial is not { Op: ReduceOp.Sum } partial ||
+            partial.Axes.Count == 0 ||
+            type.AxisPolicies.Count != type.TensorType.Shape.Rank ||
+            type.AxisPolicies.Where((_, axis) => axis != splitTensorAxis)
+                .Any(policy => policy is not SBPBroadCast))
+        {
+            return false;
+        }
+
+        var splitAxes = type.AxisPolicies[splitTensorAxis] switch
+        {
+            SBPBroadCast => Array.Empty<int>(),
+            SBPSplit split => split.HierarchyAxes.ToArray(),
+            _ => null,
+        };
+        var partialAxes = partial.Axes.ToArray();
+        return splitAxes is not null &&
+            AreValidPlacementAxes(splitAxes, type.Placement.Rank) &&
+            AreValidPlacementAxes(partialAxes, type.Placement.Rank) &&
+            !splitAxes.Intersect(partialAxes).Any() &&
+            CoversPlacement(splitAxes.Concat(partialAxes).ToArray(), type.Placement.Rank);
+    }
+
     public static SBP CreateSplitPolicy(IReadOnlyList<int> axes)
         => axes.Count == 0 ? SBP.B : SBP.SContiguous(axes.ToArray());
 
@@ -837,6 +889,10 @@ internal static class GatedDeltaNetStageUtility
 
     public static DistributedType CreateBroadcast(TensorType tensorType, Placement placement) =>
         Create(tensorType, Enumerable.Repeat<SBP>(SBP.B, tensorType.Shape.Rank).ToArray(), placement);
+
+    private static bool AreValidPlacementAxes(IReadOnlyList<int> axes, int placementRank) =>
+        axes.Distinct().Count() == axes.Count &&
+        axes.All(axis => axis >= 0 && axis < placementRank);
 
     public static bool AreCompatible(Dimension lhs, Dimension rhs) =>
         !lhs.IsFixed || !rhs.IsFixed || lhs.FixedValue == rhs.FixedValue;

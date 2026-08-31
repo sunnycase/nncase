@@ -160,6 +160,16 @@ public sealed class PackedBlockScaledMatMulEvaluator :
         var rhsScale = context.GetArgumentType<IRType>(target, PackedBlockScaledMatMul.RhsScale);
         var addend = context.GetArgumentType<IRType>(target, PackedBlockScaledMatMul.Addend);
         var output = context.GetReturnType<IRType>();
+        if (TryGetTargetCost(context, target, lhs, rhs, output, out var targetCost))
+        {
+            AddCostFactor(
+                targetCost,
+                CostFactorNames.BlockLocalMemoryLoadBytes,
+                CostUtility.GetMemoryAccess(rhsScale));
+            PackedMatMulEvaluator.AddAddendCost(targetCost, output, addend);
+            return targetCost;
+        }
+
         return new Cost
         {
             [CostFactorNames.BlockLocalMemoryLoadBytes] =
@@ -170,6 +180,74 @@ public sealed class PackedBlockScaledMatMulEvaluator :
                 output,
                 checked(GetK(lhs) + 4U + (addend is NoneType ? 0U : 1U))),
         };
+    }
+
+    internal static bool TryGetTargetCost(
+        ICostEvaluateContext context,
+        PackedBlockScaledMatMul target,
+        IRType lhs,
+        IRType rhs,
+        IRType output,
+        out Cost cost)
+    {
+        var rhsTensor = ScaledMatMulEvaluator.GetTensorType(rhs);
+        var outputTensor = ScaledMatMulEvaluator.GetTensorType(output);
+        if (rhsTensor?.DType is not VectorType rhsVector ||
+            outputTensor?.DType is not VectorType outputVector ||
+            !PackedMatMulEvaluator.TryGetRhsLayoutInfo(
+                target.RhsLayout,
+                rhsVector,
+                rhsTensor.Shape.Rank,
+                out var rhsUnpackAxes,
+                out _,
+                out _) ||
+            UnpackType(rhs, rhsUnpackAxes) is not { } logicalRhs ||
+            UnpackType(
+                output,
+                Enumerable.Repeat(
+                    outputTensor.Shape.Rank - 1,
+                    outputVector.Lanes.Count).ToArray()) is not { } logicalOutput ||
+            logicalRhs is InvalidType ||
+            logicalOutput is InvalidType ||
+            !TargetCostTensor.TryFromType(lhs, out var lhsTensor) ||
+            !TargetCostTensor.TryFromType(logicalRhs, out var rhsCostTensor) ||
+            !TargetCostTensor.TryFromType(logicalOutput, out var outputCostTensor) ||
+            !context.TargetCostModel.TryGetMatMulCost(
+                new(
+                    lhsTensor,
+                    rhsCostTensor,
+                    outputCostTensor,
+                    target.OutputDataType,
+                    MatMulOpCostKind.Mma,
+                    LhsComputeDataType: rhsCostTensor.DType,
+                    RhsComputeDataType: rhsCostTensor.DType,
+                    PipelineProfile: new(
+                        MatMulLhsPreparationKind.DynamicBlockQuantization,
+                        checked((int)target.WeightBlockK))),
+                out cost))
+        {
+            cost = Cost.Zero;
+            return false;
+        }
+
+        return true;
+    }
+
+    private static void AddCostFactor(Cost cost, string name, UInt128 value)
+    {
+        if (value == 0)
+        {
+            return;
+        }
+
+        if (cost.Factors.TryGetValue(name, out var oldValue))
+        {
+            cost.Factors[name] = oldValue + value;
+        }
+        else
+        {
+            cost.Factors.Add(name, value);
+        }
     }
 
     private static IRType UnpackType(IRType input, int[] axes) => input switch

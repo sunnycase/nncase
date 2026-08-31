@@ -155,37 +155,74 @@ public sealed class TritonTargetOpCostModel : ITargetOpCostModel, IHierarchicalT
         var (m, n, k) = GetMatMulLogicalShape(query, lhsShape, outputShape);
         var batch = Product(outputShape.AsSpan(0, outputShape.Length - 2));
         var outputDType = query.OutputDataType ?? query.Output.DType;
+        var lhsComputeDType = query.LhsComputeDataType ?? query.Lhs.DType;
+        var rhsComputeDType = query.RhsComputeDataType ?? query.Rhs.DType;
         var hasVectorLayout = HasVectorDType(query.Lhs.DType)
             || HasVectorDType(query.Rhs.DType)
             || HasVectorDType(query.Output.DType)
             || HasVectorDType(outputDType);
-        var computeCycles = query.Kind switch
+        PackedBlockFp8MmaPipelineCostModel.Estimate? pipelineEstimate = null;
+        double computeCycles;
+        if (query.PipelineProfile is { } pipelineProfile)
         {
-            MatMulOpCostKind.Simt => EstimateSimtMatMulComputeCycles(m, n, k, batch),
-            MatMulOpCostKind.Mma => EstimateMmaMatMulComputeCycles(
-                m,
-                n,
-                k,
-                batch,
-                query.Lhs.DType,
-                query.Rhs.DType),
-            _ when !hasVectorLayout => EstimateScalarMatMulComputeCycles(m, n, k, batch),
-            _ => EstimateMatMulComputeCycles(m, n, k, batch, query.Lhs.DType, query.Rhs.DType),
-        };
+            if (pipelineProfile.LhsPreparation != MatMulLhsPreparationKind.DynamicBlockQuantization
+                || query.Kind != MatMulOpCostKind.Mma
+                || m != 1
+                || batch != 1
+                || !PackedBlockFp8MmaPipelineCostModel.TryEstimateBestLocalCycles(
+                    _machine,
+                    lhsComputeDType,
+                    rhsComputeDType,
+                    n,
+                    k,
+                    pipelineProfile.ReductionGroupK,
+                    pipelineProfile.SimultaneousRhsTileCount,
+                    out var estimate))
+            {
+                cost = Cost.Zero;
+                return false;
+            }
+
+            pipelineEstimate = estimate;
+            computeCycles = estimate.Cycles;
+        }
+        else
+        {
+            computeCycles = query.Kind switch
+            {
+                MatMulOpCostKind.Simt => EstimateSimtMatMulComputeCycles(m, n, k, batch),
+                MatMulOpCostKind.Mma => EstimateMmaMatMulComputeCycles(
+                    m,
+                    n,
+                    k,
+                    batch,
+                    lhsComputeDType,
+                    rhsComputeDType),
+                _ when !hasVectorLayout => EstimateScalarMatMulComputeCycles(m, n, k, batch),
+                _ => EstimateMatMulComputeCycles(m, n, k, batch, lhsComputeDType, rhsComputeDType),
+            };
+        }
+
         if (!double.IsFinite(computeCycles))
         {
             cost = Cost.Zero;
             return false;
         }
 
-        var lhsLoadBytes = TargetOpCostModelUtility.GetEffectiveMemoryBytes(
+        var semanticLhsLoadBytes = TargetOpCostModelUtility.GetEffectiveMemoryBytes(
             GetTensorByteCount(query.Lhs),
             query.LhsMemoryAccess,
             _rootMemory.PreferredReadAccessBytes);
-        var rhsLoadBytes = TargetOpCostModelUtility.GetEffectiveMemoryBytes(
+        var semanticRhsLoadBytes = TargetOpCostModelUtility.GetEffectiveMemoryBytes(
             GetTensorByteCount(query.Rhs),
             query.RhsMemoryAccess,
             _rootMemory.PreferredReadAccessBytes);
+        var lhsLoadBytes = Math.Max(
+            semanticLhsLoadBytes,
+            pipelineEstimate?.LhsLoadBytes ?? 0);
+        var rhsLoadBytes = Math.Max(
+            semanticRhsLoadBytes,
+            pipelineEstimate?.RhsLoadBytes ?? 0);
         var outputStoreBytes = TargetOpCostModelUtility.GetEffectiveMemoryBytes(
             GetTensorByteCount(query.Output),
             query.OutputMemoryAccess,
@@ -240,10 +277,35 @@ public sealed class TritonTargetOpCostModel : ITargetOpCostModel, IHierarchicalT
     {
         var candidates = _machine.Compute.MatrixPrimitives
             .Where(instruction => instruction.Supports(lhsDType, rhsDType))
-            .Select(instruction => EstimateDotInstructionCycles(instruction, m, n, k, batch))
+            .Select(instruction => m == 1
+                ? EstimatePersistentGemvMmaCycles(instruction, n, k, batch)
+                : EstimateDotInstructionCycles(instruction, m, n, k, batch))
             .Where(double.IsFinite)
             .ToArray();
         return candidates.Length > 0 ? candidates.Min() : double.PositiveInfinity;
+    }
+
+    private double EstimatePersistentGemvMmaCycles(
+        MatrixComputePrimitiveSpec instruction,
+        long n,
+        long k,
+        double batch)
+    {
+        if (instruction.M <= 0 || instruction.K <= 0)
+        {
+            return double.PositiveInfinity;
+        }
+
+        var workers = Math.Max(1, _machine.Execution.WorkersPerBlock);
+        var blockN = checked(instruction.M * workers);
+        var nBlockCount = CeilDiv(n, blockN);
+        var kTiles = CeilDiv(k, instruction.K);
+        var accumulatorChains = Math.Max(1.0, nBlockCount * workers * batch);
+        return MatrixComputeCostModel.EstimateCycles(
+            instruction,
+            accumulatorChains,
+            kTiles,
+            _machine.Execution);
     }
 
     private double EstimateSimtMatMulComputeCycles(long m, long n, long k, double batch)

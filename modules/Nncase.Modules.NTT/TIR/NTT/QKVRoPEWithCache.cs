@@ -12,11 +12,11 @@ namespace Nncase.TIR.NTT;
 /// </summary>
 public sealed partial class QKVRoPEWithCache : NTTKernelOp
 {
-    public static readonly ParameterInfo Q = new(typeof(QKVRoPEWithCache), 0, "q", memoryEffect: MemoryEffect.Read);
+    public static readonly ParameterInfo Q = new(typeof(QKVRoPEWithCache), 0, "q", memoryEffect: MemoryEffect.Read.AcrossPartialOwners());
 
-    public static readonly ParameterInfo K = new(typeof(QKVRoPEWithCache), 1, "k", memoryEffect: MemoryEffect.Read);
+    public static readonly ParameterInfo K = new(typeof(QKVRoPEWithCache), 1, "k", memoryEffect: MemoryEffect.Read.AcrossPartialOwners());
 
-    public static readonly ParameterInfo V = new(typeof(QKVRoPEWithCache), 2, "v", memoryEffect: MemoryEffect.Read);
+    public static readonly ParameterInfo V = new(typeof(QKVRoPEWithCache), 2, "v", memoryEffect: MemoryEffect.Read.AcrossPartialOwners());
 
     public static readonly ParameterInfo QScale = new(typeof(QKVRoPEWithCache), 3, "q_scale", memoryEffect: MemoryEffect.Read);
 

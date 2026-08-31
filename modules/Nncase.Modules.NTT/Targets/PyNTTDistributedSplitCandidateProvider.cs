@@ -60,7 +60,10 @@ public sealed class PyNTTDistributedSplitCandidateProvider : IDistributedSplitCa
             }
         }
 
-        return [SBP.S(stages)];
+        var blockCyclic = SBP.S(stages);
+        return blockCyclic == contiguous
+            ? [contiguous]
+            : [blockCyclic, contiguous];
     }
 
     private static List<PhysicalAxisGroup> GroupByPhysicalLevel(DistributedSplitCandidateContext context)

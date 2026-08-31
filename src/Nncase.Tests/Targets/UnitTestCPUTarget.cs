@@ -273,6 +273,8 @@ public class UnitTestCPUTarget : TestClassBase
                 None.Default,
                 None.Default,
                 None.Default,
+                None.Default,
+                None.Default,
                 output,
                 IR.NN.GluType.SwiGLU),
             TIR.T.Return(output));

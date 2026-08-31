@@ -259,9 +259,8 @@ public sealed class NTTTIRSelectionPass : TIRSelectionPass
                             "PackedMatMulNormStatsCombine TIR selection expects distributed input and value/statistics output buffers.");
                     }
 
-                    var reducedType = inputType with { Partial = null };
                     var reduced = CreateCanonicalGlobalMetadataBuffer(
-                        reducedType,
+                        valueType,
                         MemoryLocation.ChipLocalData,
                         "packed_matmul_reduced");
                     return TIR.F.NTT.GatherReduceAddNormStats(
@@ -271,7 +270,7 @@ public sealed class NTTTIRSelectionPass : TIRSelectionPass
                         (Expr)outputs[0],
                         (Expr)outputs[1],
                         inputType,
-                        reducedType,
+                        valueType,
                         combine.Axis,
                         combine.UseMean);
                 }
@@ -282,22 +281,45 @@ public sealed class NTTTIRSelectionPass : TIRSelectionPass
                     arguments,
                     output);
             case IR.NTT.PackedMatMulGlu matmulGlu:
-                return TIR.F.NTT.PackedMatMulGlu(
-                    (Expr)arguments[0],
-                    (Expr)arguments[1],
-                    (Expr)arguments[2],
-                    (Expr)arguments[3],
-                    (Expr)arguments[4],
-                    (Expr)arguments[5],
-                    (Expr)arguments[6],
-                    (Expr)arguments[7],
-                    (Expr)arguments[8],
-                    output,
-                    matmulGlu.GluType,
-                    matmulGlu.RhsLayout,
-                    matmulGlu.QuantizationMode,
-                    matmulGlu.WeightBlockN,
-                    matmulGlu.WeightBlockK);
+                {
+                    var outputBase = Unsafe.As<Expr, BaseExpr>(ref output);
+                    var emitPartialResults = outputBase is IR.Tuple;
+                    Expr gateOutput = None.Default;
+                    Expr upOutput = None.Default;
+                    Expr materializedOutput = output;
+                    if (emitPartialResults)
+                    {
+                        if (outputBase is not IR.Tuple { Count: 2 } partialOutputs)
+                        {
+                            throw new NotSupportedException(
+                                "PackedMatMulGlu split-K TIR selection expects a tuple of gate/up outputs.");
+                        }
+
+                        gateOutput = (Expr)partialOutputs[0];
+                        upOutput = (Expr)partialOutputs[1];
+                        materializedOutput = None.Default;
+                    }
+
+                    return TIR.F.NTT.PackedMatMulGlu(
+                        (Expr)arguments[0],
+                        (Expr)arguments[1],
+                        (Expr)arguments[2],
+                        (Expr)arguments[3],
+                        (Expr)arguments[4],
+                        (Expr)arguments[5],
+                        (Expr)arguments[6],
+                        (Expr)arguments[7],
+                        (Expr)arguments[8],
+                        gateOutput,
+                        upOutput,
+                        materializedOutput,
+                        matmulGlu.GluType,
+                        matmulGlu.RhsLayout,
+                        matmulGlu.QuantizationMode,
+                        matmulGlu.WeightBlockN,
+                        matmulGlu.WeightBlockK,
+                        emitPartialResults);
+                }
             case IR.NTT.PackedNVFP4MatMulGlu nvfp4MatMulGlu:
                 return TIR.F.NTT.NVFP4MatMulGlu(
                     (Expr)arguments[IR.NTT.PackedNVFP4MatMulGlu.Input.Index],

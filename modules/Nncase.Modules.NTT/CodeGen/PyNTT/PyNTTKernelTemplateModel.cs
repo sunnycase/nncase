@@ -33,6 +33,10 @@ public sealed record PyNTTTransferPipelineChannelTemplateModel(
     string Name,
     string[] SharedWorkspaceNames);
 
+public sealed record PyNTTAuxiliaryConsumerTemplateModel(
+    string[] TransferPipelineChannelNames,
+    string[] SharedWorkspaceNames);
+
 public sealed record PyNTTMicroKernelTemplateModel(
     string Family,
     string Variant,
@@ -40,7 +44,8 @@ public sealed record PyNTTMicroKernelTemplateModel(
     IReadOnlyDictionary<string, string> SharedWorkspaceOffsets,
     IReadOnlyDictionary<string, long[]> SharedWorkspaceShapes,
     PyNTTTransferPipelineChannelTemplateModel[] TransferPipelineChannels,
-    string[] ConsumerSharedWorkspaceNames)
+    string[] ConsumerSharedWorkspaceNames,
+    PyNTTAuxiliaryConsumerTemplateModel? AuxiliaryConsumer)
 {
     public bool HasTransferPipeline => TransferPipelineChannels.Length != 0;
 }
@@ -82,6 +87,12 @@ public sealed record PyNTTProducerConsumerRegionTemplateModel(
     string[] ConsumerEndpointNames)
 {
     public string[] RuntimeShapeArgs { get; set; } = Array.Empty<string>();
+
+    public string? AuxiliaryConsumerFunctionName { get; set; }
+
+    public string AuxiliaryConsumerBodySource { get; set; } = string.Empty;
+
+    public string[] AuxiliaryConsumerEndpointNames { get; set; } = Array.Empty<string>();
 }
 
 public sealed record PyNTTPooledByteAddressTemplateModel(
@@ -572,6 +583,8 @@ public sealed record PyNTTNormApplyTemplateModel(
     string ScaleTritonDType,
     string BiasTritonDType,
     string OutputTritonDType,
+    string ResultDType,
+    string ResultTritonDType,
     PyNTTDimExpression[] InputShape,
     PyNTTDimExpression[] InputGlobalShape,
     PyNTTDimExpression[] StatsShape,
@@ -583,6 +596,7 @@ public sealed record PyNTTNormApplyTemplateModel(
     PyNTTDimExpression[] ScaleStrides,
     PyNTTDimExpression[] BiasStrides,
     PyNTTDimExpression[] OutputStrides,
+    bool InputUsesOutputGlobalCoordinates,
     int InputVectorLaneCount,
     int StatsVectorLaneCount,
     int ScaleVectorLaneCount,
@@ -596,6 +610,7 @@ public sealed record PyNTTNormApplyTemplateModel(
     int Axis,
     float Epsilon,
     bool UseMean,
+    bool RequiresCooperativeOwnerDirect,
     string Comment)
 {
     public string[] RuntimeShapeArgs { get; set; } = Array.Empty<string>();
@@ -618,6 +633,7 @@ public sealed record PyNTTGatherReduceAddNormTemplateModel(
     PyNTTReshardTemplateModel Reshard,
     PyNTTBufferPointerTemplateModel Addend,
     PyNTTNormStatsTemplateModel NormStats,
+    PyNTTPooledByteAddressTemplateModel StatsAddress,
     PyNTTNormApplyTemplateModel? NormApply,
     string Comment)
 {
@@ -755,7 +771,7 @@ public sealed record PyNTTUpdatePagedAttentionKVCacheTemplateModel(
     public string[] RuntimeShapeArgs { get; set; } = Array.Empty<string>();
 }
 
-public sealed record PyNTTQKVPartialInputTemplateModel(
+public sealed record PyNTTSumPartialInputTemplateModel(
     PyNTTPooledByteAddressTemplateModel Address,
     int ScalarElementSizeBytes,
     string DType,
@@ -787,9 +803,9 @@ public sealed record PyNTTQKVRoPEWithCacheTemplateModel(
     int[] QOutputVectorLaneShape,
     int[] QKVLayout,
     int[] AttentionLayout,
-    PyNTTQKVPartialInputTemplateModel? QPartial,
-    PyNTTQKVPartialInputTemplateModel? KPartial,
-    PyNTTQKVPartialInputTemplateModel? VPartial,
+    PyNTTSumPartialInputTemplateModel? QPartial,
+    PyNTTSumPartialInputTemplateModel? KPartial,
+    PyNTTSumPartialInputTemplateModel? VPartial,
     string Comment)
 {
     public string[] RuntimeShapeArgs { get; set; } = Array.Empty<string>();
@@ -1329,6 +1345,16 @@ public sealed record PyNTTMatMulGluTemplateModel(
 {
     public string[] RuntimeShapeArgs { get; set; } = Array.Empty<string>();
 
+    public bool EmitPartialResults { get; set; }
+
+    public PyNTTBufferPointerTemplateModel? UpOutput { get; set; }
+
+    public PyNTTDimExpression[] UpOutputShape { get; set; } = Array.Empty<PyNTTDimExpression>();
+
+    public PyNTTDimExpression[] UpOutputStrides { get; set; } = Array.Empty<PyNTTDimExpression>();
+
+    public PyNTTDimExpression[] UpOutputGlobalOffsets { get; set; } = Array.Empty<PyNTTDimExpression>();
+
     public PyNTTBufferPointerTemplateModel? GateInputScale { get; set; }
 
     public PyNTTBufferPointerTemplateModel? UpInputScale { get; set; }
@@ -1569,6 +1595,7 @@ public sealed record PyNTTSparseExpertsDownTemplateModel(
 public sealed record PyNTTGatedDeltaNetConvolutionTemplateModel(
     string FunctionName,
     PyNTTBufferPointerTemplateModel QKV,
+    PyNTTSumPartialInputTemplateModel? QKVPartial,
     PyNTTBufferPointerTemplateModel ConvState,
     PyNTTBufferPointerTemplateModel ConvWeight,
     PyNTTBufferPointerTemplateModel QKVOutput,
@@ -1595,6 +1622,7 @@ public sealed record PyNTTGatedDeltaNetRecurrentCoreTemplateModel(
     PyNTTBufferPointerTemplateModel RecurrentState,
     PyNTTBufferPointerTemplateModel QKV,
     PyNTTBufferPointerTemplateModel Z,
+    PyNTTSumPartialInputTemplateModel? ZPartial,
     PyNTTBufferPointerTemplateModel ProjectionInput,
     PyNTTBufferPointerTemplateModel BWeight,
     PyNTTBufferPointerTemplateModel AWeight,

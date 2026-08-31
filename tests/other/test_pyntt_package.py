@@ -86,6 +86,77 @@ def _device_function(name, body, extra_parameters=()):
     }
 
 
+def test_pyntt_grid_barrier_axis_groups_match_current_flagtree_api():
+    _add_pyntt_to_path()
+    from pyntt.codegen.render import _grid_barrier_axis_groups
+
+    topology = (
+        {"placement_axis": 0, "name": "block_y", "size": 8, "level": "b"},
+        {"placement_axis": 1, "name": "block_x", "size": 16, "level": "b"},
+    )
+    manifest = {
+        "functions": [
+            {
+                "render_kernels": [
+                    {
+                        "metadata": {
+                            "attrs": {
+                                "grid_barrier_axis_groups": [
+                                    {"axes": [0], "shape": [8]},
+                                ],
+                            },
+                        },
+                    },
+                ],
+            },
+        ],
+    }
+
+    assert _grid_barrier_axis_groups(manifest, topology) == (
+        {
+            "key": "0x8",
+            "axis_names": ("block_y",),
+            "shape": (8,),
+        },
+    )
+    template = (
+        Path(__file__).resolve().parents[2]
+        / "pyntt/pyntt/codegen/templates/triton/module.py.jinja"
+    ).read_text(encoding="utf-8")
+    assert ".axis_group({{ pyrepr(group.axis_names) }})" in template
+    assert "group_shape" not in template
+
+
+def test_pyntt_grid_barrier_axis_groups_reject_sub_axis_groups():
+    _add_pyntt_to_path()
+    from pyntt.codegen.render import _grid_barrier_axis_groups
+
+    topology = (
+        {"placement_axis": 0, "name": "block_y", "size": 8, "level": "b"},
+        {"placement_axis": 1, "name": "block_x", "size": 16, "level": "b"},
+    )
+    manifest = {
+        "functions": [
+            {
+                "render_kernels": [
+                    {
+                        "metadata": {
+                            "attrs": {
+                                "grid_barrier_axis_groups": [
+                                    {"axes": [0], "shape": [4]},
+                                ],
+                            },
+                        },
+                    },
+                ],
+            },
+        ],
+    }
+
+    with pytest.raises(ValueError, match="does not support sub-axis groups"):
+        _grid_barrier_axis_groups(manifest, topology)
+
+
 def test_pyntt_target_options_do_not_expose_removed_pipeline_policy():
     import nncase
 
@@ -1004,6 +1075,7 @@ def test_pyntt_renderer_preserves_one_block_cyclic_n_block_per_mma_tile():
                 "lhs_quantized": [4, 128],
                 "lhs_scale": [4, 1],
             },
+            "ConsumerSharedWorkspaceNames": ["lhs_quantized", "lhs_scale"],
         },
         "WeightBlockK": 128,
         "Rhs": pointer,
@@ -1084,6 +1156,7 @@ def test_pyntt_nvfp4_accesses_map_local_n_through_block_cyclic_storage():
             "SharedWorkspaceShapes": {
                 "packed_weight_stage": [4, 128, 128],
             },
+            "ConsumerSharedWorkspaceNames": [],
         }
 
     output_pointer = pointer((1, 2176), (0, 1), 1, block_size=16)
@@ -1383,6 +1456,7 @@ def test_pyntt_renderer_uses_one_rank3_descriptor_for_block_cyclic_mma_tile():
                 "lhs_quantized": [2, 128],
                 "lhs_scale": [2, 1],
             },
+            "ConsumerSharedWorkspaceNames": ["lhs_quantized", "lhs_scale"],
         },
         "WeightBlockK": 128,
         "Rhs": pointer,
@@ -2285,9 +2359,9 @@ def test_pyntt_renderer_materializes_named_mesh_coordinates():
     source = render_manifest(manifest)
 
     assert '_PYNTT_GRID_MESH_VALUE = tle.device_mesh({"block": [(\'block_y\', 4), (\'block_x\', 8)]})' in source
-    assert "shard_coord0 = tle.shard_id(PYNTT_GRID_MESH, 'block_y').to(tl.int64)" in source
-    assert "shard_coord1 = tle.shard_id(PYNTT_GRID_MESH, 'block_x').to(tl.int64)" in source
-    assert "shard_index = (shard_coord0 * 8 + shard_coord1)" in source
+    assert "shard_coord0 = tle.gpu.rematerialize_index(tle.shard_id(PYNTT_GRID_MESH, 'block_y').to(tl.int64))" in source
+    assert "shard_coord1 = tle.gpu.rematerialize_index(tle.shard_id(PYNTT_GRID_MESH, 'block_x').to(tl.int64))" in source
+    assert "shard_index = tle.gpu.rematerialize_index((shard_coord0 * 8 + shard_coord1))" in source
     assert "tl.program_id(0)" not in source
     assert "shard_index //" not in source
     assert "shard_index %" not in source

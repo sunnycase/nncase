@@ -33,21 +33,14 @@ public sealed class FormPackedMatMulNormStatsCombinePass : FunctionPass
                 continue;
             }
 
-            var packed = (PackedMatMul)producer.Target;
-            var addend = (Expr)producer[PackedMatMul.Addend];
+            var addend = GetAddend(producer);
             if (addend.CheckedType is NoneType)
             {
                 continue;
             }
 
             var partialCapable = AssertValidExpr(
-                IR.F.NTT.PackedMatMul(
-                    (Expr)producer[PackedMatMul.Lhs],
-                    (Expr)producer[PackedMatMul.Rhs],
-                    fusedReduce: false,
-                    outDataType: packed.OutputDataType,
-                    scale: (Expr)producer[PackedMatMul.Scale],
-                    rhsLayout: packed.RhsLayout),
+                CreatePartialCapableProducer(producer),
                 $"forming partial-capable PackedMatMul in {function.Name}");
             if (!Equals(partialCapable.CheckedType, producer.CheckedType))
             {
@@ -112,8 +105,9 @@ public sealed class FormPackedMatMulNormStatsCombinePass : FunctionPass
                      .Where(call => call.Target is NormStats))
         {
             var stats = (NormStats)statsCall.Target;
-            if (statsCall[NormStats.Input] is not Call { Target: PackedMatMul packed } producer ||
-                packed.FusedReduce ||
+            if (statsCall[NormStats.Input] is not Call producer ||
+                producer.Target is not Op producerTarget ||
+                !IsPartialCapableProducer(producerTarget) ||
                 producer.CheckedType is not (TensorType or DistributedType) ||
                 !TryNormalizeAxis(stats.Axis, producer.CheckedShape.Rank, out var axis) ||
                 axis != producer.CheckedShape.Rank - 1)
@@ -132,6 +126,43 @@ public sealed class FormPackedMatMulNormStatsCombinePass : FunctionPass
 
         return result;
     }
+
+    private static bool IsPartialCapableProducer(Op target) => target switch
+    {
+        PackedMatMul { FusedReduce: false } => true,
+        PackedBlockScaledMatMul => true,
+        _ => false,
+    };
+
+    private static Expr GetAddend(Call producer) => producer.Target switch
+    {
+        PackedMatMul => (Expr)producer[PackedMatMul.Addend],
+        PackedBlockScaledMatMul => (Expr)producer[PackedBlockScaledMatMul.Addend],
+        _ => throw new InvalidOperationException(
+            $"Unsupported partial-capable packed matmul {producer.Target.GetType().Name}."),
+    };
+
+    private static Expr CreatePartialCapableProducer(Call producer) => producer.Target switch
+    {
+        PackedMatMul packed => IR.F.NTT.PackedMatMul(
+            (Expr)producer[PackedMatMul.Lhs],
+            (Expr)producer[PackedMatMul.Rhs],
+            fusedReduce: false,
+            outDataType: packed.OutputDataType,
+            scale: (Expr)producer[PackedMatMul.Scale],
+            rhsLayout: packed.RhsLayout),
+        PackedBlockScaledMatMul packed => IR.F.NTT.PackedBlockScaledMatMul(
+            (Expr)producer[PackedBlockScaledMatMul.Lhs],
+            (Expr)producer[PackedBlockScaledMatMul.Rhs],
+            (Expr)producer[PackedBlockScaledMatMul.RhsScale],
+            packed.OutputDataType,
+            packed.WeightBlockN,
+            packed.WeightBlockK,
+            packed.RhsLayout,
+            packed.OutputNVectorLaneCount),
+        _ => throw new InvalidOperationException(
+            $"Unsupported partial-capable packed matmul {producer.Target.GetType().Name}."),
+    };
 
     private static bool TryNormalizeAxis(int axis, int rank, out int normalizedAxis)
     {

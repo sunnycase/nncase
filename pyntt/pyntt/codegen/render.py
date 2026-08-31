@@ -33,6 +33,8 @@ THROUGHPUT_BLOCK_SIZE_CANDIDATES = (128, 256, 512, 1024)
 WARP_SPECIALIZATION_PRODUCER_WARPS = 1
 WARP_SPECIALIZATION_WORKER_ALLOCATION_WARPS = 4
 WARP_SPECIALIZATION_MINIMUM_PARTITION_REGISTERS = 24
+WARP_SPECIALIZATION_AUXILIARY_CONSUMER_WARPS = 4
+WARP_SPECIALIZATION_AUXILIARY_CONSUMER_REGISTERS = 160
 PAGED_ATTENTION_BLOCK_N_CANDIDATES = (32, 64)
 PAGED_ATTENTION_NUM_STAGES_CANDIDATES = (2, 3)
 PAGED_ATTENTION_BLOCK_N = 64
@@ -511,6 +513,8 @@ def render_manifest(manifest: dict[str, Any]) -> str:
         for function in manifest.get("functions", ())
         for kernel in function.get("render_kernels", ())
     ]
+    for kernel in render_kernels:
+        _annotate_barrier_synchronized_helpers(kernel)
     grid_mesh_topology = _grid_mesh_topology(manifest)
     kernels = [
         _render_kernel(kernel, grid_mesh_topology) for kernel in render_kernels
@@ -540,6 +544,75 @@ def render_manifest(manifest: dict[str, Any]) -> str:
         ],
         grid_barrier_axis_groups=grid_barrier_axis_groups,
     )
+
+
+def _annotate_barrier_synchronized_helpers(kernel: dict[str, Any]) -> None:
+    """Mark helper calls whose remote writes complete before their next use."""
+
+    helper_models: dict[str, list[dict[str, Any]]] = {}
+    sources: list[str] = []
+
+    def walk(value: Any) -> None:
+        if isinstance(value, dict):
+            function_name = value.get("FunctionName")
+            if (
+                isinstance(function_name, str)
+                and function_name
+                and isinstance(value.get("MicroKernel"), dict)
+            ):
+                helper_models.setdefault(function_name, []).append(value)
+            for key, child in value.items():
+                if (
+                    isinstance(child, str)
+                    and (key == "body_source" or key.endswith("BodySource"))
+                    and child.strip()
+                ):
+                    sources.append(child)
+                else:
+                    walk(child)
+        elif isinstance(value, (list, tuple)):
+            for child in value:
+                walk(child)
+
+    def direct_call_name(statement: ast.stmt) -> str | None:
+        if not isinstance(statement, ast.Expr) or not isinstance(
+            statement.value, ast.Call
+        ):
+            return None
+        function = statement.value.func
+        return function.id if isinstance(function, ast.Name) else None
+
+    def is_full_grid_barrier(statement: ast.stmt) -> bool:
+        if not isinstance(statement, ast.Expr) or not isinstance(
+            statement.value, ast.Call
+        ):
+            return False
+        call = statement.value
+        return (
+            isinstance(call.func, ast.Attribute)
+            and call.func.attr == "distributed_barrier"
+            and isinstance(call.func.value, ast.Name)
+            and call.func.value.id == "tle"
+            and len(call.args) == 1
+            and isinstance(call.args[0], ast.Name)
+            and call.args[0].id == "PYNTT_GRID_MESH"
+            and not call.keywords
+        )
+
+    walk(kernel)
+    synchronized_consumers: set[str] = set()
+    for source in sources:
+        statements = ast.parse(source).body
+        for current, following in zip(statements, statements[1:]):
+            call_name = direct_call_name(current)
+            if call_name is not None and is_full_grid_barrier(following):
+                synchronized_consumers.add(call_name)
+
+    for function_name, models in helper_models.items():
+        if f"{function_name}__consumer" not in synchronized_consumers:
+            continue
+        for model in models:
+            model["_BarrierSynchronizedCooperativeNTiles"] = True
 
 
 def _paged_attention_backend_config(kernel: dict[str, Any]) -> dict[str, Any]:
@@ -700,6 +773,8 @@ def _kernel_backend_config(kernel: dict[str, Any]) -> dict[str, Any]:
         "paged_attention": _paged_attention_backend_config(kernel),
         "producer_warps": WARP_SPECIALIZATION_PRODUCER_WARPS,
         "producer_registers": producer_registers,
+        "auxiliary_consumer_warps": WARP_SPECIALIZATION_AUXILIARY_CONSUMER_WARPS,
+        "auxiliary_consumer_registers": WARP_SPECIALIZATION_AUXILIARY_CONSUMER_REGISTERS,
         "consumer_registers": consumer_registers,
         "register_granularity": register_granularity,
         "registers_per_thread_limit": registers_per_thread_limit,
@@ -885,7 +960,14 @@ def _pipeline_helper_descriptor_specs(
     ):
         descriptor_names = (model.get("RhsDescriptorName"),)
         descriptor_specs = (
-            _n_major_k_packed_gemv_host_descriptor_spec
+            (
+                lambda current_model, backing:
+                _n_major_k_packed_gemv_host_descriptor_spec(
+                    current_model,
+                    backing,
+                    variant=str(current_model["MicroKernel"]["Variant"]),
+                )
+            )
             if template.endswith("/mma_block_fp8_smem_pipeline.py.jinja")
             else _packed_gemv_host_descriptor_spec,
         )
@@ -925,6 +1007,8 @@ def _pipeline_helper_descriptor_specs(
             "triton/kernels/matmul_glu/simt_fma_smem_pipeline.py.jinja",
             "triton/kernels/matmul_glu/simt_fp8_fma_smem_pipeline.py.jinja",
             "triton/kernels/matmul_glu/simt_block_fp8_fma_smem_pipeline.py.jinja",
+            "triton/kernels/matmul_glu/mma_block_fp8_smem_pipeline.py.jinja",
+            "triton/kernels/matmul_glu/mma_n_major_block_fp8_smem_pipeline.py.jinja",
         )
     ):
         descriptor_names = tuple(
@@ -1243,16 +1327,266 @@ def _n_major_k_packed_gemv_descriptor_n_plan(
     }
 
 
+def _matmul_glu_cooperative_n_tile_plan(
+    model: dict[str, Any], block_n: int
+) -> dict[str, int | str] | None:
+    """Plan balanced N tiles when a following full-grid barrier closes writes."""
+
+    if not model.get("_BarrierSynchronizedCooperativeNTiles"):
+        return None
+    raw_microkernel = model.get("MicroKernel")
+    parameters = (
+        raw_microkernel.get("Parameters")
+        if isinstance(raw_microkernel, dict)
+        else None
+    )
+    if (
+        not isinstance(parameters, dict)
+        or not isinstance(raw_microkernel.get("AuxiliaryConsumer"), dict)
+        or bool(model.get("EmitPartialResults"))
+        or bool(model.get("HasGateBias"))
+        or bool(model.get("HasUpBias"))
+    ):
+        return None
+
+    n_lane = int(model.get("NVectorLaneCount", 0))
+    output = model.get("Output")
+    weights = tuple(model.get(f"{prefix}Weight") for prefix in ("Gate", "Up"))
+    if (
+        n_lane <= 0
+        or not isinstance(output, dict)
+        or any(not isinstance(weight, dict) for weight in weights)
+        or output.get("DistributedStorageKind") != "CanonicalGlobal"
+        or any(
+            weight.get("DistributedStorageKind") != "CanonicalGlobal"
+            for weight in weights
+        )
+    ):
+        return None
+
+    hierarchy = tuple(int(value) for value in output.get("Hierarchy", ()))
+    if len(hierarchy) < 2 or any(value <= 0 for value in hierarchy):
+        return None
+    expected_axes = list(range(len(hierarchy)))
+
+    def has_uniform_contiguous_n_shard(
+        pointer: dict[str, Any], axis: int
+    ) -> bool:
+        shard_axes = pointer.get("ShardAxes")
+        if not isinstance(shard_axes, list) or axis >= len(shard_axes):
+            return False
+        stages = _shard_axis_stages(shard_axes[axis])
+        return (
+            pointer.get("Hierarchy") == list(hierarchy)
+            and len(stages) == 1
+            and (
+                stages[0].get("Distribution") == "Contiguous"
+                or (
+                    stages[0].get("Distribution") == "BlockCyclic"
+                    and int(stages[0].get("BlockSize", 0)) > 0
+                )
+            )
+            and stages[0].get("HierarchyAxes") == expected_axes
+            and all(
+                not _shard_axis_stages(shard_axis)
+                for index, shard_axis in enumerate(shard_axes)
+                if index != axis
+            )
+        )
+
+    if not has_uniform_contiguous_n_shard(output, 1) or any(
+        not has_uniform_contiguous_n_shard(weight, 0) for weight in weights
+    ):
+        return None
+    if any(
+        any(_fixed(offset) != 0 for offset in pointer.get("GlobalOffsets", ()))
+        for pointer in (output, *weights)
+    ) or any(
+        model.get(f"{prefix}WeightDescriptorOriginElements") != "0"
+        for prefix in ("Gate", "Up")
+    ):
+        return None
+
+    output_shape = model.get("OutputShape")
+    output_global_shape = output.get("GlobalShape")
+    weight_global_shapes = tuple(weight.get("GlobalShape") for weight in weights)
+    if (
+        not isinstance(output_shape, list)
+        or len(output_shape) != 2
+        or not isinstance(output_global_shape, list)
+        or len(output_global_shape) != 2
+        or any(
+            not isinstance(shape, list) or len(shape) != 2
+            for shape in weight_global_shapes
+        )
+    ):
+        return None
+
+    local_outer_n = _max_value(output_shape[-1])
+    global_output_outer_n = _fixed(output_global_shape[-1])
+    global_weight_ns = tuple(_fixed(shape[0]) for shape in weight_global_shapes)
+    if (
+        local_outer_n is None
+        or global_output_outer_n is None
+        or any(extent is None for extent in global_weight_ns)
+    ):
+        return None
+    local_n = local_outer_n * n_lane
+    global_n = global_output_outer_n * n_lane
+    owner_count = prod(hierarchy)
+    if (
+        global_n <= 0
+        or global_weight_ns != (global_n, global_n)
+        or local_n * owner_count != global_n
+    ):
+        return None
+
+    group_size = hierarchy[-1]
+    group_n = local_n * group_size
+    if group_n % block_n != 0:
+        return None
+    group_tiles = group_n // block_n
+    local_tiles = (local_n + block_n - 1) // block_n
+    if group_tiles >= local_tiles * group_size:
+        return None
+    base_tiles, extra_tiles = divmod(group_tiles, group_size)
+    tiles_per_owner = base_tiles + int(extra_tiles != 0)
+    active_n = f"({base_tiles * block_n}"
+    if extra_tiles:
+        active_n += (
+            f" + ((shard_index % {group_size}) < {extra_tiles}).to(tl.int32)"
+            f" * {block_n}"
+        )
+    active_n += ")"
+    global_output_n = (
+        f"((((shard_index // {group_size}) * {group_tiles} + "
+        f"n_tile * {group_size} + (shard_index % {group_size})) * "
+        f"{block_n}) + local_n)"
+    )
+    return {
+        "owner_count": owner_count,
+        "group_size": group_size,
+        "group_tiles": group_tiles,
+        "base_tiles": base_tiles,
+        "extra_tiles": extra_tiles,
+        "tiles_per_owner": tiles_per_owner,
+        "block_n": block_n,
+        "global_n": global_n,
+        "runtime_active_n": active_n,
+        "global_output_n": global_output_n,
+    }
+
+
+def _cooperative_n_major_k_packed_descriptor_spec(
+    spec: dict[str, Any],
+    backing: dict[str, Any],
+    plan: dict[str, int | str],
+) -> dict[str, Any]:
+    entries = tuple(spec["entries"])
+    if not entries:
+        raise ValueError("PyNTT cooperative N tiling requires descriptor entries.")
+    prototype = entries[0]
+    prototype_shape = tuple(int(value) for value in prototype["shape"])
+    if len(prototype_shape) < 2:
+        raise ValueError(
+            "PyNTT cooperative N tiling requires an N-major descriptor."
+        )
+
+    logical_strides = tuple(int(value) for value in backing["logical_strides"])
+    vector_lanes = tuple(int(value) for value in backing["vector_lane_shape"])
+    item_size = TMA_DTYPE_ITEM_SIZES[backing["scalar_dtype"]]
+    scalar_row_stride = logical_strides[0] * prod(vector_lanes)
+    logical_shape = tuple(int(value) for value in backing["logical_shape"])
+    if len(logical_shape) != 2 or len(logical_strides) != 2:
+        raise ValueError(
+            "PyNTT cooperative N tiling requires a rank-2 logical backing."
+        )
+    block_n = int(plan["block_n"])
+    source_block_shape = tuple(int(value) for value in spec["block_shape"])
+    source_block_elements = prod(source_block_shape)
+    if source_block_elements % block_n != 0:
+        raise ValueError(
+            "PyNTT cooperative N descriptor block does not contain an "
+            f"integral K extent: shape={source_block_shape}, block_n={block_n}."
+        )
+    transfer_k = source_block_elements // block_n
+    scalar_k = logical_shape[1] * prod(vector_lanes)
+    innermost_k = source_block_shape[-1]
+    if (
+        transfer_k <= 0
+        or scalar_k <= 0
+        or scalar_k % innermost_k != 0
+        or transfer_k % innermost_k != 0
+    ):
+        raise ValueError(
+            "PyNTT cooperative N descriptor cannot canonicalize its K "
+            f"geometry: transfer_k={transfer_k}, scalar_k={scalar_k}, "
+            f"innermost_k={innermost_k}."
+        )
+    transfer_outer = transfer_k // innermost_k
+    if transfer_outer > 1:
+        block_shape = (transfer_outer, block_n, innermost_k)
+        entry_shape = (scalar_k // innermost_k, block_n, innermost_k)
+        entry_strides = (innermost_k, scalar_row_stride, 1)
+    else:
+        block_shape = (block_n, transfer_k)
+        entry_shape = (block_n, scalar_k)
+        entry_strides = (scalar_row_stride, 1)
+    owner_count = int(plan["owner_count"])
+    group_size = int(plan["group_size"])
+    group_tiles = int(plan["group_tiles"])
+    tiles_per_owner = int(plan["tiles_per_owner"])
+    rewritten = []
+    for owner in range(owner_count):
+        group_index, group_lane = divmod(owner, group_size)
+        for wave in range(tiles_per_owner):
+            group_tile = wave * group_size + group_lane
+            entry = dict(prototype)
+            if group_tile < group_tiles:
+                global_tile = group_index * group_tiles + group_tile
+                entry["offset_bytes"] = (
+                    int(backing["offset_bytes"])
+                    + global_tile * block_n * scalar_row_stride * item_size
+                )
+                entry["shape"] = entry_shape
+            else:
+                entry["offset_bytes"] = int(backing["offset_bytes"])
+                padding_shape = list(entry_shape)
+                padding_shape[-2] = 1
+                entry["shape"] = tuple(padding_shape)
+            entry["strides"] = entry_strides
+            entry["source_shape_axes"] = tuple(() for _ in entry_shape)
+            rewritten.append(entry)
+    return {
+        **spec,
+        "block_shape": block_shape,
+        "swizzle_mode": _nv_tma_swizzle_mode(
+            block_shape, backing["scalar_dtype"]
+        ),
+        "entries": tuple(rewritten),
+    }
+
+
 def _n_major_k_packed_gemv_host_descriptor_spec(
     model: dict[str, Any],
     backing: dict[str, Any],
+    *,
+    family: str = "triton.matmul",
+    variant: str = "mma_block_fp8_smem_pipeline",
+    pointer_key: str = "Rhs",
+    output_n_vector_lane_key: str = "OutputNVectorLaneCount",
+    required_workspace_names: tuple[str, ...] | None = None,
 ) -> dict[str, Any]:
     """Build owner/tile-indexed rank-2 TMA views of scalar [N, K] weights."""
 
     microkernel = _microkernel_context(
-        model, "triton.matmul", "mma_block_fp8_smem_pipeline"
+        model,
+        family,
+        variant,
+        required_workspace_names=required_workspace_names,
     )
     logical_block_n = microkernel["parameters"]["block_n"]
+    block_k = microkernel["parameters"]["block_k"]
     transfer_block_k = _require_int(
         microkernel["parameters"].get("transfer_block_k"),
         "microkernel.transfer_block_k",
@@ -1282,7 +1616,11 @@ def _n_major_k_packed_gemv_host_descriptor_spec(
     if (
         logical_block_n <= 0
         or transfer_block_k % k_atom != 0
-        or reduction_group % transfer_block_k != 0
+        or block_k % transfer_block_k != 0
+        or not (
+            reduction_group % transfer_block_k == 0
+            or transfer_block_k % reduction_group == 0
+        )
     ):
         raise ValueError(
             "PyNTT N-major K-packed GEMV descriptor tile is incompatible with "
@@ -1290,10 +1628,17 @@ def _n_major_k_packed_gemv_host_descriptor_spec(
             f"transfer_block_k={transfer_block_k}, k_atom={k_atom}."
         )
     k_outer_extent = transfer_block_k // k_atom
+    reduction_groups_per_transfer = transfer_block_k // reduction_group
 
-    pointer = model["Rhs"]
+    pointer = model[pointer_key]
     n_plan = _n_major_k_packed_gemv_descriptor_n_plan(pointer, logical_block_n)
-    descriptor_block_shape = tuple(n_plan["block_shape"]) + (transfer_block_k,)
+    descriptor_block_shape = (
+        (reduction_groups_per_transfer,)
+        + tuple(n_plan["block_shape"])
+        + (reduction_group,)
+        if reduction_groups_per_transfer > 1
+        else tuple(n_plan["block_shape"]) + (transfer_block_k,)
+    )
     hierarchy = pointer.get("Hierarchy")
     pointer_global_shape = pointer.get("GlobalShape")
     if not isinstance(hierarchy, list) or not hierarchy:
@@ -1425,8 +1770,24 @@ def _n_major_k_packed_gemv_host_descriptor_spec(
                 * descriptor_row_stride
                 for dimension in n_plan["retained_dimensions"]
             )
-            descriptor_shape = descriptor_n_shape + (local_k_extent,)
-            descriptor_strides = descriptor_n_strides + (1,)
+            if reduction_groups_per_transfer > 1:
+                if local_k_extent % reduction_group != 0:
+                    raise ValueError(
+                        "PyNTT merged N-major K-packed GEMV descriptor K "
+                        f"extent {local_k_extent} is not divisible by "
+                        f"the reduction group {reduction_group}."
+                    )
+                descriptor_shape = (
+                    (local_k_extent // reduction_group,)
+                    + descriptor_n_shape
+                    + (reduction_group,)
+                )
+                descriptor_strides = (
+                    (reduction_group,) + descriptor_n_strides + (1,)
+                )
+            else:
+                descriptor_shape = descriptor_n_shape + (local_k_extent,)
+                descriptor_strides = descriptor_n_strides + (1,)
             entries_for_owner.append(
                 {
                     "offset_bytes": int(backing["offset_bytes"])
@@ -1450,7 +1811,7 @@ def _n_major_k_packed_gemv_host_descriptor_spec(
         raise ValueError(
             "PyNTT N-major K-packed GEMV requires a bounded local output N axis."
         )
-    output_n_lanes = int(model["OutputNVectorLaneCount"])
+    output_n_lanes = int(model[output_n_vector_lane_key])
     expected_tiles_per_owner = (
         (output_outer_n * output_n_lanes + logical_block_n - 1)
         // logical_block_n
@@ -1479,7 +1840,7 @@ def _n_major_k_packed_gemv_host_descriptor_spec(
         )
     )
 
-    return {
+    spec = {
         "kind": "table",
         "name": backing["name"],
         "source": backing["source"],
@@ -1492,6 +1853,19 @@ def _n_major_k_packed_gemv_host_descriptor_spec(
         "entry_size_bytes": TENSOR_MAP_ENTRY_BYTES,
         "entries": entries,
     }
+    cooperative_plan = (
+        _matmul_glu_cooperative_n_tile_plan(model, logical_block_n)
+        if family == "triton.matmul_glu"
+        and variant == "mma_n_major_block_fp8_smem_pipeline"
+        else None
+    )
+    return (
+        _cooperative_n_major_k_packed_descriptor_spec(
+            spec, backing, cooperative_plan
+        )
+        if cooperative_plan is not None
+        else spec
+    )
 
 
 def _tma_owner_backing_base_elements(
@@ -1862,9 +2236,45 @@ def _packed_matmul_glu_gemv_host_descriptor_spec(
     backing: dict[str, Any],
     prefix: str,
 ) -> dict[str, Any]:
+    raw_parameters = model["MicroKernel"].get("Parameters")
+    required_workspace_names = None
+    if (
+        isinstance(raw_parameters, dict)
+        and raw_parameters.get("split_projection_channels") == 1
+    ):
+        required_workspace_names = (
+            "gate_rhs_stage",
+            "up_rhs_stage",
+            "lhs_quantized",
+            "lhs_scale",
+        ) + (("lhs_stage",) if "lhs_stage_extent" in raw_parameters else ())
     microkernel = _microkernel_context(
-        model, "triton.matmul_glu", str(model["MicroKernel"]["Variant"])
+        model,
+        "triton.matmul_glu",
+        str(model["MicroKernel"]["Variant"]),
+        required_workspace_names=required_workspace_names,
     )
+    if microkernel["variant"] == "mma_n_major_block_fp8_smem_pipeline":
+        return _n_major_k_packed_gemv_host_descriptor_spec(
+            model,
+            backing,
+            family="triton.matmul_glu",
+            variant="mma_n_major_block_fp8_smem_pipeline",
+            pointer_key=f"{prefix}Weight",
+            output_n_vector_lane_key="NVectorLaneCount",
+            required_workspace_names=required_workspace_names,
+        )
+    if microkernel["parameters"].get("owner_major_weight") == 1:
+        return _owner_major_k_major_gemv_host_descriptor_spec(
+            model,
+            backing,
+            block_n=microkernel["parameters"]["block_n"],
+            block_k=microkernel["parameters"]["block_k"],
+            pointer=model[f"{prefix}Weight"],
+            expected_vector_lane_shape=_packed_gemv_vector_lane_shape(
+                microkernel["variant"]
+            ),
+        )
     return _k_major_gemv_host_descriptor_spec(
         model,
         backing,
@@ -1875,6 +2285,54 @@ def _packed_matmul_glu_gemv_host_descriptor_spec(
             microkernel["variant"]
         ),
     )
+
+
+def _owner_major_k_major_gemv_host_descriptor_spec(
+    model: dict[str, Any],
+    backing: dict[str, Any],
+    *,
+    block_n: int,
+    block_k: int,
+    pointer: dict[str, Any],
+    expected_vector_lane_shape: tuple[int, int, int],
+) -> dict[str, Any]:
+    """Describe an offline owner-major copy of a balanced K-major weight."""
+
+    canonical = _k_major_gemv_host_descriptor_spec(
+        model,
+        backing,
+        block_n=block_n,
+        block_k=block_k,
+        pointer=pointer,
+        expected_vector_lane_shape=expected_vector_lane_shape,
+    )
+    entries = tuple(canonical["entries"])
+    if not entries:
+        raise ValueError("PyNTT owner-major GEMV requires descriptor entries.")
+    local_shape = tuple(entries[0]["shape"])
+    if any(tuple(entry["shape"]) != local_shape for entry in entries):
+        raise ValueError(
+            "PyNTT owner-major GEMV requires one fixed local shape per owner."
+        )
+    item_size = TMA_DTYPE_ITEM_SIZES[backing["scalar_dtype"]]
+    owner_stride_elements = _product_int(list(local_shape))
+    local_strides = []
+    stride = 1
+    for extent in reversed(local_shape):
+        local_strides.append(stride)
+        stride *= int(extent)
+    local_strides.reverse()
+    owner_entries = tuple(
+        {
+            **entry,
+            "offset_bytes": int(backing["offset_bytes"])
+            + owner * owner_stride_elements * item_size,
+            "strides": tuple(local_strides),
+            "source_shape_axes": tuple(() for _ in local_shape),
+        }
+        for owner, entry in enumerate(entries)
+    )
+    return {**canonical, "entries": owner_entries}
 
 
 def _packed_qkv_fixed_projection_ns(model: dict[str, Any]) -> dict[str, int]:
@@ -1900,6 +2358,7 @@ def _packed_gemv_vector_lane_shape(variant: str) -> tuple[int, int, int]:
         "mma_smem_pipeline": (8, 2, 8),
         "simt_fp8_fma_smem_pipeline": (8, 2, 16),
         "simt_block_fp8_fma_smem_pipeline": (8, 2, 16),
+        "mma_block_fp8_smem_pipeline": (8, 2, 16),
     }
     try:
         return shapes[variant]
@@ -2419,6 +2878,13 @@ def _prepare_helper_model(
         model["RegistersPerThreadLimit"] = registers_per_thread_limit
     if kernel_config is not None:
         model["KernelConfig"] = kernel_config
+        if model.get("AuxiliaryConsumerFunctionName"):
+            model["AuxiliaryConsumerWarps"] = kernel_config[
+                "auxiliary_consumer_warps"
+            ]
+            model["AuxiliaryConsumerRegisters"] = kernel_config[
+                "auxiliary_consumer_registers"
+            ]
 
     if "Stages" in model:
         stages = []
@@ -2440,7 +2906,11 @@ def _prepare_helper_model(
             stages.append(stage)
         model["Stages"] = tuple(stages)
     if device_functions_by_name is not None:
-        for body_key in ("ConsumerBodySource", "ProducerBodySource"):
+        for body_key in (
+            "ConsumerBodySource",
+            "AuxiliaryConsumerBodySource",
+            "ProducerBodySource",
+        ):
             body_source = model.get(body_key)
             if isinstance(body_source, str):
                 model[body_key] = _replace_device_function_calls(
@@ -2604,6 +3074,12 @@ def _make_env() -> Environment:
         ),
         packed_block_fp8_matmul_glu_gemv_pipeline_context=(
             _packed_block_fp8_matmul_glu_gemv_pipeline_template_context
+        ),
+        packed_block_fp8_mma_matmul_glu_gemv_pipeline_context=(
+            _packed_block_fp8_mma_matmul_glu_gemv_pipeline_template_context
+        ),
+        packed_block_fp8_mma_n_major_matmul_glu_gemv_pipeline_context=(
+            _packed_block_fp8_mma_n_major_matmul_glu_gemv_pipeline_template_context
         ),
         matmul_context=_matmul_template_context,
         nvfp4_matmul_context=_nvfp4_matmul_template_context,
@@ -5530,14 +6006,26 @@ def _microkernel_context(
             for axis, dimension in enumerate(dimensions)
         )
     has_complete_consumer_lhs_stage = "lhs_stage_extent" in parameters
+    simt_staged_variants = (
+        "simt_fma_smem_pipeline",
+        "simt_fp8_fma_smem_pipeline",
+        "simt_block_fp8_fma_smem_pipeline",
+    )
     if has_complete_consumer_lhs_stage and not (
         family in ("triton.matmul", "triton.matmul_glu")
-        and variant == "simt_fma_smem_pipeline"
+        and (
+            variant in simt_staged_variants
+            or variant
+            in (
+                "mma_block_fp8_smem_pipeline",
+                "mma_n_major_block_fp8_smem_pipeline",
+            )
+        )
     ):
         raise ValueError(
             "microkernel.Parameters['lhs_stage_extent'] is only valid for "
-            "triton.matmul or triton.matmul_glu with "
-            "simt_fma_smem_pipeline."
+            "triton.matmul or triton.matmul_glu with a SIMT or MMA "
+            "Shared-staged pipeline."
         )
     required_offsets = required_workspace_names
     if required_offsets is None:
@@ -5566,7 +6054,12 @@ def _microkernel_context(
                 "rhs_stage",
                 "lhs_quantized",
                 "lhs_scale",
-            ),
+            ) + (("lhs_stage",) if has_complete_consumer_lhs_stage else ()),
+            "mma_n_major_block_fp8_smem_pipeline": (
+                "rhs_stage",
+                "lhs_quantized",
+                "lhs_scale",
+            ) + (("lhs_stage",) if has_complete_consumer_lhs_stage else ()),
             "mma": ("lhs_stage", "rhs_stage"),
             "dot": ("lhs_stage", "rhs_stage"),
             "mma_direct": (),
@@ -5603,26 +6096,83 @@ def _microkernel_context(
         raise ValueError(
             "microkernel.ConsumerSharedWorkspaceNames must be unique."
         )
-    expected_consumer_workspaces = (
-        ("lhs_stage",)
-        if (
-            variant == "mma_smem_pipeline"
-            or (
-                variant == "simt_fma_smem_pipeline"
-                and (
-                    family == "triton.qkv_parallel_linear"
-                    or has_complete_consumer_lhs_stage
-                )
-            )
+    if variant in (
+        "mma_block_fp8_smem_pipeline",
+        "mma_n_major_block_fp8_smem_pipeline",
+    ):
+        expected_consumer_workspaces = (
+            "lhs_quantized",
+            "lhs_scale",
+        ) + (("lhs_stage",) if has_complete_consumer_lhs_stage else ())
+    elif family == "triton.gated_delta_net" and variant == "recurrent_core":
+        expected_consumer_workspaces = ("projection_stage",)
+    elif variant == "mma_smem_pipeline" or (
+        variant in simt_staged_variants
+        and (
+            family == "triton.qkv_parallel_linear"
+            or has_complete_consumer_lhs_stage
         )
-        else ()
-    )
+    ):
+        expected_consumer_workspaces = ("lhs_stage",)
+    else:
+        expected_consumer_workspaces = ()
     if consumer_workspaces != expected_consumer_workspaces:
         raise ValueError(
             "microkernel.ConsumerSharedWorkspaceNames does not match the "
             f"selected algorithm: expected={list(expected_consumer_workspaces)}, "
             f"actual={list(consumer_workspaces)}."
         )
+
+    raw_auxiliary_consumer = microkernel.get("AuxiliaryConsumer")
+    auxiliary_consumer = None
+    if raw_auxiliary_consumer is not None:
+        auxiliary_consumer = _require_exact_object(
+            raw_auxiliary_consumer,
+            "microkernel.AuxiliaryConsumer",
+            {"TransferPipelineChannelNames", "SharedWorkspaceNames"},
+        )
+        auxiliary_channel_names = tuple(
+            _require_string_list(
+                auxiliary_consumer["TransferPipelineChannelNames"],
+                "microkernel.AuxiliaryConsumer.TransferPipelineChannelNames",
+            )
+        )
+        auxiliary_workspace_names = tuple(
+            _require_string_list(
+                auxiliary_consumer["SharedWorkspaceNames"],
+                "microkernel.AuxiliaryConsumer.SharedWorkspaceNames",
+            )
+        )
+        if not auxiliary_channel_names or len(set(auxiliary_channel_names)) != len(
+            auxiliary_channel_names
+        ):
+            raise ValueError(
+                "microkernel.AuxiliaryConsumer transfer channels must be "
+                "non-empty and unique."
+            )
+        if len(set(auxiliary_workspace_names)) != len(auxiliary_workspace_names):
+            raise ValueError(
+                "microkernel.AuxiliaryConsumer Shared workspaces must be unique."
+            )
+        raw_channels = microkernel.get("TransferPipelineChannels")
+        channel_names = {
+            channel.get("Name")
+            for channel in raw_channels
+            if isinstance(raw_channels, list) and isinstance(channel, dict)
+        } if isinstance(raw_channels, list) else set()
+        if not set(auxiliary_channel_names).issubset(channel_names):
+            raise ValueError(
+                "microkernel.AuxiliaryConsumer references unknown transfer channels."
+            )
+        if not set(auxiliary_workspace_names).issubset(consumer_workspaces):
+            raise ValueError(
+                "microkernel.AuxiliaryConsumer references Shared workspaces not "
+                "owned by the consumer."
+            )
+        auxiliary_consumer = {
+            "transfer_pipeline_channel_names": auxiliary_channel_names,
+            "shared_workspace_names": auxiliary_workspace_names,
+        }
 
     return {
         "family": family,
@@ -5631,6 +6181,7 @@ def _microkernel_context(
         "shared_workspace_offsets": offsets,
         "shared_workspace_shapes": shapes,
         "consumer_shared_workspace_names": consumer_workspaces,
+        "auxiliary_consumer": auxiliary_consumer,
     }
 
 
@@ -6296,8 +6847,14 @@ def _matmul_glu_weight_lane_shape(
     model: dict[str, Any], *, packed: bool
 ) -> tuple[int, ...]:
     n_lane_shape = _matmul_glu_lane_shape(model, packed=packed)
-    if not packed or model.get("RhsLayout", "n_major") == "n_major":
+    rhs_layout = model.get("RhsLayout", "n_major")
+    if not packed or rhs_layout == "n_major":
         return n_lane_shape
+    if rhs_layout == "n_major_k_packed":
+        return (
+            int(model["KPackLaneCount"]),
+            int(model["KVectorLaneCount"]),
+        )
     return (
         *n_lane_shape,
         int(model["KPackLaneCount"]),
@@ -6330,8 +6887,9 @@ def _matmul_glu_weight_access(
     k_expr: str,
     coordinate_shape: str,
 ) -> dict[str, Any]:
+    rhs_layout = model.get("RhsLayout", "n_major")
     n_lane_shape = _matmul_glu_lane_shape(model, packed=packed)
-    if tuple(n_lane_shape) != tuple(n_axis["lane_shape"]):
+    if rhs_layout != "n_major_k_packed" and tuple(n_lane_shape) != tuple(n_axis["lane_shape"]):
         raise ValueError(
             f"PyNTT {prefix} MatMulGlu weight lane shape does not match its N tile: "
             f"weight N={n_lane_shape}, tile={n_axis['lane_shape']}."
@@ -6343,9 +6901,21 @@ def _matmul_glu_weight_access(
     if not packed:
         matrix_coordinates = (k_expr, n_axis["physical_coordinate"])
         lane_coordinates = ()
-    elif model.get("RhsLayout", "n_major") == "n_major":
+    elif rhs_layout == "n_major":
         matrix_coordinates = (n_axis["physical_coordinate"], k_expr)
         lane_coordinates = n_axis["lane_coordinates"]
+    elif rhs_layout == "n_major_k_packed":
+        k_pack = int(model["KPackLaneCount"])
+        k_lane = int(model["KVectorLaneCount"])
+        k_atom = k_pack * k_lane
+        matrix_coordinates = (
+            n_axis["logical_coordinate"],
+            f"({k_expr}) // {k_atom}",
+        )
+        lane_coordinates = (
+            f"(({k_expr}) // {k_lane}) % {k_pack}",
+            f"({k_expr}) % {k_lane}",
+        )
     else:
         k_pack = int(model["KPackLaneCount"])
         k_lane = int(model["KVectorLaneCount"])
@@ -6376,6 +6946,7 @@ def _matmul_glu_output_access(
     m_expr: str,
     n_axis: dict[str, Any],
     coordinate_shape: str,
+    prefix: str = "Output",
 ) -> dict[str, Any]:
     lane_shape = _matmul_glu_lane_shape(model, packed=packed)
     if tuple(lane_shape) != tuple(n_axis["lane_shape"]):
@@ -6384,11 +6955,11 @@ def _matmul_glu_output_access(
             f"output={lane_shape}, tile={n_axis['lane_shape']}."
         )
     coordinates = _aligned_batch_coordinates(
-        model["OutputShape"], 2, output_batch_rank
+        model[f"{prefix}Shape"], 2, output_batch_rank
     ) + (m_expr, n_axis["physical_coordinate"])
     return _tensor_access(
         coordinates,
-        model["OutputStrides"],
+        model[f"{prefix}Strides"],
         n_axis["lane_coordinates"],
         lane_shape,
         coordinate_shape,
@@ -6521,6 +7092,19 @@ def _matmul_glu_template_context(
         m_expr=output_m_coordinate,
         coordinate_shape=_coordinate_shape(output_structured_shape),
     )
+    up_output_access = (
+        _matmul_glu_output_access(
+            model,
+            packed=packed,
+            output_batch_rank=output_batch_rank,
+            n_axis=output_n_axis,
+            m_expr=output_m_coordinate,
+            coordinate_shape=_coordinate_shape(output_structured_shape),
+            prefix="UpOutput",
+        )
+        if bool(model.get("EmitPartialResults"))
+        else None
+    )
     projections = []
     for prefix, accumulator in (("Gate", "gate_acc"), ("Up", "up_acc")):
         _, weight_n_limit = _matmul_glu_weight_n_index(
@@ -6610,6 +7194,7 @@ def _matmul_glu_template_context(
             )
         ),
         output_access=output_access,
+        up_output_access=up_output_access,
         output_structured_shape=output_structured_shape,
         physical_n=model["OutputShape"][-1],
         physical_block_n=output_n_axis["physical_block_extent"],
@@ -6643,7 +7228,7 @@ def _matmul_glu_weight_k_index(
     weight_shape = model[f"{prefix}WeightShape"]
     if not packed:
         return k_expr, weight_shape[-2]
-    if model.get("RhsLayout", "n_major") == "n_major":
+    if model.get("RhsLayout", "n_major") in ("n_major", "n_major_k_packed"):
         return k_expr, weight_shape[-1]
     k_atom = int(model["KPackLaneCount"]) * int(model["KVectorLaneCount"])
     return k_expr, _multiply_dim(weight_shape[-2], k_atom)
@@ -6659,9 +7244,10 @@ def _matmul_glu_weight_n_index(
     weight_shape = model[f"{prefix}WeightShape"]
     if not packed:
         return n_expr, weight_shape[-1]
-    weight_axis = (
-        -2 if model.get("RhsLayout", "n_major") == "n_major" else -1
-    )
+    weight_axis = -2 if model.get("RhsLayout", "n_major") in (
+        "n_major",
+        "n_major_k_packed",
+    ) else -1
     lane_scale = model["NPackedLaneCount"] * model["NVectorLaneCount"]
     return n_expr, _multiply_dim(weight_shape[weight_axis], lane_scale)
 
@@ -7305,7 +7891,6 @@ def _validate_packed_gemv_pipeline_resource_contract(
     minimum_physical_stages = 2 * rhs_tiles_per_group
     if (
         not _is_positive_power_of_two(block_n)
-        or not _is_positive_power_of_two(block_k)
         or not 8 <= block_n <= maximum_block_n
         or block_n % 8 != 0
         or not 128 <= block_k <= 1024
@@ -7313,9 +7898,9 @@ def _validate_packed_gemv_pipeline_resource_contract(
         or num_stages % rhs_tiles_per_group != 0
     ):
         raise ValueError(
-            f"PyNTT {algorithm} resource contract requires a power-of-two "
-            f"block_n in [8, {maximum_block_n}], a power-of-two block_k in "
-            "[128, 1024], "
+            f"PyNTT {algorithm} resource contract requires "
+            f"a power-of-two block_n in [8, {maximum_block_n}], "
+            "block_k in [128, 1024], "
             "and at least two complete buffered RHS groups; got "
             f"block_n={block_n}, block_k={block_k}, "
             f"num_stages={num_stages}, rhs_tiles_per_group={rhs_tiles_per_group}."
@@ -7359,20 +7944,33 @@ def _gated_delta_net_convolution_template_context(
         or parameters["block_k"] != 1
         or parameters["num_stages"] != 1
         or not _is_positive_power_of_two(block_n)
-        or block_n > local_n
+        or block_n > 256
         or local_n % lane_count != 0
     ):
         raise ValueError(
             "PyNTT GatedDeltaNet convolution requires block_m=block_k=num_stages=1, "
-            "a power-of-two block_n no larger than LocalConvDim, and a local "
+            "a power-of-two block_n no larger than 256, and a local "
             f"convolution extent divisible by its lanes; got parameters={parameters}, "
             f"local_n={local_n}, lane_count={lane_count}."
         )
-    return {
+    context = {
         "microkernel": microkernel,
         "block_n": block_n,
         "local_n": local_n,
     }
+    if model.get("QKVPartial") is not None:
+        context["qkv_partial"] = _gated_delta_net_partial_input_context(
+            model["QKVPartial"],
+            model["QKVOutput"],
+            "channel",
+            lane_count,
+            1,
+            "GatedDeltaNetConvolution QKV",
+            "qkv_partial",
+        )
+    else:
+        context["qkv_partial"] = None
+    return context
 
 
 def _gated_delta_net_recurrent_core_template_context(
@@ -7521,8 +8119,36 @@ def _gated_delta_net_recurrent_core_template_context(
         )
     state_value_threads = min(state_value_tile, 32)
     state_key_threads = 32 // state_value_threads
-    projection_heads_per_group = min(maximum_projection_heads_per_cta, 4)
-    return {
+    consumer_warps = _require_int(
+        model.get("NumWarps"), "NumWarps", minimum=1
+    )
+    state_task_tile = 8
+    if (
+        not _is_positive_power_of_two(consumer_warps)
+        or consumer_warps > state_task_tile
+        or state_task_tile % consumer_warps != 0
+    ):
+        raise ValueError(
+            "PyNTT GatedDeltaNet recurrent core requires a power-of-two "
+            f"consumer warp count dividing {state_task_tile}, got "
+            f"{consumer_warps}."
+        )
+    projection_head_limit = min(
+        maximum_projection_heads_per_cta, 4, consumer_warps
+    )
+    projection_heads_per_group = 1 << (
+        projection_head_limit.bit_length() - 1
+    )
+    projection_k_warps = consumer_warps // projection_heads_per_group
+    projection_k_threads = 32 * projection_k_warps
+    if block_k % projection_k_threads != 0:
+        raise ValueError(
+            "PyNTT GatedDeltaNet recurrent projection requires block_k "
+            "divisible by its K-distributed consumer threads; got "
+            f"block_k={block_k}, consumer_warps={consumer_warps}, "
+            f"projection_heads={projection_heads_per_group}."
+        )
+    context = {
         "microkernel": microkernel,
         "block_n": block_n,
         "block_k": block_k,
@@ -7553,14 +8179,28 @@ def _gated_delta_net_recurrent_core_template_context(
         "b_weight_descriptor_owner_indexed": b_descriptor_owner_indexed,
         "a_weight_descriptor_owner_indexed": a_descriptor_owner_indexed,
         "maximum_projection_heads_per_cta": maximum_projection_heads_per_cta,
+        "consumer_warps": consumer_warps,
         "projection_heads_per_group": projection_heads_per_group,
-        "projection_k_warps": 8 // projection_heads_per_group,
+        "projection_k_warps": projection_k_warps,
         "projection_groups": (
             maximum_projection_heads_per_cta + projection_heads_per_group - 1
         )
         // projection_heads_per_group,
         "block_count": block_count,
     }
+    if model.get("ZPartial") is not None:
+        context["z_partial"] = _gated_delta_net_partial_input_context(
+            model["ZPartial"],
+            model["GatedOutput"],
+            "local_value_index",
+            1,
+            2,
+            "GatedDeltaNetRecurrentCore Z",
+            "z_partial",
+        )
+    else:
+        context["z_partial"] = None
+    return context
 
 
 def _sparse_experts_down_pipeline_template_context(
@@ -8204,11 +8844,22 @@ def _packed_block_fp8_mma_gemv_pipeline_template_context(
 ) -> dict[str, Any]:
     """Prepare direct TMA-to-MMA block-scaled FP8 GEMV."""
 
+    raw_microkernel = model.get("MicroKernel")
+    variant = (
+        raw_microkernel.get("Variant")
+        if isinstance(raw_microkernel, dict)
+        else None
+    )
+    if variant != "mma_block_fp8_smem_pipeline":
+        raise ValueError(
+            "PyNTT block-FP8 MMA GEMV requires an mma.sync "
+            f"pipeline variant, got {variant!r}."
+        )
+
     context = _matmul_template_context(
         model,
         gemv=True,
-        variant="mma_block_fp8_smem_pipeline",
-        required_workspace_names=("rhs_stage", "lhs_quantized", "lhs_scale"),
+        variant=variant,
     )
     if (
         model["LhsDType"] != "bfloat16"
@@ -8246,6 +8897,29 @@ def _packed_block_fp8_mma_gemv_pipeline_template_context(
         )
 
     microkernel = context["microkernel"]
+    fragment_accumulate_mma = (
+        microkernel["parameters"].get("fragment_accumulate_mma", 0) == 1
+    )
+    auxiliary_only = microkernel["auxiliary_consumer"] is not None
+    auxiliary_consumer_warps = _require_int(
+        model.get(
+            "AuxiliaryConsumerWarps",
+            WARP_SPECIALIZATION_AUXILIARY_CONSUMER_WARPS,
+        ),
+        "auxiliary_consumer_warps",
+        minimum=1,
+    )
+    large_block_n_mma = (
+        microkernel["parameters"].get("large_block_n_mma", 0) == 1
+    )
+    linear_weight_stage = microkernel["parameters"].get(
+        "linear_weight_stage", 0
+    )
+    if linear_weight_stage not in (0, 1):
+        raise ValueError(
+            "PyNTT block-FP8 MMA GEMV linear_weight_stage must be 0 or 1, "
+            f"got {linear_weight_stage}."
+        )
     block_n = microkernel["parameters"]["block_n"]
     block_k = microkernel["parameters"]["block_k"]
     num_stages = microkernel["parameters"]["num_stages"]
@@ -8264,11 +8938,13 @@ def _packed_block_fp8_mma_gemv_pipeline_template_context(
     if (
         block_n % 16 != 0
         or block_k % reduction_group != 0
-        or reduction_group % transfer_block_k != 0
+        or block_k % transfer_block_k != 0
+        or transfer_block_k % reduction_group != 0
     ):
         raise ValueError(
-            "PyNTT block-FP8 MMA GEMV requires block_n divisible by 16 and "
-            "a nested block_k/scale-group/transfer-K hierarchy, got "
+            "PyNTT block-FP8 MMA GEMV requires block_n divisible by its "
+            "native matrix-M tile and "
+            "transfer-K containing complete scale groups, got "
             f"block_n={block_n}, block_k={block_k}, "
             f"scale_group_k={reduction_group}, transfer_k={transfer_block_k}."
         )
@@ -8277,14 +8953,158 @@ def _packed_block_fp8_mma_gemv_pipeline_template_context(
         block_n=block_n,
         block_k=block_k,
         num_stages=num_stages,
-        maximum_block_n=128,
+        maximum_block_n=(256 if large_block_n_mma else 128),
     )
+    if large_block_n_mma and block_n != 256:
+        raise ValueError(
+            "PyNTT experimental large-N block-FP8 MMA GEMV requires block_n=256."
+        )
     reduction_groups_per_stage = block_k // reduction_group
-    transfer_chunks_per_group = reduction_group // transfer_block_k
+    merge_scale_group_transfers = (
+        microkernel["parameters"].get("disable_scale_group_transfer_merge", 0)
+        != 1
+    )
+    transfer_chunks_per_group = 1
+    reduction_groups_per_transfer = (
+        transfer_block_k // reduction_group
+        if merge_scale_group_transfers
+        else 1
+    )
+    transfers_per_stage = (
+        block_k // transfer_block_k
+        if merge_scale_group_transfers
+        else reduction_groups_per_stage
+    )
+    num_warps = _require_int(model.get("NumWarps"), "NumWarps", minimum=1)
+    mma_instruction_n = 8
+    if (
+        block_n % num_warps != 0
+        or mma_instruction_n % num_warps != 0
+    ):
+        raise ValueError(
+            "PyNTT block-FP8 MMA GEMV register-quantized activation requires "
+            "one complete scale group per MMA operand, block_n divisible by the "
+            "consumer warp count, and the MMA instruction N dimension divisible "
+            f"by the consumer warp count; got block_n={block_n}, "
+            f"mma_n={mma_instruction_n}, num_warps={num_warps}."
+        )
+    k = _fixed(context["k"])
+    rhs_k = _fixed(context["rhs_k"])
+    lhs_stage_extent = microkernel["parameters"].get("lhs_stage_extent")
+    use_complete_consumer_lhs_stage = lhs_stage_extent is not None
+    prequantize_lhs = microkernel["parameters"].get("prequantize_lhs", 0)
+    if prequantize_lhs not in (0, 1):
+        raise ValueError(
+            "PyNTT block-FP8 MMA GEMV prequantize_lhs must be 0 or 1, "
+            f"got {prequantize_lhs}."
+        )
+    prequantize_complete_lhs = prequantize_lhs == 1
+    reuse_prequantized_lhs = microkernel["parameters"].get(
+        "reuse_prequantized_lhs", 0
+    )
+    if reuse_prequantized_lhs not in (0, 1):
+        raise ValueError(
+            "PyNTT block-FP8 MMA GEMV reuse_prequantized_lhs must be 0 or 1, "
+            f"got {reuse_prequantized_lhs}."
+        )
+    reuse_prequantized_lhs = reuse_prequantized_lhs == 1
+    if sum(
+        (
+            prequantize_complete_lhs,
+            reuse_prequantized_lhs,
+            use_complete_consumer_lhs_stage,
+        )
+    ) > 1:
+        raise ValueError(
+            "PyNTT block-FP8 MMA GEMV complete-LHS materialization and reuse "
+            "modes are mutually exclusive."
+        )
+    materialize_complete_lhs_quantization = (
+        prequantize_complete_lhs or use_complete_consumer_lhs_stage
+    )
+    reuse_complete_lhs_quantization = (
+        materialize_complete_lhs_quantization or reuse_prequantized_lhs
+    )
+    if auxiliary_only and (
+        block_n != 64
+        or block_n % auxiliary_consumer_warps != 0
+        or mma_instruction_n % auxiliary_consumer_warps != 0
+        or not fragment_accumulate_mma
+        or not reuse_complete_lhs_quantization
+    ):
+        raise ValueError(
+            "PyNTT block-FP8 MMA GEMV auxiliary-only execution requires "
+            "block_n=64, primary and auxiliary warp counts dividing block_n "
+            "and mma_n=8, fragment accumulation, and complete reusable LHS "
+            "quantization."
+        )
+    if (
+        k is None
+        or k <= 0
+        or rhs_k != k
+        or k % reduction_group != 0
+        or (k % block_k != 0 and not reuse_complete_lhs_quantization)
+    ):
+        raise ValueError(
+            "PyNTT block-FP8 MMA GEMV requires equal fixed lhs/rhs K divisible "
+            "by the scale group; a partial block_k tail additionally requires "
+            "complete consumer LHS staging; got "
+            f"lhs={k}, rhs={rhs_k}, block_k={block_k}, "
+            f"scale_group_k={reduction_group}, "
+            f"complete_lhs_quantization={reuse_complete_lhs_quantization}."
+        )
+    lhs_copy_segments: tuple[dict[str, Any], ...] = ()
+    if use_complete_consumer_lhs_stage:
+        if (
+            _fixed(model["LhsStrides"][-1]) != 1
+            or not _is_positive_power_of_two(lhs_stage_extent)
+            or lhs_stage_extent < k
+        ):
+            raise ValueError(
+                "PyNTT block-FP8 MMA GEMV complete consumer LHS staging "
+                "requires contiguous K and a power-of-two Shared extent "
+                f"covering K; got K={k}, lhs_stage_extent={lhs_stage_extent}, "
+                f"lhs_stride={_fixed(model['LhsStrides'][-1])}."
+            )
+        raw_segments = _power_of_two_segments(k)
+        if any(extent < reduction_group for _, extent in raw_segments):
+            raise ValueError(
+                "PyNTT block-FP8 MMA GEMV complete LHS copy segments must "
+                f"cover complete scale groups, got {raw_segments}."
+            )
+        lhs_copy_segments = tuple(
+            {
+                "offset": offset,
+                "extent": extent,
+                "access": _matmul_lhs_access(
+                    model,
+                    output_batch_rank=0,
+                    m_expr="0",
+                    k_expr="pipeline_input_copy_k",
+                    coordinate_shape=_coordinate_shape((1, extent)),
+                ),
+            }
+            for offset, extent in raw_segments
+        )
+
+    logical_activation_group_count = k // reduction_group
+    num_k_tiles = (k + block_k - 1) // block_k
+    materialized_activation_group_count = (
+        num_k_tiles * reduction_groups_per_stage
+    )
+    activation_group_count = (
+        1 << (materialized_activation_group_count - 1).bit_length()
+        if reuse_complete_lhs_quantization
+        else reduction_groups_per_stage
+    )
     expected_workspace_shape = (
         num_stages,
-        reduction_groups_per_stage,
-        transfer_chunks_per_group,
+        (
+            transfers_per_stage
+            if merge_scale_group_transfers
+            else reduction_groups_per_stage
+        ),
+        1,
         block_n,
         transfer_block_k,
     )
@@ -8294,10 +9114,7 @@ def _packed_block_fp8_mma_gemv_pipeline_template_context(
             f"{expected_workspace_shape}, got "
             f"{microkernel['shared_workspace_shapes']['rhs_stage']}."
         )
-    expected_lhs_quantized_shape = (
-        reduction_groups_per_stage,
-        reduction_group,
-    )
+    expected_lhs_quantized_shape = (activation_group_count, reduction_group)
     if (
         microkernel["shared_workspace_shapes"]["lhs_quantized"]
         != expected_lhs_quantized_shape
@@ -8307,7 +9124,7 @@ def _packed_block_fp8_mma_gemv_pipeline_template_context(
             f"{expected_lhs_quantized_shape}, got "
             f"{microkernel['shared_workspace_shapes']['lhs_quantized']}."
         )
-    expected_lhs_scale_shape = (reduction_groups_per_stage, 1)
+    expected_lhs_scale_shape = (activation_group_count, 1)
     if (
         microkernel["shared_workspace_shapes"]["lhs_scale"]
         != expected_lhs_scale_shape
@@ -8317,14 +9134,17 @@ def _packed_block_fp8_mma_gemv_pipeline_template_context(
             f"{expected_lhs_scale_shape}, got "
             f"{microkernel['shared_workspace_shapes']['lhs_scale']}."
         )
-
-    k = _fixed(context["k"])
-    rhs_k = _fixed(context["rhs_k"])
-    if k is None or k <= 0 or rhs_k != k or k % block_k != 0:
-        raise ValueError(
-            "PyNTT block-FP8 MMA GEMV requires equal fixed lhs/rhs K divisible "
-            f"by block_k, got lhs={k}, rhs={rhs_k}, block_k={block_k}."
-        )
+    if use_complete_consumer_lhs_stage:
+        expected_lhs_stage_shape = (1, lhs_stage_extent)
+        if (
+            microkernel["shared_workspace_shapes"]["lhs_stage"]
+            != expected_lhs_stage_shape
+        ):
+            raise ValueError(
+                "PyNTT block-FP8 MMA GEMV complete LHS workspace must be "
+                f"{expected_lhs_stage_shape}, got "
+                f"{microkernel['shared_workspace_shapes']['lhs_stage']}."
+            )
     max_n = _max_value(context["n"])
     if max_n is None:
         raise ValueError(
@@ -8381,12 +9201,49 @@ def _packed_block_fp8_mma_gemv_pipeline_template_context(
         raise ValueError(
             "PyNTT block-FP8 MMA GEMV requires a contiguous packed K axis."
         )
+    stage_transfers = tuple(
+        _tma_local_axis_transfer(
+            model["Rhs"],
+            1,
+            rhs_global_offsets[1],
+            local_offset=0,
+            tile_index=(
+                f"k_tile * {transfers_per_stage} + {transfer}"
+                if merge_scale_group_transfers
+                else f"k_tile * {reduction_groups_per_stage} + {transfer}"
+            ),
+            tile_stride=(
+                transfer_outer
+                if merge_scale_group_transfers
+                else reduction_group // k_atom
+            ),
+            tile_extent=transfer_outer,
+            context=(
+                "N-major K-packed GEMV RHS "
+                f"K transfer {transfer}"
+            ),
+        )
+        for transfer in range(transfers_per_stage)
+    )
+    if any(
+        transfer["is_block_cyclic"]
+        or tuple(transfer["block_shape"]) != (transfer_outer,)
+        or len(transfer["coordinates"]) != 1
+        for transfer in stage_transfers
+    ):
+        raise ValueError(
+            "PyNTT block-FP8 MMA GEMV requires a contiguous packed K axis."
+        )
     n_descriptor_plan = _n_major_k_packed_gemv_descriptor_n_plan(
         model["Rhs"], block_n
     )
     rhs_descriptor_chunks_per_tile = 1
-    tma_block_shape = tuple(n_descriptor_plan["block_shape"]) + (
-        transfer_block_k,
+    tma_block_shape = (
+        (reduction_groups_per_transfer,)
+        + tuple(n_descriptor_plan["block_shape"])
+        + (reduction_group,)
+        if reduction_groups_per_transfer > 1
+        else tuple(n_descriptor_plan["block_shape"]) + (transfer_block_k,)
     )
     rhs_scalar_bytes = TMA_DTYPE_ITEM_SIZES.get(model["RhsDType"])
     if rhs_scalar_bytes is None:
@@ -8405,8 +9262,25 @@ def _packed_block_fp8_mma_gemv_pipeline_template_context(
         )
         for group in group_chunk_transfers
     )
+    transfer_descriptor_offsets = tuple(
+        (
+            (
+                f"(({transfer['coordinates'][0]}) * {k_atom} + "
+                f"({descriptor_origin_elements})) // {reduction_group}",
+                *tuple("0" for _ in n_descriptor_plan["block_shape"]),
+                f"(({transfer['coordinates'][0]}) * {k_atom} + "
+                f"({descriptor_origin_elements})) % {reduction_group}",
+            )
+            if reduction_groups_per_transfer > 1
+            else tuple("0" for _ in n_descriptor_plan["block_shape"])
+            + (
+                f"(({transfer['coordinates'][0]}) * {k_atom}) + "
+                f"({descriptor_origin_elements})",
+            )
+        )
+        for transfer in stage_transfers
+    )
 
-    num_k_tiles = k // block_k
     num_n_tiles = (max_n + block_n - 1) // block_n
     n_tiles_per_activation_batch = 2
     if num_n_tiles * num_k_tiles > 2**31 - 1:
@@ -8426,6 +9300,11 @@ def _packed_block_fp8_mma_gemv_pipeline_template_context(
     global_output_n = _pointer_local_vector_to_global_scalar_coordinate(
         model["Output"], 1, "output_n", n_lane
     )
+    global_k_start = _pointer_local_to_global_coordinate(
+        model["Lhs"],
+        1,
+        f"k_tile * {block_k} + group * {reduction_group}",
+    )
     context.update(
         block_n=block_n,
         block_k=block_k,
@@ -8434,10 +9313,36 @@ def _packed_block_fp8_mma_gemv_pipeline_template_context(
         num_n_tiles=num_n_tiles,
         n_tiles_per_activation_batch=n_tiles_per_activation_batch,
         runtime_num_n_tiles=f"tl.cdiv(active_n, {block_n})",
+        activation_group_count=activation_group_count,
+        logical_activation_group_count=logical_activation_group_count,
+        use_complete_consumer_lhs_stage=use_complete_consumer_lhs_stage,
+        prequantize_complete_lhs=prequantize_complete_lhs,
+        reuse_prequantized_lhs=reuse_prequantized_lhs,
+        materialize_complete_lhs_quantization=(
+            materialize_complete_lhs_quantization
+        ),
+        reuse_complete_lhs_quantization=reuse_complete_lhs_quantization,
+        lhs_stage_extent=lhs_stage_extent,
+        lhs_copy_segments=lhs_copy_segments,
+        consumer_input_copy_layout_name=(
+            f"{model['FunctionName']}__input_copy_layout"
+        ),
+        input_copy_size_per_thread=4,
         reduction_group=reduction_group,
         reduction_groups_per_stage=reduction_groups_per_stage,
+        reduction_groups_per_transfer=reduction_groups_per_transfer,
+        transfers_per_stage=transfers_per_stage,
         transfer_block_k=transfer_block_k,
         transfer_chunks_per_group=transfer_chunks_per_group,
+        use_nv_mma_weight_stage=(linear_weight_stage == 0),
+        mma_instruction_n=mma_instruction_n,
+        execution_consumer_warps=(
+            auxiliary_consumer_warps if auxiliary_only else num_warps
+        ),
+        activation_rows_per_warp=(
+            mma_instruction_n
+            // (auxiliary_consumer_warps if auxiliary_only else num_warps)
+        ),
         weight_block_n=weight_block_n,
         weight_block_k=reduction_group,
         rhs_descriptor_name=descriptor_name,
@@ -8447,6 +9352,7 @@ def _packed_block_fp8_mma_gemv_pipeline_template_context(
         ),
         rhs_descriptor_chunks_per_tile=rhs_descriptor_chunks_per_tile,
         rhs_descriptor_offsets=rhs_descriptor_offsets,
+        transfer_descriptor_offsets=transfer_descriptor_offsets,
         rhs_scalar_bytes=rhs_scalar_bytes,
         transfer_stage_bytes=(
             num_stages * block_n * transfer_block_k * rhs_scalar_bytes
@@ -8457,7 +9363,9 @@ def _packed_block_fp8_mma_gemv_pipeline_template_context(
             output_batch_rank=0,
             m_expr="0",
             k_expr="pipeline_offs_k",
-            coordinate_shape=_coordinate_shape((reduction_group,)),
+            coordinate_shape=_coordinate_shape(
+                (mma_instruction_n, reduction_group)
+            ),
         ),
         pipeline_output_access=_contiguous_vector_axis_access(
             ("0", "0"),
@@ -8497,11 +9405,30 @@ def _packed_block_fp8_mma_gemv_pipeline_template_context(
             else ()
         ),
         global_output_n=global_output_n,
+        global_k_start=global_k_start,
         rhs_scale_access=_tensor_access(
             ("weight_scale_n", "weight_scale_k"),
             scale_strides,
             coordinate_shape=_coordinate_shape((block_n,)),
             global_coordinate_axes=(0, 1),
+        ),
+        fragment_accumulate_mma=fragment_accumulate_mma,
+        auxiliary_only=auxiliary_only,
+        auxiliary_consumer_warps=auxiliary_consumer_warps,
+        auxiliary_mma_layout_name=(
+            f"{model['FunctionName']}__auxiliary_mma_layout"
+        ),
+        auxiliary_weight_dot_layout_name=(
+            f"{model['FunctionName']}__auxiliary_weight_dot_layout"
+        ),
+        auxiliary_activation_dot_layout_name=(
+            f"{model['FunctionName']}__auxiliary_activation_dot_layout"
+        ),
+        auxiliary_output_layout_name=(
+            f"{model['FunctionName']}__auxiliary_output_layout"
+        ),
+        auxiliary_activation_quantization_layout_name=(
+            f"{model['FunctionName']}__auxiliary_activation_quantization_layout"
         ),
     )
     return context
@@ -8961,6 +9888,11 @@ def _packed_matmul_glu_gemv_pipeline_template_context(
         block_k=block_k,
         num_stages=num_stages,
         rhs_tiles_per_group=projection_count,
+        maximum_block_n=(
+            128
+            if expected_variant == "mma_block_fp8_smem_pipeline"
+            else 64
+        ),
     )
 
     n_lane = int(model["NVectorLaneCount"])
@@ -9267,6 +10199,8 @@ def _packed_fp8_matmul_glu_gemv_pipeline_template_context(
 
 def _packed_block_fp8_matmul_glu_gemv_pipeline_template_context(
     model: dict[str, Any],
+    *,
+    expected_variant: str = "simt_block_fp8_fma_smem_pipeline",
 ) -> dict[str, Any]:
     """Prepare dynamic K-group activation and block-scaled paired GLU."""
 
@@ -9289,7 +10223,7 @@ def _packed_block_fp8_matmul_glu_gemv_pipeline_template_context(
 
     context = _packed_matmul_glu_gemv_pipeline_template_context(
         model,
-        expected_variant="simt_block_fp8_fma_smem_pipeline",
+        expected_variant=expected_variant,
         expected_weight_dtype="float8e4m3fn",
         expected_k_vector_lanes=16,
         require_operand_scales=False,
@@ -9340,6 +10274,779 @@ def _packed_block_fp8_matmul_glu_gemv_pipeline_template_context(
         projections=tuple(projections),
     )
     return context
+
+
+def _packed_block_fp8_mma_matmul_glu_gemv_pipeline_template_context(
+    model: dict[str, Any],
+) -> dict[str, Any]:
+    """Prepare K-major block-scaled paired GEMV for tensor-core execution."""
+
+    context = _packed_block_fp8_matmul_glu_gemv_pipeline_template_context(
+        model,
+        expected_variant="mma_block_fp8_smem_pipeline",
+    )
+    microkernel = context["microkernel"]
+    block_n = context["block_n"]
+    block_k = context["block_k"]
+    num_stages = context["num_stages"]
+    reduction_group = context["reduction_group"]
+    transfer_block_k = microkernel["parameters"].get("transfer_block_k")
+    if transfer_block_k != reduction_group:
+        raise ValueError(
+            "PyNTT block-FP8 MatMulGlu MMA requires one complete scale group "
+            f"per MMA transfer, got transfer_k={transfer_block_k}, "
+            f"scale_group_k={reduction_group}."
+        )
+    if block_n % 16 != 0 or block_k % reduction_group != 0:
+        raise ValueError(
+            "PyNTT block-FP8 MatMulGlu MMA requires block_n divisible by 16 "
+            "and block_k divisible by the scale group, got "
+            f"block_n={block_n}, block_k={block_k}, group={reduction_group}."
+        )
+
+    k_atom = context["k_atom"]
+    n_lane = int(model["NVectorLaneCount"])
+    activation_group_count = (
+        _fixed(context["k"]) // reduction_group
+        if context["use_complete_consumer_lhs_stage"]
+        else block_k // reduction_group
+    )
+    expected_workspaces = {
+        "rhs_stage": (
+            num_stages,
+            (block_k // k_atom) * (block_n // n_lane),
+            n_lane * k_atom,
+        ),
+        "lhs_quantized": (activation_group_count, reduction_group),
+        "lhs_scale": (activation_group_count, 1),
+    }
+    if context["use_complete_consumer_lhs_stage"]:
+        expected_workspaces["lhs_stage"] = (
+            1,
+            context["lhs_stage_extent"],
+        )
+    if microkernel["shared_workspace_shapes"] != expected_workspaces:
+        raise ValueError(
+            "PyNTT block-FP8 MatMulGlu MMA workspace contract mismatch: "
+            f"expected={expected_workspaces}, "
+            f"actual={microkernel['shared_workspace_shapes']}."
+        )
+
+    function_name = model["FunctionName"]
+    context.update(
+        mma_layout_name=f"{function_name}__mma_layout",
+        weight_dot_layout_name=f"{function_name}__weight_dot_layout",
+        activation_dot_layout_name=f"{function_name}__activation_dot_layout",
+        mma_output_layout_name=f"{function_name}__mma_output_layout",
+        transfer_block_k=transfer_block_k,
+        load_lhs_directly=False,
+    )
+    return context
+
+
+def _packed_block_fp8_mma_n_major_matmul_glu_gemv_pipeline_template_context(
+    model: dict[str, Any],
+) -> dict[str, Any]:
+    """Prepare N-major K-packed paired GEMV for mma.sync execution."""
+
+    raw_microkernel = model.get("MicroKernel")
+    raw_parameters = (
+        raw_microkernel.get("Parameters")
+        if isinstance(raw_microkernel, dict)
+        else None
+    )
+    split_projection_channels = (
+        isinstance(raw_parameters, dict)
+        and raw_parameters.get("split_projection_channels") == 1
+    )
+    dual_consumer = (
+        isinstance(raw_parameters, dict)
+        and raw_parameters.get("dual_consumer") == 1
+    )
+    auxiliary_only = isinstance(
+        raw_microkernel.get("AuxiliaryConsumer")
+        if isinstance(raw_microkernel, dict)
+        else None,
+        dict,
+    )
+    parallel_projection_consumers = (
+        isinstance(raw_parameters, dict)
+        and raw_parameters.get("parallel_projection_consumers") == 1
+    )
+    paired_projection_mma = (
+        isinstance(raw_parameters, dict)
+        and raw_parameters.get("paired_projection_mma") == 1
+    )
+    direct_mma_column_extract = (
+        isinstance(raw_parameters, dict)
+        and raw_parameters.get("direct_mma_column_extract") == 1
+    )
+    fragment_accumulate_mma = (
+        isinstance(raw_parameters, dict)
+        and raw_parameters.get("fragment_accumulate_mma") == 1
+    )
+    tail_block_n = (
+        raw_parameters.get("tail_block_n")
+        if isinstance(raw_parameters, dict)
+        else None
+    )
+    if tail_block_n is not None:
+        tail_block_n = _require_int(
+            tail_block_n, "tail_block_n", minimum=16
+        )
+        if split_projection_channels:
+            raise ValueError(
+                "PyNTT N-major block-FP8 MatMulGlu MMA tail tiling does not "
+                "support split projection channels."
+            )
+    auxiliary_modes = sum(
+        int(mode)
+        for mode in (
+            dual_consumer,
+            auxiliary_only,
+            parallel_projection_consumers,
+        )
+    )
+    if auxiliary_modes > 1:
+        raise ValueError(
+            "PyNTT N-major block-FP8 MatMulGlu auxiliary execution modes "
+            "are mutually exclusive."
+        )
+    if (dual_consumer or auxiliary_only) and split_projection_channels:
+        raise ValueError(
+            "PyNTT N-major block-FP8 MatMulGlu auxiliary-consumer execution "
+            "does not support split projection channels."
+        )
+    if parallel_projection_consumers and tail_block_n is not None:
+        raise ValueError(
+            "PyNTT N-major block-FP8 MatMulGlu auxiliary-consumer execution "
+            "supports tail tiling only in auxiliary-only execution."
+        )
+    if parallel_projection_consumers and not split_projection_channels:
+        raise ValueError(
+            "PyNTT parallel-projection MatMulGlu requires independent "
+            "Gate and Up transfer channels."
+        )
+    required_workspace_names = (
+        ("gate_rhs_stage", "up_rhs_stage", "lhs_quantized", "lhs_scale")
+        if split_projection_channels
+        else ("rhs_stage", "lhs_quantized", "lhs_scale")
+    )
+    if isinstance(raw_parameters, dict) and "lhs_stage_extent" in raw_parameters:
+        required_workspace_names += ("lhs_stage",)
+    microkernel = _microkernel_context(
+        model,
+        "triton.matmul_glu",
+        "mma_n_major_block_fp8_smem_pipeline",
+        required_workspace_names=required_workspace_names,
+    )
+    if (
+        model["InputDType"] != "bfloat16"
+        or model["WeightDType"] != "float8e4m3fn"
+        or model["OutputDType"] != "bfloat16"
+        or model.get("QuantizationMode") != "dynamic_block"
+        or bool(model.get("HasOperandScales"))
+        or not bool(model.get("HasWeightScales"))
+    ):
+        raise ValueError(
+            "PyNTT N-major block-FP8 MatMulGlu MMA requires dynamic "
+            "BF16/E4M3/BF16 quantization with two weight scales."
+        )
+    if (
+        model.get("RhsLayout") != "n_major_k_packed"
+        or int(model["NPackedLaneCount"]) != 1
+        or int(model["NVectorLaneCount"]) != 8
+        or int(model["KPackLaneCount"]) != 2
+        or int(model["KVectorLaneCount"]) != 16
+    ):
+        raise ValueError(
+            "PyNTT N-major block-FP8 MatMulGlu MMA requires "
+            "weight=[N,K/32]<2,16> and output=[M,N/8]<8>."
+        )
+    if any(
+        len(model[name]) != 2
+        for name in (
+            "InputShape",
+            "GateWeightShape",
+            "UpWeightShape",
+            "OutputShape",
+        )
+    ):
+        raise ValueError(
+            "PyNTT N-major block-FP8 MatMulGlu MMA currently requires rank-2 operands."
+        )
+
+    parameters = microkernel["parameters"]
+    block_n = parameters["block_n"]
+    block_k = parameters["block_k"]
+    physical_num_stages = parameters["num_stages"]
+    transfer_block_k = parameters.get("transfer_block_k")
+    reduction_group = _require_int(
+        model.get("WeightBlockK"), "WeightBlockK", minimum=1
+    )
+    weight_block_n = _require_int(
+        model.get("WeightBlockN"), "WeightBlockN", minimum=1
+    )
+    if weight_block_n != 128 or reduction_group != 128:
+        raise ValueError(
+            "PyNTT N-major block-FP8 MatMulGlu MMA implements the official "
+            f"128x128 scale ABI, got {weight_block_n}x{reduction_group}."
+        )
+    if (
+        physical_num_stages % 2 != 0
+        or physical_num_stages < 4
+        or block_n % 16 != 0
+        or block_k % reduction_group != 0
+        or not isinstance(transfer_block_k, int)
+        or transfer_block_k <= 0
+        or transfer_block_k % reduction_group != 0
+        or block_k % transfer_block_k != 0
+    ):
+        raise ValueError(
+            "PyNTT N-major block-FP8 MatMulGlu MMA has an invalid "
+            "projection/stage/tile hierarchy."
+        )
+    logical_num_stages = physical_num_stages // 2
+    if dual_consumer and (
+        logical_num_stages < 2 or logical_num_stages % 2 != 0
+    ):
+        raise ValueError(
+            "PyNTT N-major block-FP8 MatMulGlu dual-consumer execution "
+            "requires an even logical stage count of at least two, got "
+            f"{logical_num_stages}."
+        )
+    reduction_groups_per_stage = block_k // reduction_group
+    reduction_groups_per_transfer = transfer_block_k // reduction_group
+    transfers_per_stage = block_k // transfer_block_k
+    k = _fixed(model["InputShape"][-1])
+    if k is None or k <= 0 or k % block_k != 0:
+        raise ValueError(
+            "PyNTT N-major block-FP8 MatMulGlu MMA requires fixed K divisible "
+            f"by block_k={block_k}, got {k}."
+        )
+    num_k_tiles = k // block_k
+    lhs_stage_extent = parameters.get("lhs_stage_extent")
+    use_complete_consumer_lhs_stage = lhs_stage_extent is not None
+    prequantize_lhs = parameters.get("prequantize_lhs", 0)
+    if prequantize_lhs not in (0, 1):
+        raise ValueError(
+            "PyNTT N-major block-FP8 MatMulGlu MMA prequantize_lhs must be "
+            f"0 or 1, got {prequantize_lhs}."
+        )
+    prequantize_complete_lhs = prequantize_lhs == 1
+    if prequantize_complete_lhs and use_complete_consumer_lhs_stage:
+        raise ValueError(
+            "PyNTT N-major block-FP8 MatMulGlu MMA direct prequantization "
+            "and complete BF16 LHS staging are mutually exclusive."
+        )
+    materialize_complete_lhs_quantization = (
+        prequantize_complete_lhs or use_complete_consumer_lhs_stage
+    )
+    if paired_projection_mma and (
+        block_n != 64
+        or split_projection_channels
+        or dual_consumer
+        or auxiliary_only
+        or parallel_projection_consumers
+        or tail_block_n is not None
+    ):
+        raise ValueError(
+            "PyNTT paired-projection MatMulGlu MMA requires block_n=64, "
+            "one projection pipe, no tail, and no auxiliary consumer."
+        )
+    if direct_mma_column_extract and paired_projection_mma:
+        raise ValueError(
+            "PyNTT direct MMA column extraction does not support paired "
+            "projection MMA."
+        )
+    if fragment_accumulate_mma and (
+        (split_projection_channels and not parallel_projection_consumers)
+        or paired_projection_mma
+        or direct_mma_column_extract
+    ):
+        raise ValueError(
+            "PyNTT MMA-fragment MatMulGlu accumulation requires one projection "
+            "channel, no tail, and the mma.sync path."
+        )
+    if auxiliary_modes and not materialize_complete_lhs_quantization:
+        raise ValueError(
+            "PyNTT N-major block-FP8 MatMulGlu auxiliary-consumer execution "
+            "requires one complete shared LHS quantization."
+        )
+    if parallel_projection_consumers and (
+        block_n != 64
+        or not fragment_accumulate_mma
+        or not use_complete_consumer_lhs_stage
+        or bool(model["EmitPartialResults"])
+    ):
+        raise ValueError(
+            "PyNTT parallel-projection MatMulGlu requires block_n=64, "
+            "MMA-fragment accumulation, a reusable complete LHS stage, "
+            "and a fused GLU output."
+        )
+    logical_activation_group_count = k // reduction_group
+    activation_group_count = (
+        1 << (logical_activation_group_count - 1).bit_length()
+        if materialize_complete_lhs_quantization
+        else reduction_groups_per_stage
+    )
+    projection_workspace_shape = (
+        logical_num_stages,
+        transfers_per_stage,
+        1,
+        block_n,
+        transfer_block_k,
+    )
+    expected_workspaces = {
+        "lhs_quantized": (activation_group_count, reduction_group),
+        "lhs_scale": (activation_group_count, 1),
+    }
+    if split_projection_channels:
+        expected_workspaces = {
+            "gate_rhs_stage": projection_workspace_shape,
+            "up_rhs_stage": projection_workspace_shape,
+            **expected_workspaces,
+        }
+    else:
+        expected_workspaces = {
+            "rhs_stage": (
+                physical_num_stages,
+                transfers_per_stage,
+                1,
+                block_n,
+                transfer_block_k,
+            ),
+            **expected_workspaces,
+        }
+    if use_complete_consumer_lhs_stage:
+        expected_workspaces["lhs_stage"] = (1, lhs_stage_extent)
+    if microkernel["shared_workspace_shapes"] != expected_workspaces:
+        raise ValueError(
+            "PyNTT N-major block-FP8 MatMulGlu MMA workspace contract mismatch: "
+            f"expected={expected_workspaces}, "
+            f"actual={microkernel['shared_workspace_shapes']}."
+        )
+
+    fake_parameters = {
+        **parameters,
+        "num_stages": logical_num_stages,
+        "disable_scale_group_transfer_merge": 1,
+    }
+    fake_parameters.pop("lhs_stage_extent", None)
+    fake_parameters.pop("prequantize_lhs", None)
+    # Projection contexts validate the shared matmul geometry only. Role
+    # specialization belongs to the enclosing MatMulGlu helper.
+    fake_workspace_shapes = {
+        "rhs_stage": (
+            logical_num_stages,
+            reduction_groups_per_stage,
+            1,
+            block_n,
+            transfer_block_k,
+        ),
+        "lhs_quantized": (reduction_groups_per_stage, reduction_group),
+        "lhs_scale": (reduction_groups_per_stage, 1),
+    }
+    fake_microkernel = {
+        "Family": "triton.matmul",
+        "Variant": "mma_block_fp8_smem_pipeline",
+        "Parameters": fake_parameters,
+        "SharedWorkspaceOffsets": {
+            name: "0" for name in fake_workspace_shapes
+        },
+        "SharedWorkspaceShapes": {
+            name: list(shape) for name, shape in fake_workspace_shapes.items()
+        },
+        "ConsumerSharedWorkspaceNames": ["lhs_quantized", "lhs_scale"],
+    }
+
+    projection_contexts = []
+    for prefix in ("Gate", "Up"):
+        projection_model = {
+            **model,
+            "MicroKernel": fake_microkernel,
+            "Lhs": model["Input"],
+            "Rhs": model[f"{prefix}Weight"],
+            "Output": model["Output"],
+            "LhsDType": model["InputDType"],
+            "RhsDType": model["WeightDType"],
+            "OutputDType": model["OutputDType"],
+            "LhsShape": model["InputShape"],
+            "RhsShape": model[f"{prefix}WeightShape"],
+            "OutputShape": model["OutputShape"],
+            "LhsStrides": model["InputStrides"],
+            "RhsStrides": model[f"{prefix}WeightStrides"],
+            "OutputStrides": model["OutputStrides"],
+            "TransposeA": False,
+            "TransposeB": True,
+            "RhsNPackedLaneCount": 1,
+            "RhsNVectorLaneCount": 1,
+            "RhsKPackLaneCount": model["KPackLaneCount"],
+            "RhsKVectorLaneCount": model["KVectorLaneCount"],
+            "OutputNPackedLaneCount": model["NPackedLaneCount"],
+            "OutputNVectorLaneCount": model["NVectorLaneCount"],
+            "HasRhsBlockScale": True,
+            "HasOperandScales": False,
+            "HasAddend": False,
+            "HasNormStats": False,
+            "RhsDescriptorName": model[f"{prefix}WeightDescriptorName"],
+            "RhsDescriptorOriginElements": model[
+                f"{prefix}WeightDescriptorOriginElements"
+            ],
+            "RhsGlobalOffsets": model[f"{prefix}WeightGlobalOffsets"],
+            "RhsScaleShape": model[f"{prefix}WeightScaleShape"],
+            "RhsScaleStrides": model[f"{prefix}WeightScaleStrides"],
+        }
+        projection_contexts.append(
+            _packed_block_fp8_mma_gemv_pipeline_template_context(
+                projection_model
+            )
+        )
+
+    base = projection_contexts[0]
+    common_keys = (
+        "block_n",
+        "block_k",
+        "num_k_tiles",
+        "num_n_tiles",
+        "reduction_group",
+        "reduction_groups_per_stage",
+        "reduction_groups_per_transfer",
+        "transfers_per_stage",
+        "transfer_block_k",
+        "transfer_chunks_per_group",
+        "tma_block_shape",
+        "rhs_descriptor_entries_per_owner",
+        "rhs_descriptor_chunks_per_tile",
+        "rhs_scalar_bytes",
+        "transfer_stage_bytes",
+        "tma_n_elements",
+        "global_output_n",
+    )
+    if any(
+        context[key] != base[key]
+        for context in projection_contexts[1:]
+        for key in common_keys
+    ):
+        raise ValueError(
+            "PyNTT N-major block-FP8 MatMulGlu MMA requires gate/up "
+            "projections to have one common distributed tile layout."
+        )
+
+    cooperative_n_tile_plan = _matmul_glu_cooperative_n_tile_plan(
+        model, block_n
+    )
+
+    max_n = _max_value(base["n"])
+    full_n_tiles = base["num_n_tiles"]
+    if tail_block_n is not None:
+        local_n_remainder = None if max_n is None else max_n % block_n
+        if (
+            max_n is None
+            or tail_block_n >= block_n
+            or tail_block_n % 16 != 0
+            or local_n_remainder == 0
+            or local_n_remainder > tail_block_n
+        ):
+            raise ValueError(
+                "PyNTT N-major block-FP8 MatMulGlu MMA tail tiling requires "
+                "a 16-aligned tail smaller than block_n and covering the "
+                f"non-zero bounded local-N remainder; max_n={max_n}, "
+                f"block_n={block_n}, tail_block_n={tail_block_n}."
+            )
+        full_n_tiles = max_n // block_n
+
+    if cooperative_n_tile_plan is not None:
+        tail_block_n = None
+        full_n_tiles = int(cooperative_n_tile_plan["tiles_per_owner"])
+
+    n_lane = int(model["NVectorLaneCount"])
+    if cooperative_n_tile_plan is not None:
+        merged_tma_block_shape = (
+            (reduction_groups_per_transfer, block_n, reduction_group)
+            if reduction_groups_per_transfer > 1
+            else (block_n, transfer_block_k)
+        )
+    else:
+        merged_tma_block_shape = (
+            (reduction_groups_per_transfer,)
+            + tuple(base["tma_block_shape"][:-1])
+            + (reduction_group,)
+            if reduction_groups_per_transfer > 1
+            else tuple(base["tma_block_shape"])
+        )
+    projections = []
+    for prefix, projection_context in zip(("Gate", "Up"), projection_contexts):
+        projections.append(
+            {
+                "prefix": prefix,
+                "lower": prefix.lower(),
+                "descriptor_name": projection_context["rhs_descriptor_name"],
+                "descriptor_offsets": projection_context[
+                    "rhs_descriptor_offsets"
+                ],
+                "transfer_descriptor_offsets": tuple(
+                    (
+                        (
+                            f"(({projection_context['rhs_descriptor_offsets'][transfer * reduction_groups_per_transfer][0][-1]}) // {reduction_group})",
+                            "0",
+                            f"(({projection_context['rhs_descriptor_offsets'][transfer * reduction_groups_per_transfer][0][-1]}) % {reduction_group})",
+                        )
+                        if cooperative_n_tile_plan is not None
+                        and reduction_groups_per_transfer > 1
+                        else (
+                            "0",
+                            projection_context["rhs_descriptor_offsets"][
+                                transfer
+                            ][0][-1],
+                        )
+                        if cooperative_n_tile_plan is not None
+                        else (
+                            f"(({projection_context['rhs_descriptor_offsets'][transfer * reduction_groups_per_transfer][0][-1]}) // {reduction_group})",
+                            *projection_context["rhs_descriptor_offsets"][
+                                transfer * reduction_groups_per_transfer
+                            ][0][:-1],
+                            f"(({projection_context['rhs_descriptor_offsets'][transfer * reduction_groups_per_transfer][0][-1]}) % {reduction_group})",
+                        )
+                        if reduction_groups_per_transfer > 1
+                        else projection_context["rhs_descriptor_offsets"][
+                            transfer
+                        ][0]
+                    )
+                    for transfer in range(transfers_per_stage)
+                ),
+                "weight_scale_access": projection_context["rhs_scale_access"],
+                "has_bias": bool(model[f"Has{prefix}Bias"]),
+                "bias_access": (
+                    _contiguous_vector_axis_access(
+                        ("0",),
+                        model[f"{prefix}BiasStrides"],
+                        tensor_shape=model[f"{prefix}BiasShape"],
+                        packed_axis=0,
+                        logical_index="pipeline_output_n",
+                        lane_count=n_lane,
+                        coordinate_shape=_coordinate_shape((block_n,)),
+                    )
+                    if model[f"Has{prefix}Bias"]
+                    else None
+                ),
+            }
+        )
+
+    tail_projections = tuple(
+        {
+            **projection,
+            "weight_scale_access": _tensor_access(
+                ("weight_scale_n", "weight_scale_k"),
+                model[f"{projection['prefix']}WeightScaleStrides"],
+                coordinate_shape=_coordinate_shape((tail_block_n,)),
+                global_coordinate_axes=(0, 1),
+            ),
+            "bias_access": (
+                _contiguous_vector_axis_access(
+                    ("0",),
+                    model[f"{projection['prefix']}BiasStrides"],
+                    tensor_shape=model[f"{projection['prefix']}BiasShape"],
+                    packed_axis=0,
+                    logical_index="pipeline_output_n",
+                    lane_count=n_lane,
+                    coordinate_shape=_coordinate_shape((tail_block_n,)),
+                )
+                if projection["has_bias"]
+                else None
+            ),
+        }
+        for projection in projections
+    ) if tail_block_n is not None else ()
+
+    lhs_copy_segments: tuple[dict[str, Any], ...] = ()
+    if use_complete_consumer_lhs_stage:
+        if (
+            _fixed(model["InputStrides"][-1]) != 1
+            or not _is_positive_power_of_two(lhs_stage_extent)
+            or lhs_stage_extent < k
+        ):
+            raise ValueError(
+                "PyNTT N-major block-FP8 MatMulGlu complete LHS staging "
+                "requires contiguous K and a power-of-two covering extent."
+            )
+        lhs_copy_segments = tuple(
+            {
+                "offset": offset,
+                "extent": extent,
+                "access": _matmul_glu_input_access(
+                    model,
+                    output_batch_rank=0,
+                    m_expr="0",
+                    k_expr="pipeline_input_copy_k",
+                    coordinate_shape=_coordinate_shape((1, extent)),
+                ),
+            }
+            for offset, extent in _power_of_two_segments(k)
+        )
+
+    function_name = model["FunctionName"]
+    output_n_stages = _shard_axis_stages(model["Output"]["ShardAxes"][1])
+    runtime_active_n = _dim(base["n"])
+    if any(
+        stage.get("Distribution") == "BlockCyclic"
+        for stage in output_n_stages
+    ):
+        runtime_active_n = (
+            f"({_local_axis_active_extent(model['Output']['GlobalShape'][1], model['Output']['ShardAxes'][1], model['Output']['Hierarchy'])})"
+            f" * {n_lane}"
+        )
+    return {
+        **base,
+        "microkernel": microkernel,
+        "num_stages": physical_num_stages,
+        "logical_num_stages": logical_num_stages,
+        "dual_pipeline_num_stages": (
+            logical_num_stages // 2 if dual_consumer else logical_num_stages
+        ),
+        "split_projection_channels": split_projection_channels,
+        "dual_consumer": dual_consumer,
+        "auxiliary_only": auxiliary_only,
+        "parallel_projection_consumers": parallel_projection_consumers,
+        "paired_projection_mma": paired_projection_mma,
+        "direct_mma_column_extract": direct_mma_column_extract,
+        "fragment_accumulate_mma": fragment_accumulate_mma,
+        "auxiliary_consumer_warps": base["auxiliary_consumer_warps"],
+        "tail_block_n": tail_block_n,
+        "full_n_tiles": full_n_tiles,
+        "cooperative_n_tiles": cooperative_n_tile_plan is not None,
+        "num_n_tiles": (
+            int(cooperative_n_tile_plan["tiles_per_owner"])
+            if cooperative_n_tile_plan is not None
+            else base["num_n_tiles"]
+        ),
+        "rhs_descriptor_entries_per_owner": (
+            int(cooperative_n_tile_plan["tiles_per_owner"])
+            if cooperative_n_tile_plan is not None
+            else base["rhs_descriptor_entries_per_owner"]
+        ),
+        "global_output_n": (
+            str(cooperative_n_tile_plan["global_output_n"])
+            if cooperative_n_tile_plan is not None
+            else base["global_output_n"]
+        ),
+        "reduction_groups_per_transfer": reduction_groups_per_transfer,
+        "transfers_per_stage": transfers_per_stage,
+        "tma_block_shape": merged_tma_block_shape,
+        "projection_shared_bytes": (
+            logical_num_stages * block_n * block_k
+        ),
+        "activation_group_count": activation_group_count,
+        "logical_activation_group_count": logical_activation_group_count,
+        "runtime_active_n": (
+            str(cooperative_n_tile_plan["runtime_active_n"])
+            if cooperative_n_tile_plan is not None
+            else runtime_active_n
+        ),
+        "projections": tuple(projections),
+        "tail_projections": tail_projections,
+        "use_complete_consumer_lhs_stage": use_complete_consumer_lhs_stage,
+        "prequantize_complete_lhs": prequantize_complete_lhs,
+        "parallelize_complete_lhs_quantization": (
+            prequantize_complete_lhs
+            or (use_complete_consumer_lhs_stage and auxiliary_only)
+        ),
+        "materialize_complete_lhs_quantization": (
+            materialize_complete_lhs_quantization
+        ),
+        "lhs_stage_extent": lhs_stage_extent,
+        "lhs_copy_segments": lhs_copy_segments,
+        "pipeline_input_access": _matmul_glu_input_access(
+            model,
+            output_batch_rank=0,
+            m_expr="0",
+            k_expr="pipeline_offs_k",
+            coordinate_shape=_coordinate_shape((reduction_group,)),
+        ),
+        "complete_pipeline_input_access": _matmul_glu_input_access(
+            model,
+            output_batch_rank=0,
+            m_expr="0",
+            k_expr="pipeline_offs_k",
+            coordinate_shape=_coordinate_shape(
+                (base["mma_instruction_n"], reduction_group)
+            ),
+        ),
+        "pipeline_output_access": _contiguous_vector_axis_access(
+            ("0", "0"),
+            model["OutputStrides"],
+            tensor_shape=model["OutputShape"],
+            packed_axis=1,
+            logical_index="pipeline_output_n",
+            lane_count=n_lane,
+            coordinate_shape=_coordinate_shape((block_n,)),
+        ),
+        "tail_pipeline_output_access": (
+            _contiguous_vector_axis_access(
+                ("0", "0"),
+                model["OutputStrides"],
+                tensor_shape=model["OutputShape"],
+                packed_axis=1,
+                logical_index="pipeline_output_n",
+                lane_count=n_lane,
+                coordinate_shape=_coordinate_shape((tail_block_n,)),
+            )
+            if tail_block_n is not None
+            else None
+        ),
+        "up_output_access": (
+            _contiguous_vector_axis_access(
+                ("0", "0"),
+                model["UpOutputStrides"],
+                tensor_shape=model["UpOutputShape"],
+                packed_axis=1,
+                logical_index="pipeline_output_n",
+                lane_count=n_lane,
+                coordinate_shape=_coordinate_shape((block_n,)),
+            )
+            if bool(model.get("EmitPartialResults"))
+            else None
+        ),
+        "tail_up_output_access": (
+            _contiguous_vector_axis_access(
+                ("0", "0"),
+                model["UpOutputStrides"],
+                tensor_shape=model["UpOutputShape"],
+                packed_axis=1,
+                logical_index="pipeline_output_n",
+                lane_count=n_lane,
+                coordinate_shape=_coordinate_shape((tail_block_n,)),
+            )
+            if tail_block_n is not None and bool(model.get("EmitPartialResults"))
+            else None
+        ),
+        "pipeline_output_mask": "pipeline_output_n < active_n",
+        "mma_layout_name": f"{function_name}__mma_layout",
+        "weight_dot_layout_name": f"{function_name}__weight_dot_layout",
+        "activation_dot_layout_name": f"{function_name}__activation_dot_layout",
+        "mma_output_layout_name": f"{function_name}__mma_output_layout",
+        "auxiliary_mma_layout_name": (
+            f"{function_name}__auxiliary_mma_layout"
+        ),
+        "auxiliary_weight_dot_layout_name": (
+            f"{function_name}__auxiliary_weight_dot_layout"
+        ),
+        "auxiliary_activation_dot_layout_name": (
+            f"{function_name}__auxiliary_activation_dot_layout"
+        ),
+        "auxiliary_mma_output_layout_name": (
+            f"{function_name}__auxiliary_mma_output_layout"
+        ),
+        "consumer_input_copy_layout_name": (
+            f"{function_name}__input_copy_layout"
+        ),
+        "activation_quantization_layout_name": (
+            f"{function_name}__activation_quantization_layout"
+        ),
+        "input_copy_size_per_thread": 4,
+        "weight_block_n": weight_block_n,
+        "weight_block_k": reduction_group,
+    }
 
 
 def _reduce_template_context(model: dict[str, Any]) -> dict[str, Any]:
@@ -9778,11 +11485,24 @@ def _norm_apply_template_context(model: dict[str, Any]) -> dict[str, Any]:
     tensor_coordinates = (
         tuple(f"outer_idx{index}" for index in outer_axes) + inner_coordinates
     )
+    input_coordinates = tensor_coordinates
+    input_global_coordinate_axes: tuple[int, ...] = ()
+    if model["InputUsesOutputGlobalCoordinates"]:
+        input_coordinates = tuple(
+            _pointer_local_to_global_coordinate(
+                model["Output"], tensor_axis, coordinate
+            )
+            for tensor_axis, coordinate in enumerate(tensor_coordinates)
+        )
+        if model["Input"].get("DistributedStorageKind") == "CanonicalGlobal":
+            input_global_coordinate_axes = tuple(range(rank))
+
     context["input_access"] = _tensor_access(
-        tensor_coordinates,
+        input_coordinates,
         model["InputStrides"],
         context["lane_coordinates"],
         context["lane_shape"],
+        global_coordinate_axes=input_global_coordinate_axes,
     )
     context["output_access"] = _tensor_access(
         tensor_coordinates,
@@ -9920,8 +11640,206 @@ def _gather_reduce_add_norm_template_context(
         )
 
     norm_model = model.get("NormApply")
-    norm = None if norm_model is None else _norm_apply_template_context(norm_model)
+    norm = None
+    cooperative = None
+    hierarchy = model["Reshard"]["Hierarchy"]
+    partial_axes = tuple(reshard["input_partial_mesh_axes"])
+    lane_shape = tuple(model["Reshard"]["VectorLaneShape"])
+    rank = len(model["Reshard"]["GlobalShape"])
+    stats_address = model.get("StatsAddress")
+    if (
+        norm_model is not None
+        and model["Reshard"]["Output"].get("DistributedStorageKind")
+        == "CanonicalGlobal"
+        and model["NormStats"]["Input"].get("DistributedStorageKind")
+        == "CanonicalGlobal"
+        and axis == rank - 1
+        and len(lane_shape) == 1
+        and input_split_mesh_axes | set(partial_axes) == set(range(len(hierarchy)))
+        and isinstance(stats_address, dict)
+        and str(stats_address.get("PoolStrideBytes", "0")) != "0"
+    ):
+        local_major_extent = _fixed(model["Reshard"]["InputActiveShape"][-1])
+        global_major_extent = _fixed(model["Reshard"]["GlobalShape"][-1])
+        lane_count = int(model["Reshard"]["VectorLaneCount"])
+        if (
+            local_major_extent is not None
+            and global_major_extent is not None
+            and local_major_extent > 0
+            and global_major_extent > 0
+            and lane_count > 0
+            and lane_shape == (lane_count,)
+        ):
+            partial_extent = _product_int([hierarchy[a] for a in partial_axes])
+            target_major_tile = max(1, 512 // lane_count)
+            worker_count = min(
+                partial_extent,
+                (local_major_extent + target_major_tile - 1)
+                // target_major_tile,
+            )
+            worker_major_extent = (
+                local_major_extent + worker_count - 1
+            ) // worker_count
+            tile_major_width = 1 << (worker_major_extent - 1).bit_length()
+            split_axes = tuple(sorted(input_split_mesh_axes))
+            split_extent = _product_int([hierarchy[a] for a in split_axes])
+            stats_count = split_extent * worker_count
+            stats_width_cap = 1 << (stats_count - 1).bit_length()
+            partial_worker_index = _split_linear_expression(
+                list(partial_axes), hierarchy
+            )
+            global_major = _local_to_global_coordinate(
+                "cooperative_local_major",
+                model["Reshard"]["GlobalShape"][-1],
+                model["Reshard"]["InputShardAxes"][-1],
+                hierarchy,
+                local_extent=local_major_extent,
+            )
+            coordinate_shape = f"({tile_major_width}, {lane_count})"
+            prefix_coordinates = tuple("0" for _ in range(rank - 1))
+            local_access = _tensor_access(
+                prefix_coordinates + ("cooperative_local_major",),
+                model["Reshard"]["InputStrides"],
+                ("cooperative_lane",),
+                lane_shape,
+                coordinate_shape,
+            )
+            global_access = _tensor_access(
+                prefix_coordinates + (global_major,),
+                model["Reshard"]["OutputStrides"],
+                ("cooperative_lane",),
+                lane_shape,
+                coordinate_shape,
+            )
+
+            split_strides: dict[int, int] = {}
+            stride = 1
+            for placement_axis in reversed(split_axes):
+                split_strides[placement_axis] = stride
+                stride *= hierarchy[placement_axis]
+            partial_strides: dict[int, int] = {}
+            stride = 1
+            for placement_axis in reversed(partial_axes):
+                partial_strides[placement_axis] = stride
+                stride *= hierarchy[placement_axis]
+            stats_source_coordinates = {}
+            for placement_axis in range(len(hierarchy)):
+                if placement_axis in split_strides:
+                    stats_source_coordinates[placement_axis] = (
+                        f"((stats_split_index // {split_strides[placement_axis]})"
+                        f" % {hierarchy[placement_axis]})"
+                    )
+                else:
+                    stats_source_coordinates[placement_axis] = (
+                        f"((stats_worker_index // {partial_strides[placement_axis]})"
+                        f" % {hierarchy[placement_axis]})"
+                    )
+            stats_source_shard_index = _split_linear_expression(
+                list(range(len(hierarchy))),
+                hierarchy,
+                "stats_source_shard_coord",
+            )
+            stats_source_pool_index = _pool_index_expression(
+                "stats_source_shard_index", stats_address["PoolScopeSize"]
+            )
+            cooperative = {
+                "global_access": global_access,
+                "global_major": global_major,
+                "local_access": local_access,
+                "local_major_extent": local_major_extent,
+                "partial_worker_index": partial_worker_index,
+                "stats_address": stats_address,
+                "stats_count": stats_count,
+                "stats_pointer_type": _pointer_type(
+                    model["NormStats"]["OutputTritonDType"],
+                    stats_address["AddressSpace"],
+                ),
+                "stats_source_coordinates": stats_source_coordinates,
+                "stats_source_pool_index": stats_source_pool_index,
+                "stats_source_shard_index": stats_source_shard_index,
+                "stats_width_cap": stats_width_cap,
+                "tile_major_width": tile_major_width,
+                "worker_count": worker_count,
+                "worker_major_extent": worker_major_extent,
+            }
+
+    cooperative_norm_apply = cooperative is not None and norm_model is not None
+    if norm_model is not None:
+        if cooperative_norm_apply:
+            expected_scalar_extent = _product_int(
+                [
+                    _require_int(
+                        dim.get("FixedValue"),
+                        "PyNTT GatherReduceAddNorm global shape",
+                        minimum=1,
+                    )
+                    for dim in model["Reshard"]["GlobalShape"]
+                ]
+            ) * int(model["Reshard"]["VectorLaneCount"])
+
+            def require_canonical_scalar_extent(
+                pointer: dict[str, Any], lane_count: int, field: str
+            ) -> None:
+                storage = pointer.get("DistributedStorageKind")
+                if storage not in (None, "CanonicalGlobal"):
+                    raise ValueError(
+                        f"PyNTT GatherReduceAddNorm owner-direct {field} must use "
+                        f"canonical global storage, got {storage}."
+                    )
+                shape = pointer.get("GlobalShape")
+                strides = pointer.get("Strides")
+                if not isinstance(shape, list) or not isinstance(strides, list) or len(shape) != len(strides):
+                    raise ValueError(
+                        f"PyNTT GatherReduceAddNorm owner-direct {field} has incomplete layout metadata."
+                    )
+                physical_extent = 1
+                for dimension, stride in zip(reversed(shape), reversed(strides)):
+                    extent = _require_int(
+                        dimension.get("FixedValue"),
+                        f"PyNTT GatherReduceAddNorm owner-direct {field} extent",
+                        minimum=1,
+                    )
+                    stride_value = _require_int(
+                        stride.get("FixedValue"),
+                        f"PyNTT GatherReduceAddNorm owner-direct {field} stride",
+                        minimum=0,
+                    )
+                    if extent != 1 and stride_value != physical_extent:
+                        raise ValueError(
+                            f"PyNTT GatherReduceAddNorm owner-direct {field} must be scalar-contiguous."
+                        )
+                    physical_extent *= extent
+                if physical_extent * lane_count != expected_scalar_extent:
+                    raise ValueError(
+                        f"PyNTT GatherReduceAddNorm owner-direct {field} scalar extent "
+                        f"{physical_extent * lane_count} does not match {expected_scalar_extent}."
+                    )
+
+            require_canonical_scalar_extent(
+                norm_model["Scale"], int(norm_model["ScaleVectorLaneCount"]), "scale"
+            )
+            require_canonical_scalar_extent(
+                norm_model["Bias"], int(norm_model["BiasVectorLaneCount"]), "bias"
+            )
+            require_canonical_scalar_extent(
+                norm_model["Output"], int(norm_model["OutputVectorLaneCount"]), "output"
+            )
+            logical_input_global_shape = _logical_shape(
+                norm_model["InputGlobalShape"], norm_model["InputVectorLaneCount"]
+            )
+            norm = {
+                "normalization_size": _product(logical_input_global_shape[axis:]),
+            }
+        else:
+            if bool(norm_model.get("RequiresCooperativeOwnerDirect")):
+                raise ValueError(
+                    "PyNTT GatherReduceAddNorm terminal output cast requires the "
+                    "cooperative owner-direct lowering."
+                )
+            norm = _norm_apply_template_context(norm_model)
     return {
+        "cooperative": cooperative,
+        "cooperative_norm_apply": cooperative_norm_apply,
         "reshard": reshard,
         "stats": stats,
         "norm": norm,
@@ -10591,6 +12509,175 @@ def _qkv_partial_input_context(
         "hierarchy": hierarchy,
         "owner_expressions": owner_expressions,
         "partial_axes": partial_axes,
+        "scalar_owner_loop": False,
+        "pointer_type": _pointer_type(
+            partial["TritonDType"], partial["Address"]["AddressSpace"]
+        ),
+        "reduction_axis": target_tile_rank,
+        "reduction_extent": reduction_extent,
+        "reduction_lane_reshape": "["
+        + ", ".join(["None"] * target_tile_rank + [":"])
+        + "]",
+        "target_reduction_reshape": "["
+        + ", ".join([":"] * target_tile_rank + ["None"])
+        + "]",
+        "reduction_width": min(
+            1 << (reduction_extent - 1).bit_length(), reduction_extent
+        ),
+        "scalar_element_size_bytes": int(partial["ScalarElementSizeBytes"]),
+        "vector_lane_count": int(partial["VectorLaneCount"]),
+        "triton_dtype": partial["TritonDType"],
+        "source_access": source_access,
+        "source_pool_index": _pool_index_expression(
+            "source_shard_index", partial["Address"]["PoolScopeSize"]
+        ),
+        "source_pool_scope_size": partial["Address"]["PoolScopeSize"],
+        "source_shard_index": _split_linear_expression(
+            list(range(len(hierarchy))), hierarchy, "source_shard_coord"
+        ),
+        "zero": zero,
+    }
+
+
+def _gated_delta_net_partial_input_context(
+    partial: dict[str, Any],
+    target: dict[str, Any],
+    target_scalar_index: str,
+    target_lane_count: int,
+    target_tile_rank: int,
+    field: str,
+    variable_prefix: str,
+) -> dict[str, Any]:
+    """Map one local GDN output element to compact Sum-partial storage."""
+
+    if len(partial["GlobalShape"]) != 2 or len(partial["Strides"]) != 2:
+        raise ValueError(f"PyNTT {field} partial input must be a packed rank-2 tensor")
+    if target_lane_count <= 0:
+        raise ValueError(f"PyNTT {field} target lane count must be positive")
+    if not variable_prefix.isidentifier():
+        raise ValueError(
+            f"PyNTT {field} partial variable prefix must be an identifier"
+        )
+    hierarchy = [int(extent) for extent in partial["Hierarchy"]]
+    if target.get("Hierarchy") != partial["Hierarchy"]:
+        raise ValueError(f"PyNTT {field} partial and output views must use one hierarchy")
+    partial_axes = tuple(sorted(int(axis) for axis in partial["PartialAxes"]))
+    if not partial_axes or any(axis < 0 or axis >= len(hierarchy) for axis in partial_axes):
+        raise ValueError(f"PyNTT {field} partial axes are invalid: {partial_axes}")
+    split_axes = set(_shard_axes_hierarchy_axes(partial["ShardAxes"]))
+    if split_axes & set(partial_axes):
+        raise ValueError(f"PyNTT {field} mesh axes cannot be both split and partial")
+
+    source_lane_shape = _validate_coordinate_lane_shape(
+        partial["VectorLaneShape"], f"PyNTT {field} partial"
+    )
+    source_lane_count = _product_int(list(source_lane_shape)) if source_lane_shape else 1
+    if source_lane_count != int(partial["VectorLaneCount"]):
+        raise ValueError(f"PyNTT {field} partial lane metadata is inconsistent")
+
+    target_token_name = f"{variable_prefix}_target_token"
+    target_packed_name = f"{variable_prefix}_target_packed"
+    target_scalar_name = f"{variable_prefix}_target_scalar"
+    source_packed_name = f"{variable_prefix}_source_packed"
+    source_lane_flat_name = f"{variable_prefix}_source_lane_flat"
+    target_token = _pointer_local_to_global_coordinate(target, 0, "0")
+    target_packed = _pointer_local_to_global_coordinate(
+        target, 1, f"({target_scalar_index}) // {target_lane_count}"
+    )
+    coordinate_bindings = [
+        {"name": target_token_name, "expression": target_token},
+        {"name": target_packed_name, "expression": target_packed},
+        {
+            "name": target_scalar_name,
+            "expression": (
+                f"({target_packed_name}) * {target_lane_count} + "
+                f"({target_scalar_index}) % {target_lane_count}"
+            ),
+        },
+        {
+            "name": source_packed_name,
+            "expression": f"({target_scalar_name}) // {source_lane_count}",
+        },
+        {
+            "name": source_lane_flat_name,
+            "expression": f"({target_scalar_name}) % {source_lane_count}",
+        },
+    ]
+    source_global = (target_token_name, source_packed_name)
+    source_lane_coordinates: list[str] = []
+    lane_stride = source_lane_count
+    for index, extent in enumerate(source_lane_shape):
+        lane_stride //= extent
+        if len(source_lane_shape) == 1 and extent == source_lane_count:
+            source_lane_coordinates.append(source_lane_flat_name)
+            continue
+        coordinate_name = f"{variable_prefix}_source_lane{index}"
+        coordinate_bindings.append(
+            {
+                "name": coordinate_name,
+                "expression": (
+                    f"(({source_lane_flat_name}) // {lane_stride}) % {extent}"
+                    if lane_stride != 1
+                    else f"({source_lane_flat_name}) % {extent}"
+                ),
+            }
+        )
+        source_lane_coordinates.append(coordinate_name)
+
+    axis_plans = tuple(
+        _global_to_local_coordinate(
+            source_global[axis],
+            partial["GlobalShape"][axis],
+            partial["ShardAxes"][axis],
+            hierarchy,
+        )
+        for axis in range(2)
+    )
+    source_access = _tensor_access(
+        tuple(plan["local_coordinate"] for plan in axis_plans),
+        partial["Strides"],
+        tuple(source_lane_coordinates),
+        source_lane_shape,
+    )
+    owner_expressions: dict[int, str] = {}
+    for plan in axis_plans:
+        for axis, owner in plan["owners"].items():
+            previous = owner_expressions.setdefault(int(axis), owner)
+            if previous != owner:
+                raise ValueError(
+                    f"PyNTT {field} source mesh axis {axis} has conflicting owners"
+                )
+
+    reduction_extent = _product_int([hierarchy[axis] for axis in partial_axes])
+    axis_strides: dict[int, int] = {}
+    axis_stride = 1
+    for axis in reversed(partial_axes):
+        axis_strides[axis] = axis_stride
+        axis_stride *= hierarchy[axis]
+    target_split_axes = set(_shard_axes_hierarchy_axes(target["ShardAxes"]))
+    active = " & ".join(
+        f"(shard_coord{axis} == 0)"
+        for axis in range(len(hierarchy))
+        if axis not in target_split_axes
+    ) or "True"
+    dtype = partial["DType"]
+    if dtype in ("float16", "bfloat16", "float32"):
+        accumulator_dtype, zero = "tl.float32", "0.0"
+    elif dtype == "float64":
+        accumulator_dtype, zero = "tl.float64", "0.0"
+    else:
+        raise ValueError(f"PyNTT {field} partial Sum does not support dtype {dtype}")
+
+    return {
+        "accumulator_dtype": accumulator_dtype,
+        "active": active,
+        "address": partial["Address"],
+        "axis_strides": axis_strides,
+        "coordinate_bindings": coordinate_bindings,
+        "hierarchy": hierarchy,
+        "owner_expressions": owner_expressions,
+        "partial_axes": partial_axes,
+        "scalar_owner_loop": True,
         "pointer_type": _pointer_type(
             partial["TritonDType"], partial["Address"]["AddressSpace"]
         ),
@@ -11294,6 +13381,21 @@ def _reshard_template_context(model: dict[str, Any]) -> dict[str, Any]:
         context["lane_coordinates"],
         context["lane_shape"],
         context["tile_shape"],
+    )
+    output_global_origins = tuple(
+        _local_to_global_coordinate(
+            "0",
+            model["GlobalShape"][axis],
+            model["OutputShardAxes"][axis],
+            model["Hierarchy"],
+        )
+        for axis in range(len(model["GlobalShape"]))
+    )
+    context["output_local_access"] = _tensor_access(
+        output_global_origins,
+        model["OutputStrides"],
+        tuple("0" for _ in context["lane_shape"]),
+        context["lane_shape"],
     )
     destination_shard_index = _split_linear_expression(
         list(range(len(model["Hierarchy"]))),

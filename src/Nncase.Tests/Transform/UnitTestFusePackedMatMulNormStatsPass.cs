@@ -39,7 +39,7 @@ public sealed class UnitTestFusePackedMatMulNormStatsPass : TestClassBase
         var originalType = function.CheckedType;
 
         var rewritten = Assert.IsType<Function>(
-            await new FusePackedMatMulNormStatsPass(false).RunAsync(function, new()));
+            await new FusePackedMatMulNormStatsPass(true, false).RunAsync(function, new()));
         var calls = ExprCollector.Collect(rewritten.Body).OfType<Call>().ToArray();
         var fusedCall = Assert.Single(
             calls.Where(call => call.Target is PackedMatMulNormStats));
@@ -96,7 +96,7 @@ public sealed class UnitTestFusePackedMatMulNormStatsPass : TestClassBase
             new IVar[] { lhs, rhs });
 
         var rewritten = Assert.IsType<Function>(
-            await new FusePackedMatMulNormStatsPass(false).RunAsync(function, new()));
+            await new FusePackedMatMulNormStatsPass(true, false).RunAsync(function, new()));
         Assert.Same(function, rewritten);
         Assert.DoesNotContain(
             ExprCollector.Collect(rewritten.Body).OfType<Call>(),
@@ -123,7 +123,7 @@ public sealed class UnitTestFusePackedMatMulNormStatsPass : TestClassBase
         Assert.True(function.InferenceType());
 
         var rewritten = Assert.IsType<Function>(
-            await new FusePackedMatMulNormStatsPass(false).RunAsync(function, new()));
+            await new FusePackedMatMulNormStatsPass(true, false).RunAsync(function, new()));
         var calls = ExprCollector.Collect(rewritten.Body).OfType<Call>().ToArray();
         var fusedCalls = calls
             .Where(call => call.Target is PackedMatMulNormStats)
@@ -134,6 +134,27 @@ public sealed class UnitTestFusePackedMatMulNormStatsPass : TestClassBase
         Assert.Contains(
             fusedCalls,
             call => call[PackedMatMulNormStats.Addend] is Call { Target: IR.Tensors.GetItem });
+        Assert.True(rewritten.InferenceType());
+    }
+
+    [Fact]
+    public async Task TestBlockScaledOnlyModeLeavesPackedMatMulForLaterFusion()
+    {
+        var (lhs, rhs, addend, packedMatMul) = CreateSplitNPackedMatMul();
+        var function = new Function(
+            "main",
+            string.Empty,
+            new IR.Tuple(packedMatMul, IR.F.NN.NormStats(-1, packedMatMul, false)),
+            new IVar[] { lhs, rhs, addend });
+        Assert.True(function.InferenceType());
+
+        var rewritten = Assert.IsType<Function>(
+            await new FusePackedMatMulNormStatsPass(false, true).RunAsync(function, new()));
+        var calls = ExprCollector.Collect(rewritten.Body).OfType<Call>().ToArray();
+
+        Assert.Contains(calls, call => call.Target is PackedMatMul);
+        Assert.Contains(calls, call => call.Target is NormStats);
+        Assert.DoesNotContain(calls, call => call.Target is PackedMatMulNormStats);
         Assert.True(rewritten.InferenceType());
     }
 
@@ -184,7 +205,7 @@ public sealed class UnitTestFusePackedMatMulNormStatsPass : TestClassBase
         Assert.True(function.InferenceType());
 
         var rewritten = Assert.IsType<Function>(
-            await new FusePackedMatMulNormStatsPass(enableBlockScaledMatMul)
+            await new FusePackedMatMulNormStatsPass(false, enableBlockScaledMatMul)
                 .RunAsync(function, new()));
         var calls = ExprCollector.Collect(rewritten.Body).OfType<Call>().ToArray();
 

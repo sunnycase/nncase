@@ -98,14 +98,16 @@ internal readonly record struct EffectInfo(
     MemoryAccessMode Mode,
     TIR.NTT.BarrierScope Scope,
     bool RequiresFullChipSynchronization,
-    MemoryAccessDomain AccessDomain)
+    MemoryAccessDomain AccessDomain,
+    MemoryOwnerAccess OwnerAccess)
 {
     public EffectInfo Merge(EffectInfo other)
         => new(
             Mode | other.Mode,
             MemoryEffectAnalyzer.MergeScope(Scope, other.Scope),
             RequiresFullChipSynchronization || other.RequiresFullChipSynchronization,
-            MemoryEffectUtility.MergeAccessDomain(AccessDomain, other.AccessDomain));
+            MemoryEffectUtility.MergeAccessDomain(AccessDomain, other.AccessDomain),
+            MemoryEffectUtility.MergeOwnerAccess(OwnerAccess, other.OwnerAccess));
 }
 
 internal readonly record struct ResolvedMemoryEffect(MemoryResource Resource, EffectInfo Effect);
@@ -545,7 +547,8 @@ internal sealed class MemoryEffectAnalyzer
                         effect.Mode,
                         resource.Scope,
                         effect.Scope == MemoryAccessScope.Chip,
-                        effect.AccessDomain));
+                        effect.AccessDomain,
+                        effect.OwnerAccess));
             });
 
         return effects;
@@ -1090,8 +1093,8 @@ internal static class SynchronizationRequirementInference
                 !producer.Resource.HasSameLogicalResource(consumer.Resource));
         if (hasRaw && !hasOtherHazard &&
             TryInferRawAxisGroup(
-                producer.Resource.DistributedType,
-                consumer.Resource.DistributedType,
+                producer,
+                consumer,
                 out var requirement))
         {
             return requirement;
@@ -1111,11 +1114,13 @@ internal static class SynchronizationRequirementInference
            producer.Resource.DistributedType?.Placement == consumer.Resource.DistributedType?.Placement;
 
     internal static bool TryInferRawAxisGroup(
-        DistributedType? producer,
-        DistributedType? consumer,
+        ResolvedMemoryEffect producerEffect,
+        ResolvedMemoryEffect consumerEffect,
         out SynchronizationRequirement requirement)
     {
         requirement = default;
+        var producer = producerEffect.Resource.DistributedType;
+        var consumer = consumerEffect.Resource.DistributedType;
         if (producer is null || consumer is null ||
             producer.Placement != consumer.Placement ||
             producer.Partial != consumer.Partial)
@@ -1160,6 +1165,8 @@ internal static class SynchronizationRequirementInference
         }
 
         var requiredAxes = new List<int>();
+        AddOwnerAccessAxes(producerEffect, requiredAxes);
+        AddOwnerAccessAxes(consumerEffect, requiredAxes);
         foreach (var meshAxis in producerAssignments.Keys.Union(consumerAssignments.Keys).Order())
         {
             var hasProducer = producerAssignments.TryGetValue(meshAxis, out var producerTensorAxis);
@@ -1195,6 +1202,17 @@ internal static class SynchronizationRequirementInference
 
         requirement = SynchronizationRequirement.ChipAxisGroup(placement, requiredAxes);
         return true;
+
+        static void AddOwnerAccessAxes(
+            ResolvedMemoryEffect effect,
+            List<int> axes)
+        {
+            if (effect.Effect.OwnerAccess == MemoryOwnerAccess.PartialGroup &&
+                effect.Resource.DistributedType?.Partial is { } partial)
+            {
+                axes.AddRange(partial.Axes);
+            }
+        }
 
         static bool TryProvePrefixCoarsening(SBP producerPolicy, SBP consumerPolicy)
         {

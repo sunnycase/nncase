@@ -1240,7 +1240,7 @@ public sealed class UnitTestPyNTTTarget : TestClassBase
         Assert.Equal(3, selection.SharedWorkspaces.Length);
         var workspace = selection.SharedWorkspaces[0];
         Assert.Equal(
-            new long[] { numStages, blockK / weightBlockK, 128, weightBlockK },
+            new long[] { numStages, blockK / weightBlockK, 1, 128, weightBlockK },
             workspace.Type.Shape.ToValueArray());
         Assert.Equal("lhs_quantized", selection.SharedWorkspaces[1].Name);
         Assert.Equal(
@@ -1254,6 +1254,67 @@ public sealed class UnitTestPyNTTTarget : TestClassBase
         Assert.Equal(DataTypes.Float32, selection.SharedWorkspaces[2].Type.DType);
         Assert.Equal(new[] { 1 }, selection.TransferPipeline!.SourceArgumentIndices);
         Assert.Equal(new[] { 0 }, selection.TransferPipeline.SharedWorkspaceIndices);
+        Assert.Equal(
+            new[] { 1, 2 },
+            selection.TransferPipeline.ConsumerSharedWorkspaceIndices);
+    }
+
+    [Fact]
+    public void TestTritonH800PackedBlockFp8DownGemvUsesAuxiliaryConsumer()
+    {
+        const int localScalarN = 40;
+        const int k = 2176;
+        const int outputNLane = 8;
+        const int weightKPack = 2;
+        const int weightKLane = 16;
+        const int weightBlockK = 128;
+        var lhs = CreateBuffer(
+            "lhs",
+            DataTypes.BFloat16,
+            TIR.MemoryLocation.ChipLocalData,
+            0,
+            [1, k],
+            [k, 1]);
+        var rhs = CreateBuffer(
+            "rhs",
+            new VectorType(DataTypes.Float8E4M3, [weightKPack, weightKLane]),
+            TIR.MemoryLocation.ChipLocalRdata,
+            0,
+            [localScalarN, k / (weightKPack * weightKLane)],
+            [k / (weightKPack * weightKLane), 1]);
+        var rhsScale = CreateBuffer(
+            "rhs_scale",
+            DataTypes.BFloat16,
+            TIR.MemoryLocation.ChipLocalRdata,
+            0,
+            [(localScalarN + 127) / 128, k / weightBlockK],
+            [k / weightBlockK, 1]);
+        var output = CreateBuffer(
+            "output",
+            new VectorType(DataTypes.BFloat16, [outputNLane]),
+            TIR.MemoryLocation.ChipLocalData,
+            0,
+            [1, localScalarN / outputNLane],
+            [localScalarN / outputNLane, 1]);
+        var op = new TIR.NTT.PackedBlockScaledMatMul(
+            IR.NTT.PackedMatMulRhsLayout.NMajorKPacked,
+            outputNLane,
+            128,
+            weightBlockK);
+        var targetOptions = Assert.IsType<PyNTTTargetOptions>(CompileOptions.TargetOptions);
+
+        var selection = Assert.IsType<Nncase.Schedule.TIRMicroKernelSelection>(
+            targetOptions.TIRMicroKernelSelector.Select(
+                new(op, [lhs, rhs, rhsScale, output], NTTTargetMachineCatalog.Resolve("h800"))));
+
+        Assert.Equal("mma_block_fp8_smem_pipeline", selection.Variant);
+        Assert.Equal(4096, selection.Parameters["lhs_stage_extent"]);
+        Assert.Equal(1, selection.Parameters["fragment_accumulate_mma"]);
+        Assert.Equal(new[] { 1, 2, 3 }, selection.TransferPipeline!.ConsumerSharedWorkspaceIndices);
+        var auxiliary = Assert.IsType<Nncase.Schedule.TIRAuxiliaryConsumerContract>(
+            selection.TransferPipeline.AuxiliaryConsumer);
+        Assert.Equal(new[] { 0 }, auxiliary.ChannelIndices);
+        Assert.Equal(new[] { 1, 2, 3 }, auxiliary.ConsumerSharedWorkspaceIndices);
     }
 
     [Fact]
@@ -2023,7 +2084,8 @@ public sealed class UnitTestPyNTTTarget : TestClassBase
             IR.NTT.PackedMatMulRhsLayout.KMajor,
             IR.Math.MatMulQuantizationMode.None,
             0,
-            0);
+            0,
+            false);
         var targetOptions = Assert.IsType<PyNTTTargetOptions>(CompileOptions.TargetOptions);
 
         var selection = Assert.IsType<Nncase.Schedule.TIRMicroKernelSelection>(
@@ -2034,6 +2096,8 @@ public sealed class UnitTestPyNTTTarget : TestClassBase
                         input,
                         gateWeight,
                         upWeight,
+                        output,
+                        output,
                         output,
                         output,
                         output,
@@ -5080,8 +5144,16 @@ public sealed class UnitTestPyNTTTarget : TestClassBase
             Assert.True(attrs.GetProperty("requires_grid_barrier").GetBoolean());
             Assert.Collection(
                 attrs.GetProperty("grid_barrier_axis_groups").EnumerateArray().ToArray(),
-                group => Assert.Equal(new[] { 0 }, group.EnumerateArray().Select(axis => axis.GetInt32()).ToArray()),
-                group => Assert.Equal(new[] { 1 }, group.EnumerateArray().Select(axis => axis.GetInt32()).ToArray()));
+                group =>
+                {
+                    Assert.Equal(new[] { 0 }, group.GetProperty("axes").EnumerateArray().Select(axis => axis.GetInt32()).ToArray());
+                    Assert.Equal(new[] { 4 }, group.GetProperty("shape").EnumerateArray().Select(axis => axis.GetInt32()).ToArray());
+                },
+                group =>
+                {
+                    Assert.Equal(new[] { 1 }, group.GetProperty("axes").EnumerateArray().Select(axis => axis.GetInt32()).ToArray());
+                    Assert.Equal(new[] { 8 }, group.GetProperty("shape").EnumerateArray().Select(axis => axis.GetInt32()).ToArray());
+                });
         }
 
         RenderGeneratedKernels(outputDirectory);
@@ -5091,14 +5163,15 @@ public sealed class UnitTestPyNTTTarget : TestClassBase
             generatedKernelsPy,
             StringComparison.Ordinal);
         Assert.Contains("PYNTT_GRID_MESH = tl.constexpr(_PYNTT_GRID_MESH_VALUE)", generatedKernelsPy, StringComparison.Ordinal);
-        Assert.Contains("PYNTT_GRID_AXIS_GROUP_0 = tl.constexpr(", generatedKernelsPy, StringComparison.Ordinal);
-        Assert.Contains("_PYNTT_GRID_MESH_VALUE.axis_group(('block_y',))", generatedKernelsPy, StringComparison.Ordinal);
-        Assert.Contains("PYNTT_GRID_AXIS_GROUP_1 = tl.constexpr(", generatedKernelsPy, StringComparison.Ordinal);
-        Assert.Contains("_PYNTT_GRID_MESH_VALUE.axis_group(('block_x',))", generatedKernelsPy, StringComparison.Ordinal);
-        Assert.Contains("tle.distributed_barrier(PYNTT_GRID_AXIS_GROUP_0)", generatedKernelsPy, StringComparison.Ordinal);
-        Assert.Contains("tle.distributed_barrier(PYNTT_GRID_AXIS_GROUP_1)", generatedKernelsPy, StringComparison.Ordinal);
+        Assert.Contains("PYNTT_GRID_AXIS_GROUP_0x4 = tl.constexpr(", generatedKernelsPy, StringComparison.Ordinal);
+        Assert.Contains("('block_y',),\n        group_shape=(4,)", generatedKernelsPy, StringComparison.Ordinal);
+        Assert.Contains("PYNTT_GRID_AXIS_GROUP_1x8 = tl.constexpr(", generatedKernelsPy, StringComparison.Ordinal);
+        Assert.Contains("('block_x',),\n        group_shape=(8,)", generatedKernelsPy, StringComparison.Ordinal);
+        Assert.Contains("tle.distributed_barrier(PYNTT_GRID_AXIS_GROUP_0x4)", generatedKernelsPy, StringComparison.Ordinal);
+        Assert.Contains("tle.distributed_barrier(PYNTT_GRID_AXIS_GROUP_1x8)", generatedKernelsPy, StringComparison.Ordinal);
         Assert.Contains("tle.distributed_barrier(PYNTT_GRID_MESH)", generatedKernelsPy, StringComparison.Ordinal);
-        Assert.DoesNotContain("tle.shard_id", generatedKernelsPy, StringComparison.Ordinal);
+        Assert.Contains("shard_coord0 = tle.gpu.rematerialize_index(tle.shard_id(PYNTT_GRID_MESH, 'block_y').to(tl.int64))", generatedKernelsPy, StringComparison.Ordinal);
+        Assert.Contains("shard_coord1 = tle.gpu.rematerialize_index(tle.shard_id(PYNTT_GRID_MESH, 'block_x').to(tl.int64))", generatedKernelsPy, StringComparison.Ordinal);
         Assert.DoesNotContain("PYNTT_GRID_SUBMESH", generatedKernelsPy, StringComparison.Ordinal);
     }
 
@@ -5775,9 +5848,12 @@ public sealed class UnitTestPyNTTTarget : TestClassBase
             $"generated_gated_delta_net_atomic_{hierarchyY}x{hierarchyX}_model",
             main);
         var compiler = Assert.IsType<global::Nncase.Compiler.Compiler>(CompileSession.Compiler);
-        Assert.Single(compiler.Module.Functions
+        var convolutionCall = Assert.Single(compiler.Module.Functions
             .SelectMany(function => ExprCollector.Collect(function).OfType<Call>())
             .Where(call => call.Target is TIR.NTT.GatedDeltaNetConvolution));
+        var convolutionMicroKernel = Assert.IsType<Nncase.Schedule.TIRMicroKernelSelection>(
+            convolutionCall.Metadata.TIRMicroKernel);
+        Assert.Equal(256, convolutionMicroKernel.Parameters["block_n"]);
         Assert.Single(compiler.Module.Functions
             .SelectMany(function => ExprCollector.Collect(function).OfType<Call>())
             .Where(call => call.Target is TIR.NTT.GatedDeltaNetRecurrentCore));
@@ -5789,6 +5865,11 @@ public sealed class UnitTestPyNTTTarget : TestClassBase
             StringComparison.Ordinal);
         Assert.Contains(
             "generated from PyNTT algorithm triton.gated_delta_net/recurrent_core",
+            generatedKernelsPy,
+            StringComparison.Ordinal);
+        Assert.Contains(
+            "tle.distributed_barrier(PYNTT_GRID_MESH)\n" +
+            "    main_prim__gated_delta_net_convolution__0__consumer(",
             generatedKernelsPy,
             StringComparison.Ordinal);
         if (hierarchyY * hierarchyX < 32)
@@ -5966,6 +6047,9 @@ public sealed class UnitTestPyNTTTarget : TestClassBase
         Assert.Equal("projection", projectionChannel.Name);
         Assert.Equal(new[] { 4, 5 }, projectionChannel.SourceArgumentIndices);
         Assert.Equal(new[] { 0, 1 }, projectionChannel.SharedWorkspaceIndices);
+        Assert.Equal(
+            new[] { 2 },
+            transferPipeline.ConsumerSharedWorkspaceIndices);
 
         RenderGeneratedKernels(outputDirectory);
         var generatedKernelsPy = File.ReadAllText(Path.Join(outputDirectory, "generated_kernels.py"));

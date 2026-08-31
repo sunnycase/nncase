@@ -1,5 +1,35 @@
 {% macro load(partial, value_name, mask, indent) %}
-{{ indent }}partial_acc = tl.zeros_like({{ partial["source_access"]["ScalarOffset"] }}).to({{ partial["accumulator_dtype"] }})
+{% if partial.get("coordinate_bindings") %}
+{% for binding in partial["coordinate_bindings"] %}
+{{ indent }}{{ binding["name"] }} = {{ binding["expression"] }}
+{% endfor %}
+{{ indent }}{{ value_name }}_partial_source_offset = {{ partial["source_access"]["ScalarOffset"] }}
+{% for axis, expression in partial["owner_expressions"].items() %}
+{{ indent }}{{ value_name }}_partial_source_owner{{ axis }} = {{ expression }}
+{% endfor %}
+{% set source_offset = value_name ~ "_partial_source_offset" %}
+{% else %}
+{% set source_offset = partial["source_access"]["ScalarOffset"] %}
+{% endif %}
+{{ indent }}partial_acc = tl.zeros_like({{ source_offset }}).to({{ partial["accumulator_dtype"] }})
+{% if partial["scalar_owner_loop"] %}
+{{ indent }}for partial_lane in tl.static_range(0, {{ partial["reduction_extent"] }}):
+{% for axis in range(partial["hierarchy"] | length) %}
+{% if axis in partial["partial_axes"] %}
+{{ indent }}    source_shard_coord{{ axis }} = (partial_lane // {{ partial["axis_strides"][axis] }}) % {{ partial["hierarchy"][axis] }}
+{% elif axis in partial["owner_expressions"] %}
+{{ indent }}    source_shard_coord{{ axis }} = ({% if partial.get("coordinate_bindings") %}{{ value_name }}_partial_source_owner{{ axis }}{% else %}{{ partial["owner_expressions"][axis] }}{% endif %}) + ({{ source_offset }}) * 0
+{% else %}
+{{ indent }}    source_shard_coord{{ axis }} = shard_coord{{ axis }} + partial_lane * 0
+{% endif %}
+{% endfor %}
+{{ indent }}    source_shard_index = {{ partial["source_shard_index"] }}
+{{ indent }}    source_pool_index = {{ partial["source_pool_index"] }}
+{{ indent }}    source_byte_offset = source_pool_index * {{ partial["address"]["PoolStrideBytes"] }} + {{ partial["address"]["OffsetBytes"] }}
+{{ indent }}    source = ({{ partial["address"]["BaseName"] }} + source_byte_offset).to({{ partial["pointer_type"] }})
+{{ indent }}    source_value = tl.load(source + ({{ source_offset }}), mask={{ mask }}, other={{ partial["zero"] }}).to({{ partial["accumulator_dtype"] }})
+{{ indent }}    partial_acc += source_value
+{% else %}
 {{ indent }}for partial_start in tl.range(0, {{ partial["reduction_extent"] }}, {{ partial["reduction_width"] }}):
 {{ indent }}    partial_lane = partial_start + tl.arange(0, {{ partial["reduction_width"] }})
 {{ indent }}    partial_lane_mask = partial_lane < {{ partial["reduction_extent"] }}
@@ -21,5 +51,6 @@
 {{ indent }}    source_offsets = ({{ partial["source_access"]["ScalarOffset"] }}){{ partial["target_reduction_reshape"] }}
 {{ indent }}    source_value = tl.load(source + source_offsets, mask=({{ mask }}){{ partial["target_reduction_reshape"] }} & partial_lane_mask, other={{ partial["zero"] }}).to({{ partial["accumulator_dtype"] }})
 {{ indent }}    partial_acc += tl.sum(source_value, axis={{ partial["reduction_axis"] }})
+{% endif %}
 {{ indent }}{{ value_name }} = partial_acc.to({{ partial["triton_dtype"] }}).to({{ partial["accumulator_dtype"] }})
 {% endmacro %}

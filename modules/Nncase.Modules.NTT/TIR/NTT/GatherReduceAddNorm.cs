@@ -10,7 +10,11 @@ namespace Nncase.TIR.NTT;
 /// </summary>
 public sealed partial class GatherReduceAddNormStats : NTTKernelOp
 {
-    public static readonly ParameterInfo Input = new(typeof(GatherReduceAddNormStats), 0, "input", memoryEffect: MemoryEffect.ChipRead);
+    public static readonly ParameterInfo Input = new(
+        typeof(GatherReduceAddNormStats),
+        0,
+        "input",
+        memoryEffect: MemoryEffect.Read.AcrossPartialOwners());
 
     public static readonly ParameterInfo Collective = new(typeof(GatherReduceAddNormStats), 1, "collective", memoryEffect: MemoryEffect.ReadWrite);
 
@@ -37,7 +41,11 @@ public sealed partial class GatherReduceAddNormStats : NTTKernelOp
 /// </summary>
 public sealed partial class GatherReduceAddNormApply : NTTKernelOp
 {
-    public static readonly ParameterInfo Input = new(typeof(GatherReduceAddNormApply), 0, "input", memoryEffect: MemoryEffect.ChipRead);
+    public static readonly ParameterInfo Input = new(
+        typeof(GatherReduceAddNormApply),
+        0,
+        "input",
+        memoryEffect: MemoryEffect.Read.AcrossPartialOwners());
 
     public static readonly ParameterInfo Collective = new(typeof(GatherReduceAddNormApply), 1, "collective", memoryEffect: MemoryEffect.ReadWrite);
 
@@ -57,6 +65,11 @@ public sealed partial class GatherReduceAddNormApply : NTTKernelOp
 
     public DistributedType OutType { get; }
 
+    /// <summary>
+    /// Gets the semantic distributed type produced before any terminal storage cast.
+    /// </summary>
+    public DistributedType NormOutputType { get; }
+
     public int Axis { get; }
 
     public float Epsilon { get; }
@@ -64,5 +77,5 @@ public sealed partial class GatherReduceAddNormApply : NTTKernelOp
     public bool UseMean { get; }
 
     public override string DisplayProperty() =>
-        $"Axis: {Axis}, Epsilon: {Epsilon}, UseMean: {UseMean}";
+        $"Axis: {Axis}, Epsilon: {Epsilon}, UseMean: {UseMean}, NormOutputType: {NormOutputType}";
 }

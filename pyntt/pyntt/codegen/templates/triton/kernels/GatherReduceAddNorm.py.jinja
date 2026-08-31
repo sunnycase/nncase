@@ -8,6 +8,8 @@
 {% set stats = model["NormStats"] %}
 {% set sctx = ctx["stats"] %}
 {% set norm = model["NormApply"] %}
+{% set cooperative = ctx["cooperative"] %}
+{% set cooperative_norm_apply = ctx["cooperative_norm_apply"] %}
 # generated from PyNTT Jinja GatherReduceAddNorm.py.jinja
 # {{ model["Comment"] }}; dtype={{ stats["InputDType"] }}, shape={{ shape_tuple(stats["InputShape"]) }}, axis={{ stats["Axis"] }}, apply_norm={{ norm is not none }}
 {{ phases.consumer_header(model) }}
@@ -17,6 +19,68 @@
     addend = {{ ptr(model, "Addend") }}
     value_output = {{ ptr(stats, "Input") }}
     stats_output = {{ ptr(stats, "Output") }}
+{% if cooperative is not none %}
+    cooperative_worker_index = {{ cooperative["partial_worker_index"] }}
+    cooperative_local_major = cooperative_worker_index * {{ cooperative["worker_major_extent"] }} + tl.arange(0, {{ cooperative["tile_major_width"] }})[:, None]
+    cooperative_lane = tl.arange(0, {{ rctx["lane_count"] }})[None, :]
+    cooperative_mask = (cooperative_worker_index < {{ cooperative["worker_count"] }}) & (cooperative_local_major < (cooperative_worker_index + 1) * {{ cooperative["worker_major_extent"] }}) & (cooperative_local_major < {{ cooperative["local_major_extent"] }})
+    cooperative_global_major = {{ cooperative["global_major"] }}
+    cooperative_acc = tl.zeros(({{ cooperative["tile_major_width"] }}, {{ rctx["lane_count"] }}), {{ partial["accumulator_dtype"] }})
+{% for axis in range(reshard["Hierarchy"] | length) %}
+{% if axis not in partial["axes"] %}
+    source_shard_coord{{ axis }} = shard_coord{{ axis }}
+{% endif %}
+{% endfor %}
+    for partial_lane in tl.static_range(0, {{ partial["reduction_extent"] }}):
+{% for axis in partial["axes"] %}
+        source_shard_coord{{ axis }} = (partial_lane // {{ partial["axis_strides"][axis] }}) % {{ reshard["Hierarchy"][axis] }}
+{% endfor %}
+        source_shard_index = {{ partial["source_shard_index"] }}
+        source_pool_index = {{ partial["source_pool_index"] }}
+        source_byte_offset = source_pool_index * {{ partial["address"]["PoolStrideBytes"] }} + {{ partial["address"]["OffsetBytes"] }}
+        source = ({{ partial["address"]["BaseName"] }} + source_byte_offset).to({{ partial["pointer_type"] }})
+        source_value = tl.load(source + {{ cooperative["local_access"]["ScalarOffset"] }}, mask=cooperative_mask, other={{ partial["zero"] }}).to({{ partial["accumulator_dtype"] }})
+        cooperative_acc += source_value
+    reduced_value = cooperative_acc.to({{ reshard["TritonDType"] }}).to(tl.float32)
+    addend_value = tl.load(addend + {{ cooperative["global_access"]["ScalarOffset"] }}, mask=cooperative_mask, other=0.0).to(tl.float32)
+    value = reduced_value + addend_value
+    tl.store(collective + {{ cooperative["global_access"]["ScalarOffset"] }}, value, mask=cooperative_mask)
+{% if cooperative_norm_apply %}
+    rounded_value = value.to({{ norm["ResultTritonDType"] }}).to(tl.float32)
+{% endif %}
+{% if stats["UseMean"] %}
+    partial_mean_sum = tl.sum(tl.sum(tl.where(cooperative_mask, value, 0.0), axis=1), axis=0)
+{% endif %}
+    partial_square_sum = tl.sum(tl.sum(tl.where(cooperative_mask, value * value, 0.0), axis=1), axis=0)
+{% for axis in sctx["outer_axes"] %}
+    outer_idx{{ axis }} = 0
+{% endfor %}
+{% if stats["UseMean"] %}
+    tl.store({{ access_pointer(stats, "Output", "stats_output", sctx["stats_accesses"][0]) }}, partial_mean_sum, mask=cooperative_worker_index < {{ cooperative["worker_count"] }})
+    tl.store({{ access_pointer(stats, "Output", "stats_output", sctx["stats_accesses"][1]) }}, partial_square_sum, mask=cooperative_worker_index < {{ cooperative["worker_count"] }})
+{% else %}
+    tl.store({{ access_pointer(stats, "Output", "stats_output", sctx["stats_accesses"][0]) }}, partial_square_sum, mask=cooperative_worker_index < {{ cooperative["worker_count"] }})
+{% endif %}
+
+    tle.distributed_barrier(PYNTT_GRID_MESH)
+    stats_index = tl.arange(0, {{ cooperative["stats_width_cap"] }})
+    stats_mask = stats_index < {{ cooperative["stats_count"] }}
+    stats_split_index = stats_index // {{ cooperative["worker_count"] }}
+    stats_worker_index = stats_index % {{ cooperative["worker_count"] }}
+{% for axis, coordinate in cooperative["stats_source_coordinates"].items() %}
+    stats_source_shard_coord{{ axis }} = {{ coordinate }}
+{% endfor %}
+    stats_source_shard_index = {{ cooperative["stats_source_shard_index"] }}
+    stats_source_pool_index = {{ cooperative["stats_source_pool_index"] }}
+    stats_source_byte_offset = stats_source_pool_index * {{ cooperative["stats_address"]["PoolStrideBytes"] }} + {{ cooperative["stats_address"]["OffsetBytes"] }}
+    stats_source = ({{ cooperative["stats_address"]["BaseName"] }} + stats_source_byte_offset).to({{ cooperative["stats_pointer_type"] }})
+{% if stats["UseMean"] %}
+    mean_sum = tl.sum(tl.load(stats_source + {{ sctx["stats_accesses"][0]["ScalarOffset"] }}, mask=stats_mask, other=0.0).to(tl.float32), axis=0)
+    square_sum = tl.sum(tl.load(stats_source + {{ sctx["stats_accesses"][1]["ScalarOffset"] }}, mask=stats_mask, other=0.0).to(tl.float32), axis=0)
+{% else %}
+    square_sum = tl.sum(tl.load(stats_source + {{ sctx["stats_accesses"][0]["ScalarOffset"] }}, mask=stats_mask, other=0.0).to(tl.float32), axis=0)
+{% endif %}
+{% else %}
 {% for axis in rctx["destination_local_mesh_axes"] %}
     destination_shard_coord{{ axis }} = shard_coord{{ axis }}
 {% endfor %}
@@ -24,11 +88,7 @@
 {{ "    " * loop.index }}for destination_shard_coord{{ axis }} in tl.range(0, {{ reshard["Hierarchy"][axis] }}):
 {% endfor %}
 {% set rbase = "    " * (rctx["prefix_depth"] + 1) %}
-{{ rbase }}partial_reduction_width: tl.constexpr = min({{ model["TargetWorkerWidth"] }}, {{ partial["reduction_width_cap"] }})
-{{ rbase }}partial_worker_thread_id = tl.inline_asm_elementwise("mov.u32 $0, %tid.x;", "=r", [], dtype=tl.int32, is_pure=True, pack=1)
-{% call(body) elementwise.iterate(rctx, rctx["prefix_depth"], physical_width_divisor="partial_reduction_width") %}
-{{ body }}partial_worker_count: tl.constexpr = min({{ model["NumWarps"] * model["TargetWorkerWidth"] }}, elementwise_physical_tile_width * {{ rctx["lane_count"] }} * partial_reduction_width)
-{{ body }}mask = mask & (partial_worker_thread_id < partial_worker_count)
+{% call(body) elementwise.iterate(rctx, rctx["prefix_depth"]) %}
 {% for axis in range(reshard["GlobalShape"] | length) %}
 {{ body }}global_idx{{ axis }} = {{ rctx["global_coordinates"][axis] }}
 {{ body }}mask = mask & (global_idx{{ axis }} < {{ dim(reshard["GlobalShape"][axis]) }})
@@ -63,11 +123,7 @@
 {{ body }}source_shard_coord{{ axis }} = shard_coord{{ axis }}
 {% endif %}
 {% endfor %}
-{{ body }}for partial_start in tl.range(0, {{ partial["reduction_extent"] }}, partial_reduction_width):
-{{ body }}    partial_lane = partial_start + tl.arange(0, partial_reduction_width)
-{{ body }}    partial_lane_mask = partial_lane < {{ partial["reduction_extent"] }}
-{{ body }}    partial_lane = partial_lane{{ partial["reduction_lane_reshape"] }}
-{{ body }}    partial_lane_mask = partial_lane_mask{{ partial["reduction_lane_reshape"] }}
+{{ body }}for partial_lane in tl.static_range(0, {{ partial["reduction_extent"] }}):
 {% for axis in partial["axes"] %}
 {{ body }}    source_shard_coord{{ axis }} = (partial_lane // {{ partial["axis_strides"][axis] }}) % {{ reshard["Hierarchy"][axis] }}
 {% endfor %}
@@ -75,8 +131,8 @@
 {{ body }}    source_pool_index = {{ partial["source_pool_index"] }}
 {{ body }}    source_byte_offset = source_pool_index * {{ partial["address"]["PoolStrideBytes"] }} + {{ partial["address"]["OffsetBytes"] }}
 {{ body }}    source = ({{ partial["address"]["BaseName"] }} + source_byte_offset).to({{ partial["pointer_type"] }})
-{{ body }}    source_value = tl.load(source + {{ rctx["input_access"]["ScalarOffset"] }}{{ partial["append_reduction_axis"] }}, mask=mask{{ partial["append_reduction_axis"] }} & partial_lane_mask, other={{ partial["zero"] }}).to({{ partial["accumulator_dtype"] }})
-{{ body }}    acc += tl.sum(source_value, axis={{ partial["reduction_axis"] }})
+{{ body }}    source_value = tl.load(source + {{ rctx["input_access"]["ScalarOffset"] }}, mask=mask, other={{ partial["zero"] }}).to({{ partial["accumulator_dtype"] }})
+{{ body }}    acc += source_value
 {{ body }}reduced_value = acc.to({{ reshard["TritonDType"] }}).to(tl.float32)
 {{ body }}tl.store(({{ reshard["OutputAddress"]["BaseName"] }} + output_byte_offsets).to({{ rctx["output_pointer_type"] }}), reduced_value, mask=mask)
 {% endcall %}
@@ -94,7 +150,7 @@
 {{ sbase }}for reduction_start in tl.range(0, {{ sctx["reduction_extent"] }}, block_size, loop_unroll_factor=1):
 {{ sbody }}reduction_offsets = reduction_start + tl.arange(0, block_size)
 {{ sbody }}mask = reduction_offsets < {{ sctx["reduction_extent"] }}
-{{ sbody }}reduced_value = tl.load(collective + reduction_offsets, mask=mask, other=0.0).to(tl.float32)
+{{ sbody }}reduced_value = tl.load(collective + {{ rctx["output_local_access"]["ScalarOffset"] }} + reduction_offsets, mask=mask, other=0.0).to(tl.float32)
 {{ sbody }}addend_value = tl.load(addend + reduction_offsets, mask=mask, other=0.0).to(tl.float32)
 {{ sbody }}value = reduced_value + addend_value
 {{ sbody }}tl.store(value_output + reduction_offsets, value, mask=mask)
@@ -108,13 +164,37 @@
 {% else %}
 {{ sbase }}tl.store({{ access_pointer(stats, "Output", "stats_output", sctx["stats_accesses"][0]) }}, square_sum)
 {% endif %}
+{% endif %}
 
 {% if norm is not none %}
 {% set nctx = ctx["norm"] %}
+{% if cooperative is none %}
     tl.debug_barrier()
+{% endif %}
     norm_scale = {{ ptr(norm, "Scale") }}
     norm_bias = {{ ptr(norm, "Bias") }}
     norm_output = {{ ptr(norm, "Output") }}
+{% if cooperative_norm_apply %}
+    inner_count = ({{ nctx["normalization_size"] }}) + 0.0
+{% if norm["UseMean"] %}
+    mean_value = mean_sum / inner_count
+    variance = (square_sum / inner_count) - (mean_value * mean_value)
+{% else %}
+    mean_value = 0.0
+    variance = square_sum / inner_count
+{% endif %}
+    variance = tl.maximum(variance, 0.0)
+    inv_std = tl.rsqrt(variance + {{ pyrepr(norm["Epsilon"]) }})
+    norm_offsets = {{ cooperative["global_access"]["ScalarOffset"] }}
+    scale_value = tl.load(norm_scale + norm_offsets, mask=cooperative_mask, other=0.0).to(tl.float32)
+    bias_value = tl.load(norm_bias + norm_offsets, mask=cooperative_mask, other=0.0).to(tl.float32)
+    result = ((rounded_value - mean_value) * inv_std * scale_value) + bias_value
+{% if norm["ResultTritonDType"] == norm["OutputTritonDType"] %}
+    tl.store(norm_output + norm_offsets, result, mask=cooperative_mask)
+{% else %}
+    tl.store(norm_output + norm_offsets, result.to({{ norm["ResultTritonDType"] }}).to({{ norm["OutputTritonDType"] }}), mask=cooperative_mask)
+{% endif %}
+{% else %}
 {% for axis in nctx["outer_axes"] %}
     outer_idx{{ axis }} = 0
 {% endfor %}
@@ -137,6 +217,7 @@
 {{ body }}result = ((value0 - mean_value) * inv_std * scale_value) + bias_value
 {{ body }}tl.store({{ access_pointer(norm, "Output", "norm_output", nctx["output_access"]) }}, result, mask=mask)
 {% endcall %}
+{% endif %}
 {% endif %}
 
 

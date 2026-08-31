@@ -1,0 +1,39 @@
+{% import "triton/kernels/_common.py.jinja" as common with context %}
+{% import "triton/kernels/_producer_consumer.py.jinja" as phases with context %}
+# generated from PyNTT Jinja PackedMatMulGluCombine.py.jinja
+# {{ model["Comment"] }}; local_vectors={{ model["LocalVectorExtent"] }}, lane={{ model["VectorLaneCount"] }}, reduction_extent={{ model["ReductionExtent"] }}
+{{ phases.consumer_header(model) }}
+{{ common.mesh_coordinates(model["MeshAxes"]) }}
+    scalar_id = tl.arange(0, {{ model["PhysicalTileWidth"] }})
+    vectors_per_worker = {{ model["LocalVectorExtent"] }} // {{ model["WorkPartitionExtent"] }}
+    local_vector = shard_coord{{ model["WorkPartitionAxis"] }} * vectors_per_worker + scalar_id // {{ model["VectorLaneCount"] }}
+    vector_lane = scalar_id % {{ model["VectorLaneCount"] }}
+    mask = scalar_id < vectors_per_worker * {{ model["VectorLaneCount"] }}
+    gate_acc = tl.zeros(({{ model["PhysicalTileWidth"] }},), tl.float32)
+    up_acc = tl.zeros(({{ model["PhysicalTileWidth"] }},), tl.float32)
+    for reduction_coord in tl.static_range(0, {{ model["ReductionExtent"] }}):
+        source_shard_index = reduction_coord * {{ model["SourceOwnerMajorStride"] }} + shard_coord{{ model["OutputSplitAxis"] }}
+        source_scalar_offset = source_shard_index * {{ model["SourceOwnerScalarStride"] }} + local_vector * {{ model["VectorLaneCount"] }} + vector_lane
+        gate_acc += tl.load(
+            ({{ model["GatePartialAddress"]["BaseName"] }} + {{ model["GatePartialAddress"]["OffsetBytes"] }}).to(tl.pointer_type({{ model["TritonDType"] }})) + source_scalar_offset,
+            mask=mask,
+            other=0.0,
+        ).to(tl.float32)
+        up_acc += tl.load(
+            ({{ model["UpPartialAddress"]["BaseName"] }} + {{ model["UpPartialAddress"]["OffsetBytes"] }}).to(tl.pointer_type({{ model["TritonDType"] }})) + source_scalar_offset,
+            mask=mask,
+            other=0.0,
+        ).to(tl.float32)
+    global_vector = (
+        (local_vector // {{ model["OutputBlockSize"] }})
+        * ({{ model["OutputBlockSize"] }} * {{ model["OutputSplitExtent"] }})
+        + shard_coord{{ model["OutputSplitAxis"] }} * {{ model["OutputBlockSize"] }}
+        + local_vector % {{ model["OutputBlockSize"] }}
+    )
+    output_scalar_offset = global_vector * {{ model["VectorLaneCount"] }} + vector_lane
+    gate_activated = gate_acc / (1.0 + tl.exp(-gate_acc))
+    output = {{ model["Output"]["Expression"] }}
+    tl.store(output + output_scalar_offset, gate_activated * up_acc, mask=mask)
+
+
+{{ phases.dispatch(model) }}

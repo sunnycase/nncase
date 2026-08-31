@@ -301,7 +301,8 @@ internal sealed class PackedBlockScaledMatMulCandidateProvider :
                      .Where(type =>
                          type.Partial is null &&
                          type.Placement == output.Placement &&
-                         type.TensorType.Shape is RankedShape { Rank: 2 }))
+                         type.TensorType.Shape is RankedShape { Rank: 2 } &&
+                         IsScaleGroupAlignedReductionShard(target, type)))
         {
             var logicalRhs = new DistributedType(
                 logicalRhsTensor,
@@ -369,6 +370,11 @@ internal sealed class PackedBlockScaledMatMulCandidateProvider :
                     continue;
                 }
 
+                if (!IsScaleGroupAlignedReductionShard(target, lhs))
+                {
+                    continue;
+                }
+
                 foreach (var rhsScale in context.AvailableInputTypes[PackedBlockScaledMatMul.RhsScale.Index]
                              .Where(type => IsReplicatedScale(type, lhs.Placement)))
                 {
@@ -417,6 +423,31 @@ internal sealed class PackedBlockScaledMatMulCandidateProvider :
                 distributed.AxisPolicies.All(policy => policy is SBPBroadCast),
             _ => false,
         };
+    }
+
+    private static bool IsScaleGroupAlignedReductionShard(
+        PackedBlockScaledMatMul target,
+        DistributedType lhs)
+    {
+        if (lhs.TensorType.Shape is not RankedShape { Rank: > 0 } ||
+            lhs.AxisPolicies[^1] is SBPSplit { IsContiguous: false })
+        {
+            return false;
+        }
+
+        var localLhs = DistributedUtility.GetDividedTensorType(
+            lhs,
+            DistributedUtility.DivideFlags.MaxShape);
+        if (localLhs.Shape[^1] is not { IsFixed: true } localK)
+        {
+            return false;
+        }
+
+        var vectorLanes = localLhs.DType is VectorType vectorType
+            ? vectorType.Lanes.Aggregate(1L, (product, lane) => checked(product * lane))
+            : 1L;
+        var scalarK = checked(localK.FixedValue * vectorLanes);
+        return target.WeightBlockK > 0 && scalarK % target.WeightBlockK == 0;
     }
 }
 

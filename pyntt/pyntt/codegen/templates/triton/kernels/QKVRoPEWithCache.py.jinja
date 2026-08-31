@@ -2,7 +2,7 @@
 {% import "triton/kernels/_elementwise.py.jinja" as elementwise with context %}
 {% import "triton/kernels/_paged_attention_kv_cache.py.jinja" as cache_io with context %}
 {% import "triton/kernels/_producer_consumer.py.jinja" as phases with context %}
-{% import "triton/kernels/_qkv_partial.py.jinja" as partial_io with context %}
+{% import "triton/kernels/_sum_partial.py.jinja" as partial_io with context %}
 {% import "triton/kernels/_qkv_partial_headwise.py.jinja" as partial_headwise with context %}
 {% set ctx = qkv_rope_with_cache_context(model) %}
 {% set q_norm = model["QNorm"] %}

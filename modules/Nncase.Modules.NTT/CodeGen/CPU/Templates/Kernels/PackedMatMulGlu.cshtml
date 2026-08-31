@@ -5,7 +5,12 @@
   string upWeight = Model.Arguments[2].Symbol.Name;
   string gateBias = Model.Arguments[3].Symbol.Name;
   string upBias = Model.Arguments[4].Symbol.Name;
-  string output = Model.Arguments[9].Symbol.Name;
+  if (Model.Target.EmitPartialResults)
+  {
+      throw new NotSupportedException("CPU PackedMatMulGlu does not support split-K partial outputs.");
+  }
+
+  string output = Model.Arguments[11].Symbol.Name;
 
   if (Model.Target.GluType != Nncase.IR.NN.GluType.SwiGLU)
   {

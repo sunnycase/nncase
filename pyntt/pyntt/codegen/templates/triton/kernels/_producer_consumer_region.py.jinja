@@ -11,6 +11,20 @@ def {{ model["ConsumerFunctionName"] }}(
 {% endif %}
 
 
+{% if model.get("AuxiliaryConsumerFunctionName") %}
+@triton.jit
+def {{ model["AuxiliaryConsumerFunctionName"] }}(
+    {{ helper_parameters(model, model["AuxiliaryConsumerEndpointNames"]) }}
+):
+{{ common.mesh_coordinates(model["MeshAxes"]) }}
+{% if model["AuxiliaryConsumerBodySource"].strip() %}
+{{ model["AuxiliaryConsumerBodySource"] | indent(4, true) }}
+{% else %}
+    pass
+{% endif %}
+
+
+{% endif %}
 @triton.jit
 def {{ model["ProducerFunctionName"] }}(
     {{ helper_parameters(model, model["ProducerEndpointNames"]) }}
@@ -49,6 +63,14 @@ def {{ model["FunctionName"] }}({{ helper_parameters(model) }}):
                     {{ helper_argument_names(model, model["ConsumerEndpointNames"]) }},
                 ),
             ),
+{% if model.get("AuxiliaryConsumerFunctionName") %}
+            (
+                {{ model["AuxiliaryConsumerFunctionName"] }},
+                (
+                    {{ helper_argument_names(model, model["AuxiliaryConsumerEndpointNames"]) }},
+                ),
+            ),
+{% endif %}
             (
                 {{ model["ProducerFunctionName"] }},
                 (
@@ -56,6 +78,6 @@ def {{ model["FunctionName"] }}({{ helper_parameters(model) }}):
                 ),
             ),
         ],
-        [{{ model["ProducerWarps"] }}],
-        [{{ model["ProducerRegisters"] }}],
+        [{% if model.get("AuxiliaryConsumerFunctionName") %}{{ model["AuxiliaryConsumerWarps"] }}, {% endif %}{{ model["ProducerWarps"] }}],
+        [{% if model.get("AuxiliaryConsumerFunctionName") %}{{ model["AuxiliaryConsumerRegisters"] }}, {% endif %}{{ model["ProducerRegisters"] }}],
     )

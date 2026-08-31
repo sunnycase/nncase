@@ -19,6 +19,18 @@
     alias=pyntt_shared_arena,
     alias_offset_bytes={{ stage["SharedWorkspaceOffsets"]["rhs_stage"] }},
 )
+{% if stage_ctx["use_complete_consumer_lhs_stage"] %}
+{% set lhs_workspace = stage["ConsumerSharedWorkspaces"][0] %}
+{{ lhs_workspace["VariableName"] }} = tle.gpu.alloc(
+    [1, {{ stage_ctx["lhs_stage_extent"] }}],
+    dtype={{ stage_model["InputTritonDType"] }},
+    layout=None,
+    scope=tle.gpu.smem,
+    alias=pyntt_shared_arena,
+    alias_offset_bytes={{ lhs_workspace["SharedWorkspaceOffset"] }},
+    nv_mma_shared_layout=True,
+)
+{% endif %}
 {{ stage["PipeName"] }} = tle.pipe(
     capacity={{ stage_ctx["num_stages"] }},
     scope="cta",
@@ -45,6 +57,16 @@
 {{ ctx["consumer_output_layout_name"] }} = tl.constexpr(
     tle.gpu.SlicedEncoding(1, {{ ctx["consumer_weight_layout_name"] }}.value)
 )
+{% if ctx["use_complete_consumer_lhs_stage"] %}
+{{ ctx["consumer_input_copy_layout_name"] }} = tl.constexpr(
+    tle.gpu.BlockEncoding(
+        [1, {{ ctx["input_copy_size_per_thread"] }}],
+        [1, {{ model["TargetWorkerWidth"] }}],
+        [1, {{ model["NumWarps"] }}],
+        [0, 1],
+    )
+)
+{% endif %}
 
 
 {{ "@triton.jit(noinline=True)" if model["NoInline"] else "@triton.jit" }}
@@ -98,7 +120,7 @@ def {{ model["FunctionName"] }}__producer(writer, {{ helper_parameters(model) }}
 
 
 {{ "@triton.jit(noinline=True)" if model["NoInline"] else "@triton.jit" }}
-def {{ model["FunctionName"] }}__consumer(reader, {{ helper_parameters(model) }}):
+def {{ model["FunctionName"] }}__consumer(reader, {% if ctx["use_complete_consumer_lhs_stage"] %}lhs_stage, {% endif %}{{ helper_parameters(model) }}):
 {{ common.mesh_coordinates(model["MeshAxes"]) }}
     input0 = {{ ptr(model, "Input") }}
     output = {{ ptr(model, "Output") }}
@@ -124,6 +146,32 @@ def {{ model["FunctionName"] }}__consumer(reader, {{ helper_parameters(model) }}
         local_k_vector[None, :],
         {{ ctx["consumer_weight_layout_name"] }},
     )
+{% if ctx["use_complete_consumer_lhs_stage"] %}
+    input_row_vector = tle.encoding(
+        tl.zeros(({{ ctx["reduction_group"] }},), tl.int32),
+        {{ ctx["consumer_lhs_layout_name"] }},
+    )
+{% for segment in ctx["lhs_copy_segments"] %}
+    input_copy_offset_{{ loop.index0 }} = tle.encoding(
+        tl.arange(0, {{ segment["extent"] }})[None, :],
+        {{ ctx["consumer_input_copy_layout_name"] }},
+    )
+    pipeline_input_copy_k = {{ segment["offset"] }} + input_copy_offset_{{ loop.index0 }}
+    tle.gpu.copy(
+        {{ access_pointer(model, "Input", "input0", segment["access"]) }},
+        lhs_stage.subslice(
+            [0, {{ segment["offset"] }}],
+            [1, {{ segment["extent"] }}],
+        ),
+        [1, {{ segment["extent"] }}],
+        is_async=True,
+        eviction_policy="evict_last",
+    )
+{% endfor %}
+    tle.gpu.async_commit_group()
+    tle.gpu.async_wait_group(0)
+    tl.debug_barrier()
+{% endif %}
     active_n = {{ dim(ctx["n"]) }}
     for n_tile in tl.range(0, {{ ctx["runtime_num_n_tiles"] }}):
         n_start = n_tile * {{ ctx["block_n"] }}
@@ -160,6 +208,21 @@ def {{ model["FunctionName"] }}__consumer(reader, {{ helper_parameters(model) }}
                     * {{ ctx["k_atom"] }}
                     + shared_k % {{ ctx["k_atom"] }}
                 )
+{% if ctx["use_complete_consumer_lhs_stage"] %}
+                input_ptr = tle.gpu.local_ptr(
+                    lhs_stage,
+                    (
+                        input_row_vector,
+                        k_tile * {{ ctx["block_k"] }}
+                        + k_group * {{ ctx["reduction_group"] }}
+                        + local_k_vector,
+                    ),
+                )
+                input_value = tle.encoding(
+                    tl.load(input_ptr),
+                    {{ ctx["consumer_lhs_layout_name"] }},
+                ).to(tl.float32)
+{% else %}
                 pipeline_offs_k = (
                     k_tile * {{ ctx["block_k"] }}
                     + k_group * {{ ctx["reduction_group"] }}
@@ -171,6 +234,7 @@ def {{ model["FunctionName"] }}__consumer(reader, {{ helper_parameters(model) }}
                     ),
                     {{ ctx["consumer_lhs_layout_name"] }},
                 ).to(tl.float32)
+{% endif %}
                 input_matrix = input_value[None, :]
                 input_scale = tl.maximum(
                     tl.max(tl.abs(input_matrix), axis=1) / 448.0,
