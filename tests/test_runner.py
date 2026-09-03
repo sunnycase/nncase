@@ -415,6 +415,10 @@ class TestRunner(Evaluator, Inference, metaclass=ABCMeta):
             "custom_op_scheme": "CustomOpScheme",
             "backend": "Backend",
             "output_directory": "OutputDirectory",
+            "cpu_offload_regions": "CpuOffloadRegions",
+            "cpu_core_count": "CpuCoreCount",
+            "cpu_target_machine": "CpuTargetMachine",
+            "block_cyclic_block_bytes": "BlockCyclicBlockBytes",
         }
         return aliases.get(name, name)
 

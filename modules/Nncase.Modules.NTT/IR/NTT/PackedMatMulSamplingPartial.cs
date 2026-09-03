@@ -47,6 +47,29 @@ public sealed partial class PackedMatMulSamplingPartial : Op
         ParameterKind.Input,
         MemoryEffect.Read);
 
+    public static readonly ParameterInfo LhsScale = new(
+        typeof(PackedMatMulSamplingPartial),
+        5,
+        "lhs_scale",
+        ParameterKind.Input,
+        MemoryEffect.Read);
+
+    public static readonly ParameterInfo RhsScale = new(
+        typeof(PackedMatMulSamplingPartial),
+        6,
+        "rhs_scale",
+        ParameterKind.Input,
+        MemoryEffect.Read);
+
+    /// <summary>
+    /// Gets the packed matrix multiplication accumulation dtype before output
+    /// scaling and logits conversion.
+    /// </summary>
+    public DataType AccumulatorDataType { get; }
+
+    /// <summary>
+    /// Gets the scalar dtype observed by sampling.
+    /// </summary>
     public DataType OutputDataType { get; }
 
     public PackedMatMulRhsLayout RhsLayout { get; }
@@ -56,5 +79,6 @@ public sealed partial class PackedMatMulSamplingPartial : Op
     public override bool CanFoldConstCall => false;
 
     public override string DisplayProperty()
-        => $"OutputDataType: {OutputDataType}, RhsLayout: {RhsLayout}, Config: {Config}";
+        => $"AccumulatorDataType: {AccumulatorDataType}, OutputDataType: {OutputDataType}, " +
+           $"RhsLayout: {RhsLayout}, Config: {Config}";
 }

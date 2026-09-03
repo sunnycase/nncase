@@ -25,7 +25,19 @@
 #endif
 
 namespace nncase::ntt::runtime {
-struct thread_inout_desc {
+inline constexpr size_t pipeline_channel_header_bytes = 64;
+
+/// Cache-line isolated header shared by heterogeneous persistent workers.
+/// The payload immediately follows this header in canonical tensor order.
+struct alignas(pipeline_channel_header_bytes) pipeline_channel {
+    uint32_t produced_phase;
+    uint32_t producer_arrivals;
+    std::byte reserved[pipeline_channel_header_bytes - (2 * sizeof(uint32_t))];
+};
+
+static_assert(sizeof(pipeline_channel) == pipeline_channel_header_bytes);
+
+struct block_inout_desc {
     std::byte *data;
     size_t size;
     size_t *shape;
@@ -33,7 +45,7 @@ struct thread_inout_desc {
     size_t rank;
 };
 
-struct thread_paged_attention_kv_cache_desc {
+struct block_paged_attention_kv_cache_desc {
     size_t num_seqs;
     size_t num_tokens;
     int64_t *context_lens; // [num_seqs]
@@ -56,7 +68,8 @@ void thread_free(void *ptr);
 } // namespace nncase::ntt::runtime
 
 extern "C" NTT_DEVICE void
-thread_main(const nncase::ntt::runtime::thread_inout_desc *input_descs,
-            nncase::ntt::runtime::thread_inout_desc *const output_descs,
+block_main(uint32_t function_id,
+           const nncase::ntt::runtime::block_inout_desc *input_descs,
+           nncase::ntt::runtime::block_inout_desc *const output_descs,
             const std::byte *rdata, const std::byte *block_local_rdata,
             std::byte *data, std::byte *block_local_data, std::byte *output);

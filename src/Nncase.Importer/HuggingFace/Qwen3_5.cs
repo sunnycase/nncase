@@ -4,6 +4,7 @@
 using System;
 using System.Collections.Generic;
 using System.Linq;
+using System.Numerics;
 using Nncase.IR;
 using Nncase.IR.F;
 using Nncase.IR.Math;
@@ -24,18 +25,19 @@ public class Qwen3_5 : HuggingFaceModel
         _textModelPrefix = textModelPrefix;
     }
 
-    protected override bool SupportsDecoderLayerFunctionReuse => false;
+    protected override bool RequiresPagedAttentionKVCache => Enumerable.Range(
+        0,
+        checked((int)Config.GetNestedValue<long>("num_hidden_layers")))
+        .Any(index => GetLayerType(index) == "full_attention");
 
-    protected override bool RequiresPagedAttentionKVCache => false;
+    protected override bool RequiresRotaryEmbedding => RequiresPagedAttentionKVCache;
+
+    protected override bool DecoderLayerUsesRotaryEmbedding(int layerIndex)
+        => GetLayerType(layerIndex) == "full_attention";
 
     public override (IEnumerable<IVar> Inputs, Dictionary<IVar, Dimension[]> VarMap) CreateInputs()
     {
         ValidateSupportedConfiguration();
-        if (ImportOptions.HuggingFaceOptions.EnableSampler)
-        {
-            throw new NotSupportedException("Qwen3.5 recurrent-state outputs are not yet compatible with the fused sampler ABI.");
-        }
-
         var (inputs, varMap) = base.CreateInputs();
         if (!Context!.FixVarMap!.TryGetValue("sequence_length", out var sequenceLength) || sequenceLength != 1)
         {
@@ -93,51 +95,7 @@ public class Qwen3_5 : HuggingFaceModel
     }
 
     public override System.Tuple<Expr, Expr?> LLMModel(Expr inputIds, Expr pastKeyValues)
-    {
-        var embedTokensWeight = GetWeight("model.embed_tokens.weight")
-            ?? throw new InvalidOperationException("Required weight model.embed_tokens.weight is missing.");
-        var requestedTensorType = GetRequestedTensorType();
-        if (requestedTensorType is not null)
-        {
-            embedTokensWeight = embedTokensWeight.CastTo(requestedTensorType);
-        }
-
-        Expr hiddenStates;
-        if (inputIds.CheckedShape.Rank > 2 && inputIds.CheckedDataType.IsFloat())
-        {
-            hiddenStates = inputIds;
-        }
-        else
-        {
-            long? paddingIndex = Config.TryGetValue("pad_token_id", out var value) && value is long index
-                ? index
-                : null;
-            hiddenStates = Embedding(inputIds, embedTokensWeight, paddingIndex);
-        }
-
-        Expr? allHiddenStates = null;
-        if (ImportOptions.HuggingFaceOptions.OutputHiddenStates)
-        {
-            allHiddenStates = Tensors.Unsqueeze(hiddenStates, new long[] { 0 });
-        }
-
-        var (layerOutput, _) = DecodeLayer(
-            0,
-            hiddenStates,
-            pastKeyValues,
-            System.Tuple.Create(hiddenStates, hiddenStates),
-            new DimConst(0));
-        var lastHiddenStates = LLMLayerNorm(layerOutput, "model.norm.weight");
-
-        if (ImportOptions.HuggingFaceOptions.OutputHiddenStates)
-        {
-            allHiddenStates = Tensors.Concat(
-                new Nncase.IR.Tuple(allHiddenStates!, Tensors.Unsqueeze(lastHiddenStates, new long[] { 0 })),
-                0);
-        }
-
-        return System.Tuple.Create<Expr, Expr?>((Expr)lastHiddenStates, allHiddenStates);
-    }
+        => base.LLMModel(inputIds, pastKeyValues);
 
     public override System.Tuple<Expr, Expr> DecodeLayer(
         int count,
@@ -146,21 +104,49 @@ public class Qwen3_5 : HuggingFaceModel
         System.Tuple<Expr, Expr> positionEmbeddings,
         Dimension layerId)
     {
-        if (count != 0)
+        if (GetLayerType(count) == "full_attention")
         {
-            throw new NotSupportedException("Qwen3.5 support currently covers exactly the first decoder layer.");
+            return base.DecodeLayer(count, hiddenStates, pastKeyValues, positionEmbeddings, layerId);
         }
 
         var residual = hiddenStates;
         hiddenStates = LLMLayerNorm(hiddenStates, $"model.layers.{count}.input_layernorm.weight");
-        hiddenStates = BuildGatedDeltaNet(count, hiddenStates);
+        hiddenStates = BuildGatedDeltaNet(count, hiddenStates, layerId);
         hiddenStates = residual + hiddenStates;
 
         residual = hiddenStates;
         hiddenStates = LLMLayerNorm(hiddenStates, $"model.layers.{count}.post_attention_layernorm.weight");
-        hiddenStates = LLMMlp(count, hiddenStates);
-        hiddenStates = residual + hiddenStates;
+        hiddenStates = residual + LLMMlp(count, hiddenStates);
         return System.Tuple.Create(hiddenStates, pastKeyValues);
+    }
+
+    protected override QKVProjection QKVCompute(
+        int count,
+        Expr hiddenStates,
+        Dimension seqLen,
+        Dimension headDim)
+    {
+        var hiddenShape = new RankedShape(seqLen, -1L, headDim);
+        var (queryAndGateStates, keyStates, valueStates) = BuildQKVParallelLinear(
+            count,
+            hiddenStates,
+            hiddenShape);
+        var numHeads = Config.GetNestedValue<long>("num_attention_heads");
+        var queryAndGateShape = new RankedShape(seqLen, numHeads, 2, headDim);
+        queryAndGateStates = Tensors.Reshape(queryAndGateStates, queryAndGateShape);
+        var queryStates = Tensors.Reshape(
+            Tensors.Slice(queryAndGateStates, [0L], [1L], [2L], [1L]),
+            new RankedShape(seqLen, numHeads, headDim));
+        var outputGate = Tensors.Reshape(
+            Tensors.Slice(queryAndGateStates, [1L], [2L], [2L], [1L]),
+            new RankedShape(seqLen, numHeads, headDim));
+        queryStates = LLMLayerNorm(
+            queryStates,
+            $"model.layers.{count}.self_attn.q_norm.weight");
+        keyStates = LLMLayerNorm(
+            keyStates,
+            $"model.layers.{count}.self_attn.k_norm.weight");
+        return new(queryStates, keyStates, valueStates, outputGate);
     }
 
     public override Call LLMLayerNorm(Expr hiddenStates, string layerName)
@@ -168,31 +154,52 @@ public class Qwen3_5 : HuggingFaceModel
         var originType = hiddenStates.CheckedDataType;
         var weightTensor = GetWeight(layerName)
             ?? throw new InvalidOperationException($"Required weight {layerName} is missing.");
-        var weight = weightTensor.CastTo(originType);
-        var scale = IR.F.Math.Add(weight, Tensor.FromScalar(1.0f).CastTo(originType));
+        var scale = GetLayerWeightExpr(layerName, tensor => PrepareRmsNormScale(tensor, originType));
         var bias = Tensor.Zeros(originType, weightTensor.Dimensions);
         var epsilon = (float)Config.GetNestedValue<double>("rms_norm_eps");
         return NN.LayerNorm(-1, epsilon, hiddenStates, scale, bias, false)
             .With(metadata: new IRMetadata { OutputNames = new[] { layerName[..^7] } });
     }
 
+    private static Tensor PrepareRmsNormScale(Tensor weight, DataType dataType) => dataType switch
+    {
+        var type when type == DataTypes.Float16 => AddOne(weight.Cast<Half>()),
+        var type when type == DataTypes.BFloat16 => AddOne(weight.Cast<BFloat16>()),
+        var type when type == DataTypes.Float32 => AddOne(weight.Cast<float>()),
+        _ => throw new NotSupportedException(
+            $"Qwen3.5 RMSNorm scale preparation does not support {dataType}."),
+    };
+
+    private static Tensor<T> AddOne<T>(Tensor<T> input)
+        where T : unmanaged, IEquatable<T>, INumber<T>
+    {
+        var output = input.Clone();
+        var values = output.Buffer.Span;
+        for (var index = 0; index < values.Length; index++)
+        {
+            values[index] += T.One;
+        }
+
+        return output;
+    }
+
     public override Call LLMMlp(int count, Expr hiddenStates)
     {
-        if (TryGetNVFP4Config(out var groupSize))
+        if (TryGetNVFP4Config(out var groupSize) && HasNVFP4Projection($"model.layers.{count}.mlp.down_proj"))
         {
             var prefix = $"model.layers.{count}.mlp.down_proj";
             return IR.F.Math.NVFP4MatMul(
                     BuildMatMulGlu(count, hiddenStates),
-                    RequireWeight($"{prefix}.weight_packed"),
-                    RequireWeight($"{prefix}.weight_scale"),
-                    RequireWeight($"{prefix}.input_global_scale"),
-                    RequireWeight($"{prefix}.weight_global_scale"),
+                    RequireLayerWeight($"{prefix}.weight_packed"),
+                    RequireLayerWeight($"{prefix}.weight_scale"),
+                    RequireLayerWeight($"{prefix}.input_global_scale"),
+                    RequireLayerWeight($"{prefix}.weight_global_scale"),
                     hiddenStates.CheckedDataType,
                     groupSize)
                 .With(metadata: new IRMetadata { OutputNames = new[] { prefix } });
         }
 
-        if (!TryGetDynamicBlockFp8Config(out var blockN, out var blockK))
+        if (!TryGetFp8ProjectionConfig(out var blockN, out var blockK, out var compressed))
         {
             return base.LLMMlp(count, hiddenStates);
         }
@@ -200,9 +207,10 @@ public class Qwen3_5 : HuggingFaceModel
         return BlockScaledLinearByName(
             BuildMatMulGlu(count, hiddenStates),
             $"model.layers.{count}.mlp.down_proj.weight",
-            $"model.layers.{count}.mlp.down_proj.weight_scale_inv",
+            $"model.layers.{count}.mlp.down_proj.{(compressed ? "weight_scale" : "weight_scale_inv")}",
             blockN,
             blockK,
+            compressed,
             $"model.layers.{count}.mlp.down_proj");
     }
 
@@ -214,22 +222,43 @@ public class Qwen3_5 : HuggingFaceModel
             : canonicalWeightName;
     }
 
+    protected override Call BuildAttentionOutputProjection(int count, Expr input)
+    {
+        if (!TryGetFp8ProjectionConfig(out var blockN, out var blockK, out var compressed))
+        {
+            return base.BuildAttentionOutputProjection(count, input);
+        }
+
+        var prefix = $"model.layers.{count}.self_attn.o_proj";
+        var scaleSuffix = compressed ? "weight_scale" : "weight_scale_inv";
+        return BlockScaledLinearByName(
+            input,
+            $"{prefix}.weight",
+            $"{prefix}.{scaleSuffix}",
+            blockN,
+            blockK,
+            compressed,
+            prefix);
+    }
+
     protected override Call BuildMatMulGlu(int count, Expr hiddenStates)
     {
-        if (TryGetNVFP4Config(out var groupSize))
+        if (TryGetNVFP4Config(out var groupSize) &&
+            HasNVFP4Projection($"model.layers.{count}.mlp.gate_proj") &&
+            HasNVFP4Projection($"model.layers.{count}.mlp.up_proj"))
         {
             var gatePrefix = $"model.layers.{count}.mlp.gate_proj";
             var upPrefix = $"model.layers.{count}.mlp.up_proj";
             return IR.F.NN.NVFP4MatMulGlu(
                     hiddenStates,
-                    RequireWeight($"{gatePrefix}.weight_packed"),
-                    RequireWeight($"{upPrefix}.weight_packed"),
-                    RequireWeight($"{gatePrefix}.weight_scale"),
-                    RequireWeight($"{upPrefix}.weight_scale"),
-                    RequireWeight($"{gatePrefix}.input_global_scale"),
-                    RequireWeight($"{upPrefix}.input_global_scale"),
-                    RequireWeight($"{gatePrefix}.weight_global_scale"),
-                    RequireWeight($"{upPrefix}.weight_global_scale"),
+                    RequireLayerWeight($"{gatePrefix}.weight_packed"),
+                    RequireLayerWeight($"{upPrefix}.weight_packed"),
+                    RequireLayerWeight($"{gatePrefix}.weight_scale"),
+                    RequireLayerWeight($"{upPrefix}.weight_scale"),
+                    RequireLayerWeight($"{gatePrefix}.input_global_scale"),
+                    RequireLayerWeight($"{upPrefix}.input_global_scale"),
+                    RequireLayerWeight($"{gatePrefix}.weight_global_scale"),
+                    RequireLayerWeight($"{upPrefix}.weight_global_scale"),
                     GetMlpGluType(),
                     hiddenStates.CheckedDataType,
                     groupSize)
@@ -239,20 +268,21 @@ public class Qwen3_5 : HuggingFaceModel
                 });
         }
 
-        if (!TryGetDynamicBlockFp8Config(out var blockN, out var blockK))
+        if (!TryGetFp8ProjectionConfig(out var blockN, out var blockK, out var compressed))
         {
             return base.BuildMatMulGlu(count, hiddenStates);
         }
 
         var gateWeightName = $"model.layers.{count}.mlp.gate_proj.weight";
         var upWeightName = $"model.layers.{count}.mlp.up_proj.weight";
-        var gateScaleName = $"model.layers.{count}.mlp.gate_proj.weight_scale_inv";
-        var upScaleName = $"model.layers.{count}.mlp.up_proj.weight_scale_inv";
-        Tensor RequireWeight(string name) => GetWeight(name)
-            ?? throw new InvalidOperationException($"Required weight {name} is missing.");
+        var scaleSuffix = compressed ? "weight_scale" : "weight_scale_inv";
+        var gateScaleName = $"model.layers.{count}.mlp.gate_proj.{scaleSuffix}";
+        var upScaleName = $"model.layers.{count}.mlp.up_proj.{scaleSuffix}";
         Expr PrepareWeight(string name) =>
-            PrepareLinearWeightTensor(RequireWeight(name), DataTypes.Float8E4M3);
-        Expr RequireScale(string name) => RequireWeight(name);
+            GetLayerWeightExpr(name, tensor => PrepareLinearWeightTensor(tensor, DataTypes.Float8E4M3));
+        Expr RequireScale(string name) => GetLayerWeightExpr(
+            name,
+            tensor => PrepareFp8WeightScale(tensor, name, hiddenStates.CheckedShape[^1].FixedValue, blockK, compressed));
 
         return IR.F.NN.MatMulGlu(
             hiddenStates,
@@ -275,7 +305,17 @@ public class Qwen3_5 : HuggingFaceModel
             });
     }
 
-    private Expr BuildGatedDeltaNet(int count, Expr hiddenStates)
+    protected override string? GetDecoderLayerStructureKey(int layerIndex)
+    {
+        return $"{GetLayerType(layerIndex)}_{GetDecoderPrecisionKey(layerIndex)}";
+    }
+
+    private string GetDecoderPrecisionKey(int layerIndex)
+        => HasNVFP4Projection($"model.layers.{layerIndex}.mlp.down_proj")
+            ? "nvfp4"
+            : "fp8";
+
+    private Expr BuildGatedDeltaNet(int count, Expr hiddenStates, Dimension layerId)
     {
         var inputType = hiddenStates.CheckedDataType;
         var numKeyHeads = Config.GetNestedValue<long>("linear_num_key_heads");
@@ -287,60 +327,26 @@ public class Qwen3_5 : HuggingFaceModel
         var valueDim = numValueHeads * valueHeadDim;
         var convDim = (keyDim * 2) + valueDim;
         var prefix = $"model.layers.{count}.linear_attn";
-        var state = _state ?? throw new InvalidOperationException("Qwen3.5 GDN state input is unavailable.");
-        Tensor PrepareLinearWeight(string name) => PrepareLinearWeightTensor(RequireWeight(name), inputType);
-        var hasLegacyBlockFp8 = TryGetDynamicBlockFp8Config(out var blockN, out var blockK);
-        var hasCompressedFp8 = !hasLegacyBlockFp8 && TryGetCompressedTensorFp8Config(out blockN, out blockK);
-        var hasBlockFp8 = hasLegacyBlockFp8 || hasCompressedFp8;
-        Tensor PrepareBlockWeight(string name) => PrepareLinearWeightTensor(
-            RequireWeight(name),
-            DataTypes.Float8E4M3);
+        var modelState = _state ?? throw new InvalidOperationException("Qwen3.5 GDN state input is unavailable.");
+        var state = GetDecoderLayerResource("gated_delta_net_state", modelState);
+        Expr PrepareLinearWeight(string name) =>
+            GetLayerWeightExpr(name, tensor => PrepareLinearWeightTensor(tensor, inputType));
+        var hasBlockFp8 = TryGetFp8ProjectionConfig(out var blockN, out var blockK, out var hasCompressedFp8);
+        Expr PrepareBlockWeight(string name) =>
+            GetLayerWeightExpr(name, tensor => PrepareLinearWeightTensor(tensor, DataTypes.Float8E4M3));
         Expr PrepareProjectionWeight(string name) => hasBlockFp8
             ? PrepareBlockWeight(name)
             : PrepareLinearWeight(name);
-        Expr PrepareProjectionScale(string name, long reductionExtent)
-        {
-            if (!hasBlockFp8)
-            {
-                return None.Default;
-            }
-
-            var scale = RequireWeight(name);
-            if (!hasCompressedFp8)
-            {
-                return scale;
-            }
-
-            if (scale.Rank != 2 || scale.Dimensions[1] != 1 || reductionExtent % blockK != 0)
-            {
-                throw new InvalidOperationException(
-                    $"Compressed-tensors FP8 scale {name} must have shape [N,1] and K " +
-                    $"must divide block K {blockK}, got shape [{string.Join(",", scale.Dimensions.ToArray())}] " +
-                    $"and K={reductionExtent}.");
-            }
-
-            var repeats = reductionExtent / blockK;
-            var expanded = Tensor.Zeros(scale.ElementType, [scale.Dimensions[0], repeats]);
-            var elementSize = scale.ElementType.SizeInBytes;
-            for (var row = 0L; row < scale.Dimensions[0]; row++)
-            {
-                var source = scale.BytesBuffer.Slice(checked((int)(row * elementSize)), elementSize);
-                for (var column = 0L; column < repeats; column++)
-                {
-                    source.CopyTo(
-                        expanded.BytesBuffer.Slice(
-                            checked((int)(((row * repeats) + column) * elementSize)),
-                            elementSize));
-                }
-            }
-
-            return expanded;
-        }
+        Expr PrepareProjectionScale(string name, long reductionExtent) => hasBlockFp8
+            ? GetLayerWeightExpr(
+                name,
+                tensor => PrepareFp8WeightScale(tensor, name, reductionExtent, blockK, hasCompressedFp8))
+            : None.Default;
 
         var convWeightTensor = GetWeight($"{prefix}.conv1d.weight")
             ?? throw new InvalidOperationException($"Required weight {prefix}.conv1d.weight is missing.");
         var convWeight = Tensors.Reshape(
-            convWeightTensor.CastTo(inputType),
+            GetLayerWeightExpr($"{prefix}.conv1d.weight", tensor => tensor.CastTo(inputType)),
             new RankedShape(convDim, convKernelSize));
         var result = NN.GatedDeltaNet(
             hiddenStates,
@@ -350,11 +356,11 @@ public class Qwen3_5 : HuggingFaceModel
             PrepareLinearWeight($"{prefix}.in_proj_b.weight"),
             PrepareLinearWeight($"{prefix}.in_proj_a.weight"),
             convWeight,
-            RequireWeight($"{prefix}.A_log"),
-            RequireWeight($"{prefix}.dt_bias"),
-            RequireWeight($"{prefix}.norm.weight"),
+            RequireLayerWeight($"{prefix}.A_log"),
+            RequireLayerWeight($"{prefix}.dt_bias"),
+            RequireLayerWeight($"{prefix}.norm.weight"),
             PrepareProjectionWeight($"{prefix}.out_proj.weight"),
-            new DimConst(count),
+            layerId,
             numKeyHeads,
             numValueHeads,
             keyHeadDim,
@@ -375,14 +381,17 @@ public class Qwen3_5 : HuggingFaceModel
                 : MatMulQuantizationMode.None,
             weightBlockN: blockN,
             weightBlockK: blockK)
-            .With(metadata: new IRMetadata { OutputNames = new[] { prefix } });
+            .With(metadata: new IRMetadata
+            {
+                OutputNames = new[] { prefix },
+                SemanticRegion = new SemanticRegion(SemanticRegionKinds.Attention, prefix),
+            });
         if (result.CheckedType is InvalidType invalid)
         {
             throw new InvalidOperationException(
                 $"Imported {prefix} has an invalid type: {invalid.Reason}");
         }
 
-        _state = result[1];
         return result[0];
     }
 
@@ -392,13 +401,20 @@ public class Qwen3_5 : HuggingFaceModel
         string weightScaleName,
         long blockN,
         long blockK,
+        bool compressed,
         string layerName)
     {
-        var weightTensor = GetWeight(weightName)
-            ?? throw new InvalidOperationException($"Required weight {weightName} is missing.");
-        var scale = GetWeight(weightScaleName)
-            ?? throw new InvalidOperationException($"Required weight {weightScaleName} is missing.");
-        var weight = PrepareLinearWeightTensor(weightTensor, DataTypes.Float8E4M3);
+        var weight = GetLayerWeightExpr(
+            weightName,
+            tensor => PrepareLinearWeightTensor(tensor, DataTypes.Float8E4M3));
+        var scale = GetLayerWeightExpr(
+            weightScaleName,
+            tensor => PrepareFp8WeightScale(
+                tensor,
+                weightScaleName,
+                input.CheckedShape[^1].FixedValue,
+                blockK,
+                compressed));
         return IR.F.Math.BlockScaledMatMul(
                 input,
                 weight,
@@ -407,6 +423,60 @@ public class Qwen3_5 : HuggingFaceModel
                 blockN,
                 blockK)
             .With(metadata: new IRMetadata { OutputNames = new[] { layerName } });
+    }
+
+    private bool TryGetFp8ProjectionConfig(
+        out long blockN,
+        out long blockK,
+        out bool compressed)
+    {
+        if (TryGetDynamicBlockFp8Config(out blockN, out blockK))
+        {
+            compressed = false;
+            return true;
+        }
+
+        compressed = TryGetCompressedTensorFp8Config(out blockN, out blockK);
+        return compressed;
+    }
+
+    private static Tensor PrepareFp8WeightScale(
+        Tensor scale,
+        string name,
+        long reductionExtent,
+        long blockK,
+        bool compressed)
+    {
+        if (!compressed)
+        {
+            return scale;
+        }
+
+        if (scale.Rank != 2 || scale.Dimensions[1] != 1 ||
+            blockK <= 0 || reductionExtent % blockK != 0)
+        {
+            throw new InvalidOperationException(
+                $"Compressed-tensors FP8 scale {name} must have shape [N,1], and K={reductionExtent} " +
+                $"must be divisible by block K {blockK}; got shape " +
+                $"[{string.Join(",", scale.Dimensions.ToArray())}].");
+        }
+
+        var repeats = reductionExtent / blockK;
+        var expanded = Tensor.Zeros(scale.ElementType, [scale.Dimensions[0], repeats]);
+        var elementSize = scale.ElementType.SizeInBytes;
+        for (var row = 0L; row < scale.Dimensions[0]; row++)
+        {
+            var source = scale.BytesBuffer.Slice(checked((int)(row * elementSize)), elementSize);
+            for (var column = 0L; column < repeats; column++)
+            {
+                source.CopyTo(
+                    expanded.BytesBuffer.Slice(
+                        checked((int)(((row * repeats) + column) * elementSize)),
+                        elementSize));
+            }
+        }
+
+        return expanded;
     }
 
     private bool TryGetDynamicBlockFp8Config(out long blockN, out long blockK)
@@ -547,18 +617,32 @@ public class Qwen3_5 : HuggingFaceModel
     private Tensor RequireWeight(string name) => GetWeight(name)
         ?? throw new InvalidOperationException($"Required weight {name} is missing.");
 
+    private Expr RequireLayerWeight(string name) => GetLayerWeightExpr(name, tensor => tensor);
+
+    private bool HasNVFP4Projection(string prefix)
+        => WeightToFileMap.ContainsKey(ResolveWeightName($"{prefix}.weight_packed"));
+
+    private string GetLayerType(int index)
+    {
+        var layerType = Config.GetNestedValue<string>("layer_types", index);
+        return layerType switch
+        {
+            "linear_attention" or "full_attention" => layerType,
+            _ => throw new NotSupportedException(
+                $"Qwen3.5 layer {index} has unsupported layer type {layerType}."),
+        };
+    }
+
     private void ValidateSupportedConfiguration()
     {
-        if (Config.GetNestedValue<long>("num_hidden_layers") != 1)
+        var numLayers = checked((int)Config.GetNestedValue<long>("num_hidden_layers"));
+        if (numLayers <= 0)
         {
-            throw new NotSupportedException(
-                "Qwen3.5 support currently requires huggingface_options.num_layers=1.");
+            throw new InvalidOperationException(
+                $"Qwen3.5 num_hidden_layers must be positive, got {numLayers}.");
         }
 
-        if (Config.GetNestedValue<string>("layer_types", 0) != "linear_attention")
-        {
-            throw new NotSupportedException("The supported Qwen3.5 layer must be the first linear_attention layer.");
-        }
+        _ = Enumerable.Range(0, numLayers).Select(GetLayerType).ToArray();
 
         var numKeyHeads = Config.GetNestedValue<long>("linear_num_key_heads");
         var numValueHeads = Config.GetNestedValue<long>("linear_num_value_heads");

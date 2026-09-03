@@ -11,6 +11,7 @@ using System.Threading.Tasks;
 using DryIoc.ImTools;
 using Nncase.CodeGen.NTT;
 using Nncase.Diagnostics;
+using Nncase.IR;
 using Nncase.Targets;
 using Nncase.TIR;
 
@@ -32,11 +33,18 @@ internal sealed class LinkableModule : ILinkableModule
         _rdata = rdata;
         _blockLocalRdatas = blockLocalRdatas;
         _functions = functions;
-        PublicFunctions = _functions.OfType<LinkableKernelFunction>().ToArray();
+        var kernelFunctions = _functions.OfType<LinkableKernelFunction>().ToArray();
+        PublicFunctions = kernelFunctions.Any(function => function.PrimFunction.Role == FunctionRole.PipelineWorker)
+            ? kernelFunctions.Where(function => function.PrimFunction.Role == FunctionRole.PipelineWorker).ToArray()
+            : kernelFunctions;
         _targetOptions = (NTTTargetOptions)options.TargetOptions;
     }
 
     public IReadOnlyList<ILinkableFunction> PublicFunctions { get; }
+
+    public string ModuleKind => _moduleKind;
+
+    public IReadOnlySet<string> DependencyModuleKinds { get; } = new HashSet<string>(StringComparer.Ordinal);
 
     public ILinkedModule Link(ILinkContext linkContext)
     {
@@ -47,30 +55,21 @@ internal sealed class LinkableModule : ILinkableModule
             Directory.CreateDirectory(codegenDir);
         }
 
-        WriteDeviceFunctions(codegenDir);
         WriteLambdaFunctions(codegenDir);
         var kernelFiles = WriteKernelFunctions(codegenDir);
         WriteTopoAwareRuntime(codegenDir);
         WriteModuleTopologyDef(codegenDir);
 
-        var mainFunc = (LinkableKernelFunction)PublicFunctions.First(x => x.SourceFunction.IsEntry);
-        WriteThreadMain(codegenDir, mainFunc, kernelFiles);
+        var kernelFunctions = PublicFunctions.Cast<LinkableKernelFunction>().ToArray();
+        if (kernelFunctions.Length == 0)
+        {
+            throw new InvalidOperationException($"NTT module {_moduleKind} contains no public kernel functions.");
+        }
+
+        WriteBlockMain(codegenDir, kernelFunctions, kernelFiles);
         WriteCMakeLists(codegenDir);
 
-        return GenerateLinkedModule(codegenDir, mainFunc);
-    }
-
-    private void WriteDeviceFunctions(string codegenDir)
-    {
-        using (var writer = new StreamWriter(File.Open(Path.Join(codegenDir, "device_functions.h"), FileMode.Create)))
-        {
-            writer.Write(CSourceBuiltn.DeviceHeader);
-
-            foreach (var func in _functions.OfType<LinkableDeviceFunction>())
-            {
-                writer.Write(func.Header);
-            }
-        }
+        return GenerateLinkedModule(codegenDir, kernelFunctions);
     }
 
     private void WriteLambdaFunctions(string codegenDir)
@@ -138,33 +137,53 @@ internal sealed class LinkableModule : ILinkableModule
         }
     }
 
-    private void WriteThreadMain(string codegenDir, LinkableKernelFunction mainFunc, IReadOnlyList<string> kernelFiles)
+    private void WriteBlockMain(string codegenDir, IReadOnlyList<LinkableKernelFunction> kernelFunctions, IReadOnlyList<string> kernelFiles)
     {
-        var threadMainExt = _moduleKind == CUDATarget.Kind ? "cu" : "cpp";
-        using (var fs = File.Open(Path.Join(codegenDir, $"thread_main.{threadMainExt}"), FileMode.Create))
+        var sourceExtension = _moduleKind == CUDATarget.Kind ? "cu" : "cpp";
+        using (var fs = File.Open(Path.Join(codegenDir, $"block_main.{sourceExtension}"), FileMode.Create))
         {
             using (var writer = new StreamWriter(fs))
             {
-                var scheduleResult = mainFunc.SourceFunction.SchedResult;
-                var memoryPoolDesc = mainFunc.MemoryPoolDesc;
-
-                writer.Write(CSourceBuiltn.ThreadMainHeader);
+                writer.Write(CSourceBuiltn.BlockMainHeader);
                 foreach (var file in kernelFiles)
                 {
                     writer.WriteLine($"#include \"{file}\"");
                 }
 
-                writer.Write(CSourceBuiltn.MakeMain(
-                    primFunction: (TIR.PrimFunction)mainFunc.SourceFunction,
-                    dataAlign: scheduleResult.DataAlign,
-                    dataUsage: scheduleResult.DataUsage,
-                    blockLocalDataPoolSize: scheduleResult.BlockLocalDataPoolSize,
-                    rdataPoolSize: memoryPoolDesc.RdataPoolSize,
-                    blockLocalRdataPoolSize: memoryPoolDesc.BlockLocalRdataPoolSize,
-                    options: _targetOptions));
+                foreach (var function in kernelFunctions)
+                {
+                    var scheduleResult = function.SourceFunction.SchedResult;
+                    var memoryPoolDesc = function.MemoryPoolDesc;
+                    writer.Write(CSourceBuiltn.MakeBlockMain(
+                        primFunction: (TIR.PrimFunction)function.SourceFunction,
+                        functionId: function.Id,
+                        entryPoint: GetBlockEntryPoint(function.Id),
+                        dataAlign: scheduleResult.DataAlign,
+                        dataUsage: scheduleResult.DataUsage,
+                        blockLocalDataPoolSize: scheduleResult.BlockLocalDataPoolSize,
+                        rdataPoolSize: memoryPoolDesc.RdataPoolSize,
+                        blockLocalRdataPoolSize: memoryPoolDesc.BlockLocalRdataPoolSize,
+                        options: _targetOptions));
+                }
+
+                writer.WriteLine("extern \"C\" NTT_DEVICE void block_main(uint32_t function_id, const nncase::ntt::runtime::block_inout_desc *input_descs, nncase::ntt::runtime::block_inout_desc *const output_descs, const std::byte *rdata, const std::byte *block_local_rdata, std::byte *data, std::byte *block_local_data, std::byte *output) {");
+                writer.WriteLine("  switch (function_id) {");
+                foreach (var function in kernelFunctions)
+                {
+                    writer.WriteLine($"  case {function.Id}U:");
+                    writer.WriteLine($"    {GetBlockEntryPoint(function.Id)}(input_descs, output_descs, rdata, block_local_rdata, data, block_local_data, output);");
+                    writer.WriteLine("    return;");
+                }
+
+                writer.WriteLine("  default:");
+                writer.WriteLine("    std::abort();");
+                writer.WriteLine("  }");
+                writer.WriteLine("}");
             }
         }
     }
+
+    private static string GetBlockEntryPoint(uint functionId) => $"block_main_{functionId}";
 
     private void WriteCMakeLists(string codegenDir)
     {
@@ -177,7 +196,7 @@ internal sealed class LinkableModule : ILinkableModule
         }
     }
 
-    private ILinkedModule GenerateLinkedModule(string codegenDir, LinkableKernelFunction mainFunc)
+    private ILinkedModule GenerateLinkedModule(string codegenDir, IReadOnlyList<LinkableKernelFunction> kernelFunctions)
     {
         var manager = new SectionManager();
         var textWriter = manager.GetWriter(WellknownSectionNames.Text);
@@ -189,22 +208,21 @@ internal sealed class LinkableModule : ILinkableModule
             rdataAlign = Math.Max(rdataAlign, func.PrimFunction.SchedResult.DataAlign);
         }
 
-        foreach (var func in _functions.OfType<LinkableDeviceFunction>())
-        {
-            rdataAlign = Math.Max(rdataAlign, func.PrimFunction.SchedResult.DataAlign);
-        }
-
         var elfPath = CompileCSource(codegenDir);
         var funcText = File.ReadAllBytes(elfPath);
         textWriter.Write(funcText);
-        var entryAbi = mainFunc.PrimFunction.GetAbiView();
-        linkedFunctions.Add(new LinkedFunction(
-            mainFunc.Id,
-            entryAbi.RuntimeParameterTypes,
-            entryAbi.RuntimeReturnType,
-            0,
-            (uint)funcText.Length,
-            mainFunc.Sections));
+        foreach (var function in kernelFunctions)
+        {
+            var entryAbi = function.PrimFunction.GetAbiView();
+            linkedFunctions.Add(new LinkedFunction(
+                function.Id,
+                entryAbi.RuntimeParameterTypes,
+                entryAbi.RuntimeReturnType,
+                0,
+                (uint)funcText.Length,
+                function.Sections));
+        }
+
         return new LinkedModule(_moduleKind, linkedFunctions, _desc, manager.GetContent(WellknownSectionNames.Text)!, _rdata, _blockLocalRdatas, rdataAlign);
     }
 

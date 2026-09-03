@@ -99,14 +99,21 @@ struct reshard_impl<SrcTensor, DestTensor> {
     static constexpr auto rank = global_shape_type::rank();
 
     constexpr void operator()(const SrcTensor &src, DestTensor &dest) noexcept {
+        using value_type = typename SrcTensor::value_type;
+        auto *global_buffer_address =
+            reinterpret_cast<value_type *>(tar::collective_pool_ptr);
+        auto global_tensor =
+            make_tensor_view_from_address(global_buffer_address, src.shape());
         const auto local_shard_index = mesh_type::local_index();
         auto [global_offset, local_offset, shape] =
             shard_to_slice_with_global_offset(src, local_shard_index);
         if (shape.length() != 0) {
-            // Not empty slice
             auto local = src.local().view(local_offset, shape);
-            tensor_copy_sync(local, dest.view(global_offset, shape));
+            tensor_copy_sync(local, global_tensor.view(global_offset, shape));
         }
+
+        distributed::topology_synchronize();
+        tensor_copy_sync(global_tensor, dest);
         distributed::topology_synchronize();
     }
 

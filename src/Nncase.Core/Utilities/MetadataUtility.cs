@@ -23,9 +23,23 @@ public static class MetadataUtility
     public static T InheritMetaData<T>(this T newCall, BaseExpr oldCall)
         where T : BaseExpr
     {
-        if (oldCall.Metadata != null && oldCall.Metadata!.OutputNames != null)
+        if (oldCall.Metadata.OutputNames is not null)
         {
             newCall.Metadata.OutputNames = oldCall.Metadata.OutputNames;
+        }
+
+        // These fields identify the expression's model-level semantics and
+        // placement, so semantics-preserving rewrites must carry them forward.
+        // Range and microkernel metadata are derived for a concrete expression
+        // and must be recomputed after rewriting.
+        if (oldCall.Metadata.SemanticRegion is not null)
+        {
+            newCall.Metadata.SemanticRegion = oldCall.Metadata.SemanticRegion;
+        }
+
+        if (oldCall.Metadata.ExecutionModuleKind is not null)
+        {
+            newCall.Metadata.ExecutionModuleKind = oldCall.Metadata.ExecutionModuleKind;
         }
 
         return newCall;

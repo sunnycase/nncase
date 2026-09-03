@@ -30,7 +30,9 @@ public sealed class InlineSingleCallPrimFunctionsPass : ModulePass
     {
         var targetFunctions = input.Functions
             .OfType<PrimFunction>()
-            .Where(function => function.ModuleKind == _moduleKind)
+            .Where(function =>
+                function.ModuleKind == _moduleKind &&
+                CompileSession.IsFunctionActive(function))
             .ToHashSet(new ReferenceEqualityComparer<PrimFunction>());
         if (targetFunctions.Count == 0)
         {
@@ -50,7 +52,8 @@ public sealed class InlineSingleCallPrimFunctionsPass : ModulePass
         var inlineFunctions = new HashSet<PrimFunction>(new ReferenceEqualityComparer<PrimFunction>());
         foreach (var (callee, sites) in callSites)
         {
-            if (sites.Count != 1 || callee.Role == FunctionRole.Dispatch)
+            if (sites.Count != 1 ||
+                callee.Role is FunctionRole.Dispatch or FunctionRole.ModuleDispatch or FunctionRole.PipelineProjection)
             {
                 continue;
             }
@@ -58,7 +61,7 @@ public sealed class InlineSingleCallPrimFunctionsPass : ModulePass
             var site = sites[0];
             if (site.Caller is not PrimFunction caller
                 || caller.ModuleKind != _moduleKind
-                || caller.Role == FunctionRole.Dispatch)
+                || caller.Role is FunctionRole.Dispatch or FunctionRole.ModuleDispatch)
             {
                 continue;
             }
@@ -156,7 +159,9 @@ public sealed class InlineSingleCallPrimFunctionsPass : ModulePass
 
         protected override Unit VisitLeafCall(Call expr)
         {
-            if (expr.Target is not PrimFunction callee || callee.ModuleKind != _moduleKind)
+            if (expr.Target is not PrimFunction callee ||
+                callee.ModuleKind != _moduleKind ||
+                callee.Role == FunctionRole.ModuleDispatch)
             {
                 return default;
             }

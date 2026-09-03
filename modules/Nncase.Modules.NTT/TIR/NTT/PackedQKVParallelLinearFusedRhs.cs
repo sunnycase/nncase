@@ -2,12 +2,13 @@
 // Licensed under the Apache license. See LICENSE file in the project root for full license information.
 
 using Nncase.IR;
+using Nncase.IR.Math;
 
 namespace Nncase.TIR.NTT;
 
 /// <summary>
 /// Packed QKV projection whose block-local Q/K/V RHS shards are stored in one
-/// canonical K-major tensor. Projection capacities define the fixed physical N
+/// canonical target-selected tensor. Projection capacities define the fixed physical N
 /// ranges; output shapes define the active tails.
 /// </summary>
 public sealed partial class PackedQKVParallelLinearFusedRhs : NTTKernelOp
@@ -46,6 +47,10 @@ public sealed partial class PackedQKVParallelLinearFusedRhs : NTTKernelOp
 
     public IR.NTT.PackedMatMulRhsLayout RhsLayout { get; }
 
+    public int OutputNVectorLaneCount { get; }
+
+    public MatMulQuantizationMode QuantizationMode { get; }
+
     /// <summary>
     /// Gets fixed scalar N capacities for Q, K, and V in the fused local RHS.
     /// </summary>
@@ -53,5 +58,7 @@ public sealed partial class PackedQKVParallelLinearFusedRhs : NTTKernelOp
 
     public override string DisplayProperty() =>
         $"NumHeads: {NumHeads}, NumKvHeads: {NumKvHeads}, RhsLayout: {RhsLayout}, " +
+        $"OutputNVectorLaneCount: {OutputNVectorLaneCount}, " +
+        $"QuantizationMode: {QuantizationMode}, " +
         $"ProjectionNCapacities: [{string.Join(",", ProjectionNCapacities)}]";
 }

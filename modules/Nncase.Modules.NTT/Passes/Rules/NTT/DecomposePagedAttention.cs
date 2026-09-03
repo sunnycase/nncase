@@ -43,7 +43,8 @@ public sealed partial class DecomposePagedAttention : IRewriteRule
         IsWildcard("kvCaches"),
         IsWildcard("extra"),
         IsWildcard("scale"),
-        IsWildcard("layerId"));
+        IsWildcard("layerId"),
+        IsWildcard("outputGate"));
 
     private Expr? GetReplace(
         PagedAttention pagedAttention,
@@ -52,7 +53,8 @@ public sealed partial class DecomposePagedAttention : IRewriteRule
         Expr kvCaches,
         Expr extra,
         Expr scale,
-        Dimension layerId)
+        Dimension layerId,
+        Expr outputGate)
     {
         var seqAxis = pagedAttention.Layout.IndexOf(AttentionDimKind.Seq);
         if (seqAxis < 0 ||
@@ -78,6 +80,7 @@ public sealed partial class DecomposePagedAttention : IRewriteRule
                 IR.F.Tensors.GetItem(partial, 0),
                 IR.F.Tensors.GetItem(partial, 1),
                 IR.F.Tensors.GetItem(partial, 2),
+                outputGate,
                 pagedAttention.Layout,
                 pagedAttention.HiddenSize,
                 pagedAttentionCall.CheckedTensorType.DType,

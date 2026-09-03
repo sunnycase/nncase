@@ -21,11 +21,21 @@ internal sealed class PyNTTFunctionBuilder
 
     public PyNTTLinkableFunction Build(BaseFunction function)
     {
-        var visitor = new PyNTTKernelSourceConvertVisitor(_compileOptions);
-        visitor.Visit(function);
-        var generatedKernelSource = visitor.GetKernelSource();
+        var generatedKernelSource = function is TIR.PrimFunction
+            ? BuildKernelSource(function)
+            : new PyNTTGeneratedKernelSource(
+                Array.Empty<GeneratedKernelMetadata>(),
+                Array.Empty<KernelRenderSpec>(),
+                string.Empty);
 
         return new PyNTTLinkableFunction(_id, function, generatedKernelSource, BuildRDataBundle(function));
+    }
+
+    private PyNTTGeneratedKernelSource BuildKernelSource(BaseFunction function)
+    {
+        var visitor = new PyNTTKernelSourceConvertVisitor(_compileOptions);
+        visitor.Visit(function);
+        return visitor.GetKernelSource();
     }
 
     private PyNTTRDataBundle BuildRDataBundle(BaseFunction function)

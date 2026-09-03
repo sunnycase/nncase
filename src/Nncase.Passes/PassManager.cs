@@ -195,6 +195,11 @@ internal sealed class PassManager : IPassManager
             foreach (var functionIndex in functionIndices)
             {
                 var pre = module.Functions[functionIndex];
+                if (!_compileSession.IsFunctionActive(pre))
+                {
+                    continue;
+                }
+
                 var runner = new Runner(_compileSession, pre, Passes, StartPassIndex);
                 var post = await runner.RunAsync();
 

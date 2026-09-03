@@ -2,6 +2,7 @@
 {% set stage_model = stage["Model"] %}
 {% set stage_ctx = nvfp4_matmul_context(stage_model) %}
 {% set packed_shape = [stage_ctx["num_stages"]] + (stage_ctx["packed_tma_block_shape"] | list) %}
+{% set scale_shape = [stage_ctx["num_stages"]] + (stage_ctx["scale_tma_block_shape"] | list) %}
 {{ stage["StageName"] }}__packed_weight_stages = tle.gpu.alloc(
     [{{ packed_shape | join(", ") }}],
     dtype=tl.uint8,
@@ -19,11 +20,29 @@
     alias=pyntt_shared_arena,
     alias_offset_bytes={{ stage["SharedWorkspaceOffsets"]["packed_weight_stage"] }},
 )
+{{ stage["StageName"] }}__weight_scale_stages = tle.gpu.alloc(
+    [{{ scale_shape | join(", ") }}],
+    dtype=tl.float8e4nv,
+    layout=tle.gpu.nv_tma_shared_layout(
+        [{{ scale_shape | join(", ") }}],
+        [{{ range((scale_shape | length) - 1, -1, -1) | join(", ") }}],
+        tl.float8e4nv,
+        [{% for _ in scale_shape %}1{{ ", " if not loop.last }}{% endfor %}],
+        [{% for _ in scale_shape %}1{{ ", " if not loop.last }}{% endfor %}],
+        [{{ range((scale_shape | length) - 1, -1, -1) | join(", ") }}],
+        False,
+        True,
+    ),
+    scope=tle.gpu.smem,
+    alias=pyntt_shared_arena,
+    alias_offset_bytes={{ stage["SharedWorkspaceOffsets"]["weight_scale_stage"] }},
+)
 {{ stage["PipeName"] }} = tle.pipe(
     capacity={{ stage_ctx["num_stages"] }},
     scope="cta",
     name="{{ stage["StageName"] }}_weight",
     packed_weight={{ stage["StageName"] }}__packed_weight_stages,
+    weight_scale={{ stage["StageName"] }}__weight_scale_stages,
 )
 {%- endmacro %}
 {% if model is defined %}
@@ -48,18 +67,22 @@
 {{ "@triton.jit(noinline=True)" if model["NoInline"] else "@triton.jit" }}
 def {{ model["FunctionName"] }}__producer(writer, {{ helper_parameters(model) }}):
 {{ common.mesh_coordinates(model["MeshAxes"]) }}
-{% for n_tile in range(ctx["num_n_tiles"]) %}
-    packed_descriptor_entry_{{ n_tile }} = tle.gpu.tensor_map_table_entry(
+    packed_descriptor_entry = tle.gpu.tensor_map_table_entry(
         {{ ctx["packed_descriptor_name"] }},
-        shard_index * {{ ctx["num_n_tiles"] }} + {{ n_tile }},
+        shard_index,
     )
-    tle.gpu.tensor_map_fenceproxy_acquire(packed_descriptor_entry_{{ n_tile }})
-{% endfor %}
+    tle.gpu.tensor_map_fenceproxy_acquire(packed_descriptor_entry)
+    scale_descriptor_entry = tle.gpu.tensor_map_table_entry(
+        {{ ctx["scale_descriptor_name"] }},
+        shard_index,
+    )
+    tle.gpu.tensor_map_fenceproxy_acquire(scale_descriptor_entry)
 {% for n_batch_start in range(0, ctx["num_n_tiles"], ctx["n_tiles_per_activation_batch"]) %}
 {% set n_batch_end = [n_batch_start + ctx["n_tiles_per_activation_batch"], ctx["num_n_tiles"]] | min %}
 {% set n_batch_count = n_batch_end - n_batch_start %}
     for k_tile_{{ n_batch_start }} in tl.range(0, {{ ctx["num_k_tiles"] }}):
         k_tile = k_tile_{{ n_batch_start }}
+        k_start = k_tile * {{ ctx["block_k"] }}
 {% for n_tile in range(n_batch_start, n_batch_end) %}
         sequence = (
             {{ n_batch_start * ctx["num_k_tiles"] }}
@@ -68,14 +91,28 @@ def {{ model["FunctionName"] }}__producer(writer, {{ helper_parameters(model) }}
         ).to(tl.int32)
         slot = writer.acquire(sequence)
         packed_descriptor = tle.gpu.reinterpret_tensor_map(
-            packed_descriptor_entry_{{ n_tile }}, slot.packed_weight
+            packed_descriptor_entry, slot.packed_weight
         )
         tle.gpu.copy(
             packed_descriptor,
             slot.packed_weight,
             [{{ ctx["packed_tma_block_shape"] | join(", ") }}],
             offsets=[
-{% for offset in ctx["packed_tma_offsets"] %}
+{% for offset in ctx["packed_tma_offsets_by_n_tile"][n_tile] %}
+                {{ tma_offset(offset) }},
+{% endfor %}
+            ],
+            eviction_policy="evict_first",
+        )
+        scale_descriptor = tle.gpu.reinterpret_tensor_map(
+            scale_descriptor_entry, slot.weight_scale
+        )
+        tle.gpu.copy(
+            scale_descriptor,
+            slot.weight_scale,
+            [{{ ctx["scale_tma_block_shape"] | join(", ") }}],
+            offsets=[
+{% for offset in ctx["scale_tma_offsets_by_n_tile"][n_tile] %}
                 {{ tma_offset(offset) }},
 {% endfor %}
             ],
@@ -91,10 +128,19 @@ def {{ model["FunctionName"] }}__producer(writer, {{ helper_parameters(model) }}
 def {{ model["FunctionName"] }}__consumer(reader, {{ helper_parameters(model) }}):
 {{ common.mesh_coordinates(model["MeshAxes"]) }}
     lhs = {{ ptr(model, "Lhs") }}
-    rhs_scale = {{ ptr(model, "RhsScale") }}
     lhs_global_scale_ptr = {{ ptr(model, "LhsGlobalScale") }}
     rhs_global_scale_ptr = {{ ptr(model, "RhsGlobalScale") }}
     output = {{ ptr(model, "Output") }}
+{% if model["HasAddend"] %}
+    addend = {{ ptr(model, "Addend") }}
+{% endif %}
+{% if model["HasNormStats"] %}
+    stats = {{ ptr(model, "Stats") }}
+{% if model["UseMean"] %}
+    stats_sum = 0.0
+{% endif %}
+    stats_square_sum = 0.0
+{% endif %}
     lhs_global_scale = tl.load({{ access_pointer(model, "LhsGlobalScale", "lhs_global_scale_ptr") }}).to(tl.float32)
     rhs_global_scale = tl.load({{ access_pointer(model, "RhsGlobalScale", "rhs_global_scale_ptr") }}).to(tl.float32)
     logical_k = tl.arange(0, {{ ctx["block_k"] }})
@@ -161,7 +207,6 @@ def {{ model["FunctionName"] }}__consumer(reader, {{ helper_parameters(model) }}
             (8, {{ ctx["scale_block_k"] }}),
         )
 {% for n_tile in range(n_batch_start, n_batch_end) %}
-        offs_n = {{ n_tile * ctx["block_n"] }} + local_n_source
         sequence = (
             {{ n_batch_start * ctx["num_k_tiles"] }}
             + k_tile * {{ n_batch_count }}
@@ -175,11 +220,9 @@ def {{ model["FunctionName"] }}__consumer(reader, {{ helper_parameters(model) }}
             ),
             {{ model["FunctionName"] }}__weight_dot_layout,
         )
-        rhs_block_scale = tl.load(
-            {{ access_pointer(model, "RhsScale", "rhs_scale", ctx["weight_scale_access"]) }},
-            mask=(offs_n[:, None] < {{ dim(ctx["n"]) }})
-            & (k_start // {{ ctx["group_size"] }} + scale_k[None, :] < {{ dim(ctx["k"]) }} // {{ ctx["group_size"] }}),
-            other=0.0,
+        rhs_block_scale = tl.reshape(
+            tl.load(tle.gpu.local_ptr(ready.slot.weight_scale)),
+            ({{ ctx["block_n"] }}, {{ ctx["scale_block_k"] }}),
         )
         mma = tl.dot_scaled(
             rhs_value,
@@ -202,15 +245,49 @@ def {{ model["FunctionName"] }}__consumer(reader, {{ helper_parameters(model) }}
         reader.release(sequence)
 {% endfor %}
 {% for n_tile in range(n_batch_start, n_batch_end) %}
-    result_{{ n_tile }} = acc_{{ n_tile }} / (lhs_global_scale * rhs_global_scale)
+    result_{{ n_tile }} = (
+        acc_{{ n_tile }} / (lhs_global_scale * rhs_global_scale)
+    ).to({{ model["OutputTritonDType"] }})
     offs_n = output_offs_n_{{ n_tile }}
+{% if model["HasAddend"] %}
+    addend_value_{{ n_tile }} = tl.load(
+        {{ access_pointer(model, "Addend", "addend", ctx["addend_access"]) }},
+        mask=offs_n < {{ dim(ctx["n"]) }},
+        other=0.0,
+    )
+    result_{{ n_tile }} = (
+        result_{{ n_tile }} + addend_value_{{ n_tile }}
+    ).to({{ model["OutputTritonDType"] }})
+{% endif %}
     tl.store(
         {{ access_pointer(model, "Output", "output", ctx["output_access"]) }},
-        result_{{ n_tile }}.to({{ model["OutputTritonDType"] }}),
+        result_{{ n_tile }},
         mask=offs_n < {{ dim(ctx["n"]) }},
     )
+{% if model["HasNormStats"] %}
+    stats_value_{{ n_tile }} = tl.where(
+        offs_n < {{ dim(ctx["n"]) }},
+        result_{{ n_tile }}.to(tl.float32),
+        0.0,
+    )
+{% if model["UseMean"] %}
+    stats_sum += tl.sum(stats_value_{{ n_tile }}, axis=None)
+{% endif %}
+    stats_square_sum += tl.sum(
+        stats_value_{{ n_tile }} * stats_value_{{ n_tile }},
+        axis=None,
+    )
+{% endif %}
 {% endfor %}
 {% endfor %}
+{% if model["HasNormStats"] %}
+{% if model["UseMean"] %}
+    tl.store({{ access_pointer(model, "Stats", "stats", ctx["stats_accesses"][0]) }}, stats_sum, mask=True)
+    tl.store({{ access_pointer(model, "Stats", "stats", ctx["stats_accesses"][1]) }}, stats_square_sum, mask=True)
+{% else %}
+    tl.store({{ access_pointer(model, "Stats", "stats", ctx["stats_accesses"][0]) }}, stats_square_sum, mask=True)
+{% endif %}
+{% endif %}
 
 
 {% endif %}

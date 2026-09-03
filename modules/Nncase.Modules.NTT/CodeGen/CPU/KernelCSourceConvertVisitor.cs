@@ -14,13 +14,11 @@ using DryIoc.ImTools;
 using NetFabric.Hyperlinq;
 using Nncase.CodeGen.NTT;
 using Nncase.IR;
-using Nncase.Layouts;
 using Nncase.Runtime;
 using Nncase.Targets;
 using Nncase.TIR;
 using Nncase.Utilities;
 using Razor.Templating.Core;
-using Lutil = Nncase.Layouts.LayoutUtilities;
 
 namespace Nncase.CodeGen.NTT;
 
@@ -29,10 +27,20 @@ namespace Nncase.CodeGen.NTT;
 /// </summary>
 internal sealed class KernelCSourceConvertVisitor : CSourceConvertVisitor, IDisposable
 {
-    private readonly HashSet<string> _excludedVars = new() { "data", "block_local_data" };
     private readonly StringBuilder _kernelBuilder;
     private readonly HashSet<TIR.PrimFunction> _refFuncs;
     private readonly HashSet<TIR.Buffer> _declaredBuffers = new(ReferenceEqualityComparer.Instance);
+    private readonly HashSet<string> _localNames = new(StringComparer.Ordinal)
+    {
+        "rdata",
+        "block_local_rdata",
+        "data",
+        "block_local_data",
+        "output",
+        "output_descs",
+    };
+
+    private readonly Dictionary<string, int> _localNameSuffixes = new(StringComparer.Ordinal);
     private readonly ulong _chipLocalRdataBase;
     private IVar[]? _tensorParams;
 
@@ -49,7 +57,7 @@ internal sealed class KernelCSourceConvertVisitor : CSourceConvertVisitor, IDisp
 
     public ulong CollectivePoolSize { get; private set; }
 
-    private IVar[] TensorParams => _tensorParams ??= VisitEntry.Parameters.ToArray().Where(x => !_excludedVars.Contains(x.Name)).ToArray();
+    private IVar[] TensorParams => _tensorParams ??= VisitEntry.Parameters.ToArray().Where(IsTemplateTensorParameter).ToArray();
 
     public void WriteWithProfiler(string functionName, string tagName = "")
     {
@@ -93,10 +101,10 @@ internal sealed class KernelCSourceConvertVisitor : CSourceConvertVisitor, IDisp
 
     public KernelCSource GetCSource()
     {
-        var paramsExcluded = VisitEntry.Parameters.ToArray().OfType<IVar>().Where(x => !_excludedVars.Contains(x.Name)).ToArray();
+        var runtimeParameters = VisitEntry.Parameters.ToArray().Where(IsRuntimeParameter).ToArray();
         var templateHeader = TensorParams.Length == 0 ? string.Empty : $"template<{string.Join(", ", Enumerable.Range(0, TensorParams.Length).Select(x => $"class T{x}"))}>" + Environment.NewLine;
         var ctype = templateHeader +
-            $"NTT_DEVICE void {VisitEntry.Name}({string.Concat(paramsExcluded.Select(Visit).Select(s => $"{s.Type} {s.Name}, ").ToArray())}const std::byte *rdata, const std::byte *block_local_rdata, std::byte *data, std::byte *block_local_data, std::byte *output, nncase::ntt::runtime::thread_inout_desc *const output_descs)";
+            $"NTT_DEVICE void {VisitEntry.Name}({string.Concat(runtimeParameters.Select(Visit).Select(s => $"{s.Type} {s.Name}, ").ToArray())}const std::byte *rdata, const std::byte *block_local_rdata, std::byte *data, std::byte *block_local_data, std::byte *output, nncase::ntt::runtime::block_inout_desc *const output_descs)";
         return new(
             Declare: ctype + ";\n",
             Kernel: CSourceBuiltn.MakeKernel(ctype, _kernelBuilder.ToString()),
@@ -108,6 +116,12 @@ internal sealed class KernelCSourceConvertVisitor : CSourceConvertVisitor, IDisp
     {
     }
 
+    private static bool IsRuntimeParameter(IVar parameter)
+        => parameter is not BufferVar { Role: BufferVarRole.Workspace };
+
+    private static bool IsTemplateTensorParameter(IVar parameter)
+        => IsRuntimeParameter(parameter) && parameter.CheckedType is TensorType or DistributedType;
+
     protected override CSymbol VisitVar(Var expr)
     {
         if (_exprMemo.TryGetValue(expr, out var symbol))
@@ -115,7 +129,7 @@ internal sealed class KernelCSourceConvertVisitor : CSourceConvertVisitor, IDisp
             return symbol;
         }
 
-        var name = IRHelpers.GetIdentityName(expr.Name);
+        var name = AllocateLocalName(IRHelpers.GetIdentityName(expr.Name));
         var index = Array.IndexOf(TensorParams, expr);
         if (index != -1)
         {
@@ -137,7 +151,7 @@ internal sealed class KernelCSourceConvertVisitor : CSourceConvertVisitor, IDisp
             return symbol;
         }
 
-        var name = IRHelpers.GetIdentityName(expr.Name);
+        var name = AllocateLocalName(IRHelpers.GetIdentityName(expr.Name));
         var index = Array.IndexOf(TensorParams, expr);
         if (index != -1)
         {
@@ -220,8 +234,9 @@ internal sealed class KernelCSourceConvertVisitor : CSourceConvertVisitor, IDisp
         }
 
         var start = Visit(expr.Start);
-        var isReadOnly = expr.Location is MemoryLocation.Rdata or MemoryLocation.ChipLocalRdata or MemoryLocation.BlockLocalRdata ||
-            (expr.Location == MemoryLocation.Input && expr.Start is not BufferVar { Role: BufferVarRole.InOut });
+        var isReadOnly = expr.Start.CheckedDataType is not ReferenceType &&
+            (expr.Location is MemoryLocation.Rdata or MemoryLocation.ChipLocalRdata or MemoryLocation.BlockLocalRdata ||
+             (expr.Location == MemoryLocation.Input && expr.Start is not BufferVar { Role: BufferVarRole.InOut }));
         if (expr.Location is MemoryLocation.Input or MemoryLocation.Output)
         {
             if (expr.Start is not BufferVar)
@@ -313,7 +328,7 @@ internal sealed class KernelCSourceConvertVisitor : CSourceConvertVisitor, IDisp
         var dimensions = expr.DistributedType is null ? expr.Dimensions : ((RankedShape)expr.DistributedType.TensorType.Shape).Dimensions;
         var dimensionTypes = dimensions.AsValueEnumerable().Select(x => Visit(x).Type).ToArray();
         var strideTypes = expr.Strides.AsValueEnumerable().Select(x => Visit(x).Type).ToArray();
-        var dtypeStr = expr.ElemType.ToC();
+        var dtypeStr = GetBufferElementType(expr);
         var dimensionStr = $"shape_t<{StringUtility.Join(", ", dimensionTypes)}>";
         var strideStr = $"strides_t<{StringUtility.Join(", ", strideTypes)}>";
 
@@ -323,7 +338,7 @@ internal sealed class KernelCSourceConvertVisitor : CSourceConvertVisitor, IDisp
              : $"sharded_tensor_view<{dtypeStr}, {dimensionStr}, {KernelUtility.ShardingToC(expr.DistributedType)}, {strideStr}> ")
             : $"tensor<{dtypeStr}, {dimensionStr}, {strideStr}> ";
 
-        symbol = new(type, expr.Name);
+        symbol = new(type, AllocateLocalName(expr.Name));
         DeclBuffer(expr, symbol);
         _exprMemo.Add(expr, symbol);
         return symbol;
@@ -345,7 +360,35 @@ internal sealed class KernelCSourceConvertVisitor : CSourceConvertVisitor, IDisp
         };
 
         string str = string.Empty;
-        if (expr.Target is Op kop && kop is TIR.NTT.NTTKernelOp or TIR.Memcopy or TIR.TileLoad or TIR.TileStore)
+        if (expr.Target is TIR.ChannelProduce produce)
+        {
+            var args = expr.Arguments.ToArray();
+            if (args.Length != 2 || args[1] is not TIR.Buffer value)
+            {
+                throw new NotSupportedException(
+                    $"NTT ChannelProduce {produce.ChannelId} expects a channel and one TIR buffer payload.");
+            }
+
+            Visit(value);
+            WriteIndWithProfiler(
+                $"ntt::runtime::pipeline_channel_produce({Visit(args[0]).Name}, {VisitBuffer(value, local: false).Name}, {(produce.Phase + 1).ToString(System.Globalization.CultureInfo.InvariantCulture)}U)",
+                "pipeline_channel_produce");
+        }
+        else if (expr.Target is TIR.ChannelConsume consume)
+        {
+            var args = expr.Arguments.ToArray();
+            if (args.Length != 2 || args[1] is not TIR.Buffer destination)
+            {
+                throw new NotSupportedException(
+                    $"NTT ChannelConsume {consume.ChannelId} expects a channel and one TIR buffer destination.");
+            }
+
+            Visit(destination);
+            WriteIndWithProfiler(
+                $"ntt::runtime::pipeline_channel_consume({Visit(args[0]).Name}, {VisitBuffer(destination, local: false).Name}, {(consume.Phase + 1).ToString(System.Globalization.CultureInfo.InvariantCulture)}U)",
+                "pipeline_channel_consume");
+        }
+        else if (expr.Target is Op kop && kop is TIR.NTT.NTTKernelOp or TIR.Memcopy)
         {
             foreach (var item in expr.Arguments.ToArray().OfType<TIR.Buffer>())
             {
@@ -407,6 +450,8 @@ internal sealed class KernelCSourceConvertVisitor : CSourceConvertVisitor, IDisp
                     }
                     else
                     {
+                        (var maxSize, _) = TensorUtilities.GetTensorMaxSizeAndStrides(args[0].CheckedTensorType);
+                        CollectivePoolSize = Math.Max(CollectivePoolSize, (ulong)maxSize);
                         WriteWithProfiler($"reshard({VisitBuffer(args[0], local: false).Name}, {VisitBuffer(args[1], local: true).Name});\n");
                     }
 
@@ -441,6 +486,24 @@ internal sealed class KernelCSourceConvertVisitor : CSourceConvertVisitor, IDisp
                         {
                             Arguments = args.Select(x => new KernelArgument { Symbol = VisitBuffer(x, local: true) }).Concat(vectorizedLayerNorm.PadedNums.Select(Visit).Select(x => new KernelArgument { Symbol = x })).ToArray(),
                             Args = args.ToArray(),
+                        }).Result);
+                    }
+
+                    break;
+                case TIR.NTT.NormStats normStats:
+                    {
+                        WriteWithProfiler(RazorTemplateEngine.RenderAsync("~/CodeGen/CPU/Templates/Kernels/NormStats.cshtml", new TypedKernelTemplateModel<TIR.NTT.NormStats>(normStats)
+                        {
+                            Arguments = args.Select(x => new KernelArgument { Symbol = VisitBuffer(x, local: false) }).ToArray(),
+                        }).Result);
+                    }
+
+                    break;
+                case TIR.NTT.NormApply normApply:
+                    {
+                        WriteWithProfiler(RazorTemplateEngine.RenderAsync("~/CodeGen/CPU/Templates/Kernels/NormApply.cshtml", new TypedKernelTemplateModel<TIR.NTT.NormApply>(normApply)
+                        {
+                            Arguments = args.Select(x => new KernelArgument { Symbol = VisitBuffer(x, local: false) }).ToArray(),
                         }).Result);
                     }
 
@@ -517,9 +580,19 @@ internal sealed class KernelCSourceConvertVisitor : CSourceConvertVisitor, IDisp
                     }
 
                     break;
+                case TIR.NTT.BlockScaledMatMul blockScaledMatMul:
+                    {
+                        WriteWithProfiler(
+                            RazorTemplateEngine.RenderAsync("~/CodeGen/CPU/Templates/Kernels/BlockScaledMatMul.cshtml", new TypedKernelTemplateModel<TIR.NTT.BlockScaledMatMul>(blockScaledMatMul)
+                            {
+                                Arguments = args.Select(x => new KernelArgument { Symbol = VisitBuffer(x, local: false) }).ToArray(),
+                            }).Result,
+                            "block_scaled_matmul");
+                    }
+
+                    break;
                 case TIR.NTT.QKVParallelLinear qkvParallelLinear:
                     {
-                        ValidateQKVParallelLinearScales(args);
                         WriteWithProfiler(
                             RazorTemplateEngine.RenderAsync("~/CodeGen/CPU/Templates/Kernels/QKVParallelLinear.cshtml", new TypedKernelTemplateModel<TIR.NTT.QKVParallelLinear>(qkvParallelLinear)
                             {
@@ -531,7 +604,6 @@ internal sealed class KernelCSourceConvertVisitor : CSourceConvertVisitor, IDisp
                     break;
                 case TIR.NTT.PackedQKVParallelLinear packedQKVParallelLinear:
                     {
-                        ValidateQKVParallelLinearScales(args);
                         WriteWithProfiler(
                             RazorTemplateEngine.RenderAsync("~/CodeGen/CPU/Templates/Kernels/PackedQKVParallelLinear.cshtml", new TypedKernelTemplateModel<TIR.NTT.PackedQKVParallelLinear>(packedQKVParallelLinear)
                             {
@@ -567,12 +639,6 @@ internal sealed class KernelCSourceConvertVisitor : CSourceConvertVisitor, IDisp
                     break;
                 case TIR.Memcopy copy:
                     WriteWithProfiler($"tensor_copy_sync({VisitBuffer(args[1], local: true).Name}, {VisitBuffer(args[0], local: true).Name});\n");
-                    break;
-                case TIR.TileLoad:
-                    WriteWithProfiler($"tensor_copy_sync({VisitBuffer(args[1], local: true).Name}, {VisitBuffer(args[0], local: true).Name});\n");
-                    break;
-                case TIR.TileStore:
-                    WriteWithProfiler($"tensor_copy_sync({VisitBuffer(args[0], local: true).Name}, {VisitBuffer(args[1], local: true).Name});\n");
                     break;
                 case TIR.NTT.Gather gather:
                     {
@@ -665,79 +731,9 @@ internal sealed class KernelCSourceConvertVisitor : CSourceConvertVisitor, IDisp
                         }
                         else
                         {
-                            if (grs.InType.TensorType.Shape.All(dim => dim.IsFixed) &&
-                                grs.OutType.TensorType.Shape.All(dim => dim.IsFixed) &&
-                                !grs.OutType.AxisPolicies.All(p => p is SBPBroadCast) &&
-                                grs.InType.TensorType.Shape == grs.OutType.TensorType.Shape)
-                            {
-                                IndentScope.Writer.IndWrite("{\n");
-                                IndentScope.Writer.Indent++;
-                                var srcBuffer = VisitBuffer(args[0], local: false);
-                                var destBuffer = VisitBuffer(args[1], local: false);
-                                IndentScope.Writer.IndWrite("using T = decltype(" + srcBuffer.Name + ");\n");
-                                IndentScope.Writer.IndWrite("using mesh_type = typename T::mesh_type;\n");
-                                IndentScope.Writer.IndWrite("auto pids = mesh_type::local_index();\n");
-                                IndentScope.Writer.IndWrite("distributed::topology_synchronize();\n");
-                                int[] GetSplitTopoAxes(IRArray<SBP> axisPolicies)
-                                {
-                                    return axisPolicies.OfType<SBPSplit>().Select(x => x.HierarchyAxes).SelectMany(x => x).ToArray();
-                                }
-
-                                var srcType = grs.InType;
-                                var destType = grs.OutType;
-                                var srcLayout = Layout.From(srcType);
-                                var destLayout = Layout.From(destType);
-                                var primTile = Lutil.Minimum(srcLayout[1].Shape, destLayout[1].Shape);
-                                var primTileInts = Lutil.Flatten(primTile).Elements.OfType<IntValue>().Select(x => x.Value).ToArray();
-                                var placement = srcType.Placement;
-                                var srcSplitTopoAxes = GetSplitTopoAxes(srcType.AxisPolicies);
-                                var destSplitTopoAxes = GetSplitTopoAxes(destType.AxisPolicies);
-                                foreach (var destSplitPids in destSplitTopoAxes.Select(axis => placement.Hierarchy[axis]).Select(x => LinqUtility.Range<long>(0, x)).CartesianProduct().Select(x => x.ToArray()))
-                                {
-                                    IndentScope.Writer.IndWrite($"if ({string.Join(" and ", destSplitTopoAxes.Select((aixs, i) => $"pids[{aixs}] == {destSplitPids[i]}"))}){{\n");
-
-                                    var destLayoutLocal = new Layout(destLayout[1].Shape);
-                                    var destLayoutLocalTiled = Lutil.ZippedDivide(destLayoutLocal, primTile); // [(minTile), (times)]
-                                    var destPrimTimes = destLayoutLocalTiled[1];
-                                    for (int i = 0; i < (int)destPrimTimes.Size(); i++)
-                                    {
-                                        var destCoordLocalTiled = new CollectValue([RecursiveValue.UnderScore, Lutil.Idx2Crd(i, destPrimTimes.Shape)]);
-                                        var destOffsetLocalTiled = destLayoutLocalTiled.Invoke(destCoordLocalTiled);
-                                        var destCoordLocal = destLayoutLocal.HierCoord(destOffsetLocalTiled);
-
-                                        CollectValue destCoord = [new CollectValue(destSplitPids.Select(x => new IntValue(x))), destCoordLocal];
-                                        var destOffest = destLayout.Invoke(destCoord);
-                                        var srcCoord = Lutil.Idx2Crd(destOffest, srcLayout.Shape, srcLayout.Stride); // src rank with src start
-
-                                        var srcCoordFlattened = Lutil.Flatten(srcCoord).Elements.OfType<IntValue>().Select(x => x.Value).ToArray();
-
-                                        var srcSplitPids = srcCoordFlattened[..srcSplitTopoAxes.Length];
-                                        var srcCoordLocal = srcCoordFlattened[srcSplitTopoAxes.Length..];
-
-                                        var srcShardIndexStr = string.Join(",", Enumerable.Range(0, placement.Rank).Select(i => srcSplitTopoAxes.IndexOf(i) switch { -1 => $"pids[{i}]", var j => $"{srcSplitPids[j]}" }));
-                                        IndentScope.Writer.IndWrite($"auto src_local_{i} = {srcBuffer.Name}.remote(make_shape({srcShardIndexStr}));\n");
-                                        var srcLocalTileStartStr = string.Join(", ", srcCoordLocal);
-                                        var tileShapeStr = string.Join(", ", primTileInts);
-                                        IndentScope.Writer.IndWrite($"auto src_local_tile_{i} = src_local_{i}.view(make_shape({srcLocalTileStartStr}), make_shape({tileShapeStr}));\n");
-                                        var destLocalTileStartStr = string.Join(", ", Lutil.Flatten(destCoordLocal).Elements.OfType<IntValue>().Select(x => x.Value).ToArray());
-                                        IndentScope.Writer.IndWrite($"auto dest_local_tile_{i} = {destBuffer.Name}.local().view(make_shape({destLocalTileStartStr}), make_shape({tileShapeStr}));\n");
-                                        IndentScope.Writer.IndWrite($"tensor_copy_sync(src_local_tile_{i}, dest_local_tile_{i});\n");
-                                    }
-
-                                    IndentScope.Writer.IndWrite("}\n");
-                                }
-
-                                IndentScope.Writer.Indent--;
-                                IndentScope.Writer.IndWrite("distributed::topology_synchronize();\n");
-                                IndentScope.Writer.IndWrite("}\n");
-                            }
-                            else
-                            {
-                                // todo using isl.
-                                (var maxSize, _) = TensorUtilities.GetTensorMaxSizeAndStrides(args[0].CheckedTensorType);
-                                CollectivePoolSize = Math.Max(CollectivePoolSize, (ulong)maxSize);
-                                WriteWithProfiler($"reshard({VisitBuffer(args[0], local: false).Name}, {VisitBuffer(args[1], local: false).Name});\n");
-                            }
+                            (var maxSize, _) = TensorUtilities.GetTensorMaxSizeAndStrides(args[0].CheckedTensorType);
+                            CollectivePoolSize = Math.Max(CollectivePoolSize, (ulong)maxSize);
+                            WriteWithProfiler($"reshard({VisitBuffer(args[0], local: false).Name}, {VisitBuffer(args[1], local: false).Name});\n");
                         }
                     }
 
@@ -766,11 +762,17 @@ internal sealed class KernelCSourceConvertVisitor : CSourceConvertVisitor, IDisp
                 case TIR.NTT.UpdatePagedAttentionKVCache updatePagedAttentionKVCache:
                     WriteIndWithProfiler($"update_paged_attention_kv_cache<caching::attention_cache_kind::{updatePagedAttentionKVCache.CacheKind.ToString().ToLower(System.Globalization.CultureInfo.CurrentCulture)}>({VisitBuffer(args[0], local: false).Name}, {VisitBuffer(args[1], local: true).Name}, {Visit(args[2]).Name}, {updatePagedAttentionKVCache.Layout.ToC()});\n");
                     break;
+                case TIR.NTT.QKVRoPEWithCache qkvRoPEWithCache:
+                    WriteIndWithProfiler($"qkv_rope_with_cache<{qkvRoPEWithCache.QUseMean.ToString().ToLowerInvariant()}, {qkvRoPEWithCache.KUseMean.ToString().ToLowerInvariant()}>({VisitBuffer(args[0], local: false).Name}, {VisitBuffer(args[1], local: false).Name}, {VisitBuffer(args[2], local: false).Name}, {VisitBuffer(args[3], local: false).Name}, {VisitBuffer(args[4], local: false).Name}, {VisitBuffer(args[5], local: false).Name}, {VisitBuffer(args[6], local: false).Name}, {VisitBuffer(args[7], local: false).Name}, {VisitBuffer(args[8], local: false).Name}, {VisitBuffer(args[9], local: true).Name}, {Visit(args[10]).Name}, {VisitBuffer(args[11], local: false).Name}, {qkvRoPEWithCache.QEpsilon}f, {qkvRoPEWithCache.KEpsilon}f, {qkvRoPEWithCache.QKVLayout.ToC()}, {qkvRoPEWithCache.AttentionLayout.ToC()});\n");
+                    break;
                 case TIR.NTT.GatherPagedAttentionKVCache gakv:
                     IndentScope.Writer.IndWrite($"gather_paged_attention_kv_cache({VisitBuffer(args[0], local: false).Name}, {VisitBuffer(args[1], local: true).Name}, {VisitBuffer(args[2], local: true).Name});\n");
                     break;
                 case TIR.NTT.PagedAttention pagedAttention:
-                    WriteIndWithProfiler($"paged_attention({VisitBuffer(args[0], local: false).Name}, {VisitBuffer(args[1], local: true).Name}, {VisitBuffer(args[2], local: true).Name}, {VisitBuffer(args[3], local: true).Name}, {Visit(args[4]).Name}, {VisitBuffer(args[5], local: true).Name}, {pagedAttention.Layout.ToC()});\n");
+                    var outputGate = args[5] is None
+                        ? "nullptr"
+                        : VisitBuffer(args[5], local: true).Name;
+                    WriteIndWithProfiler($"paged_attention({VisitBuffer(args[0], local: false).Name}, {VisitBuffer(args[1], local: true).Name}, {VisitBuffer(args[2], local: true).Name}, {VisitBuffer(args[3], local: true).Name}, {Visit(args[4]).Name}, {outputGate}, {VisitBuffer(args[6], local: true).Name}, {pagedAttention.Layout.ToC()});\n");
                     break;
                 case TIR.NTT.SynchronizeThreads:
                     WriteIndWithProfiler($"ntt::distributed::topology_synchronize<ntt::distributed::topology::block>();\n");
@@ -821,7 +823,15 @@ internal sealed class KernelCSourceConvertVisitor : CSourceConvertVisitor, IDisp
         }
         else if (expr.Target is PrimFunction deviceFunc)
         {
-            foreach (var item in expr.Arguments.ToArray().OfType<TIR.Buffer>())
+            var parameters = deviceFunc.Parameters.ToArray();
+            var arguments = expr.Arguments.ToArray();
+            if (parameters.Length != arguments.Length)
+            {
+                throw new InvalidOperationException(
+                    $"NTT call to {deviceFunc.Name} expects {parameters.Length} arguments, got {arguments.Length}.");
+            }
+
+            foreach (var item in arguments.OfType<TIR.Buffer>())
             {
                 Visit(item);
             }
@@ -829,8 +839,22 @@ internal sealed class KernelCSourceConvertVisitor : CSourceConvertVisitor, IDisp
             IndentScope.Writer.IndWrite($"runtime_util->printf(\"call {deviceFunc.Name} bid %d tid %d\\n\", bid, tid);\n");
 #endif
             var argumentNames = new List<string>();
-            foreach (var arg in expr.Arguments)
+            var workspaceArguments = new Dictionary<MemoryLocation, BaseExpr>();
+            for (int i = 0; i < parameters.Length; i++)
             {
+                var parameter = parameters[i];
+                var arg = arguments[i];
+                if (parameter is BufferVar { Role: BufferVarRole.Workspace } workspace)
+                {
+                    if (!workspaceArguments.TryAdd(workspace.Location, arg))
+                    {
+                        throw new InvalidOperationException(
+                            $"NTT call to {deviceFunc.Name} has duplicate {workspace.Location} workspace arguments.");
+                    }
+
+                    continue;
+                }
+
                 if (arg is TIR.Buffer b)
                 {
                     var buffer = VisitBuffer(b, local: true);
@@ -841,6 +865,13 @@ internal sealed class KernelCSourceConvertVisitor : CSourceConvertVisitor, IDisp
                     argumentNames.Add(Visit(arg).Name);
                 }
             }
+
+            argumentNames.Add("rdata");
+            argumentNames.Add("block_local_rdata");
+            argumentNames.Add(GetWorkspacePointer(deviceFunc, workspaceArguments, MemoryLocation.Data));
+            argumentNames.Add(GetWorkspacePointer(deviceFunc, workspaceArguments, MemoryLocation.BlockLocalData));
+            argumentNames.Add("output");
+            argumentNames.Add("nullptr");
 
             _refFuncs.Add(deviceFunc);
             WriteIndWithProfiler($"{deviceFunc.Name}({string.Join(", ", argumentNames)});\n");
@@ -1011,15 +1042,57 @@ internal sealed class KernelCSourceConvertVisitor : CSourceConvertVisitor, IDisp
             return symbol;
         }
 
-        var values = expr.Values.AsValueEnumerable().Select(Visit).ToArray();
-        for (int i = 0; i < values.Length; i++)
+        var returnValues = expr.Values.ToArray();
+        if (returnValues.Length == 0)
         {
-            var value = values[i];
-            var rank = expr.Values[i].CheckedShape.Rank;
-            IndentScope.Writer.IndWrite($"output_descs[{i}].data = (std::byte *){value.Name}.elements().data();\n");
-            IndentScope.Writer.IndWrite($"output_descs[{i}].size = {value.Name}.size() * sizeof({expr.Values[i].CheckedDataType.ToC()});\n");
-            IndentScope.Writer.IndWrite($"{value.Name}.shape().copy_to(output_descs[{i}].shape);\n");
-            IndentScope.Writer.IndWrite($"{value.Name}.strides().copy_to(output_descs[{i}].strides);\n");
+            symbol = new(string.Empty, string.Empty);
+            _exprMemo.Add(expr, symbol);
+            return symbol;
+        }
+
+        var outputParameters = VisitEntry.GetAbiView().OutputParameters;
+        var resultStorages = returnValues
+            .Select((value, resultIndex) => PrimFunctionAbi.GetResultStorage(VisitEntry, resultIndex, value))
+            .ToArray();
+        if (outputParameters.Count > 0)
+        {
+            IndentScope.Writer.IndWrite("if (output_descs != nullptr) {\n");
+        }
+
+        IndentScope? outputDescriptorScope = outputParameters.Count > 0 ? new IndentScope() : null;
+        for (int outputIndex = 0; outputIndex < outputParameters.Count; outputIndex++)
+        {
+            var outputParameter = outputParameters[outputIndex];
+            var matchingResultIndexes = resultStorages
+                .Select((storage, resultIndex) => (Storage: storage, ResultIndex: resultIndex))
+                .Where(binding => ReferenceEquals(binding.Storage, outputParameter))
+                .Select(binding => binding.ResultIndex)
+                .ToArray();
+            if (matchingResultIndexes.Length != 1)
+            {
+                throw new InvalidOperationException(
+                    $"NTT PrimFunction {VisitEntry.Name} Return must bind output parameter {outputParameter.Name} exactly once, " +
+                    $"but found {matchingResultIndexes.Length} bindings.");
+            }
+
+            var resultValue = returnValues[matchingResultIndexes[0]];
+            var value = Visit(resultValue);
+            var rank = resultValue.CheckedShape.Rank;
+            var physicalValue = resultValue is TIR.Buffer { DistributedType: not null } ||
+                resultValue.CheckedType is DistributedType
+                ? $"{value.Name}.local()"
+                : value.Name;
+            IndentScope.Writer.IndWrite($"output_descs[{outputIndex}].data = (std::byte *){physicalValue}.elements().data();\n");
+            IndentScope.Writer.IndWrite($"output_descs[{outputIndex}].size = {physicalValue}.size() * sizeof(*{physicalValue}.elements().data());\n");
+            IndentScope.Writer.IndWrite($"{value.Name}.shape().copy_to(output_descs[{outputIndex}].shape);\n");
+            IndentScope.Writer.IndWrite($"{physicalValue}.strides().copy_to(output_descs[{outputIndex}].strides);\n");
+            IndentScope.Writer.IndWrite($"output_descs[{outputIndex}].rank = {rank};\n");
+        }
+
+        outputDescriptorScope?.Dispose();
+        if (outputParameters.Count > 0)
+        {
+            IndentScope.Writer.IndWrite("}\n");
         }
 
         symbol = new(string.Empty, string.Empty);
@@ -1079,14 +1152,6 @@ internal sealed class KernelCSourceConvertVisitor : CSourceConvertVisitor, IDisp
         return $"{VisitBuffer(expr, local: true).Name}()";
     }
 
-    private static void ValidateQKVParallelLinearScales(IReadOnlyList<BaseExpr> args)
-    {
-        if (args.Count < 16 || args.Skip(7).Take(6).Any(arg => arg is not None))
-        {
-            throw new NotSupportedException("NTT QKVParallelLinear codegen currently supports only None input/weight scales.");
-        }
-    }
-
     private static void ValidateMatMulGluScales(IReadOnlyList<BaseExpr> args)
     {
         if (args.Count < 10 || args.Skip(5).Take(4).Any(arg => arg is not None))
@@ -1103,9 +1168,11 @@ internal sealed class KernelCSourceConvertVisitor : CSourceConvertVisitor, IDisp
             if (buffer.MemSpan.Buffer.Start is not None)
             {
                 // If the buffer has a start, we create a tensor view
-                var isReadOnly = buffer.MemSpan.Buffer.Location is MemoryLocation.Rdata or MemoryLocation.ChipLocalRdata or MemoryLocation.BlockLocalRdata ||
-                    (buffer.MemSpan.Buffer.Location == MemoryLocation.Input && buffer.MemSpan.Buffer.Start is not BufferVar { Role: BufferVarRole.InOut });
-                var dtypeStr = isReadOnly ? $"const {buffer.ElemType.ToC()}" : buffer.ElemType.ToC();
+                var isReadOnly = buffer.ElemType is not ReferenceType &&
+                    (buffer.MemSpan.Buffer.Location is MemoryLocation.Rdata or MemoryLocation.ChipLocalRdata or MemoryLocation.BlockLocalRdata ||
+                     (buffer.MemSpan.Buffer.Location == MemoryLocation.Input && buffer.MemSpan.Buffer.Start is not BufferVar { Role: BufferVarRole.InOut }));
+                var elementType = GetBufferElementType(buffer);
+                var dtypeStr = isReadOnly ? $"const {elementType}" : elementType;
                 var dimensions = buffer.DistributedType is null ? buffer.Dimensions : ((RankedShape)buffer.DistributedType.TensorType.Shape).Dimensions;
                 var spanStr = $"span_cast<{dtypeStr}>({Visit(buffer.MemSpan).Name})";
                 var dimensionValues = dimensions.AsValueEnumerable().Select(x => Visit(x).Name);
@@ -1113,7 +1180,15 @@ internal sealed class KernelCSourceConvertVisitor : CSourceConvertVisitor, IDisp
 
                 if (buffer.DistributedType is DistributedType distributedType)
                 {
-                    IndentScope.Writer.IndWrite($"= make_sharded_tensor_view({spanStr}, make_shape({StringUtility.Join(", ", dimensionValues)}), {KernelUtility.ShardingToC(distributedType)}, make_strides({StringUtility.Join(", ", strideValues)}))");
+                    var viewArguments = buffer.MemSpan.Buffer.Location switch
+                    {
+                        MemoryLocation.Rdata or MemoryLocation.ChipLocalRdata
+                            => $"make_sharded_tensor_view_from_global_buffer({spanStr}",
+                        MemoryLocation.Input or MemoryLocation.Output
+                            => $"make_sharded_tensor_view_from_address({spanStr}.data()",
+                        _ => $"make_sharded_tensor_view({spanStr}",
+                    };
+                    IndentScope.Writer.IndWrite($"= {viewArguments}, make_shape({StringUtility.Join(", ", dimensionValues)}), {KernelUtility.ShardingToC(distributedType)}, make_strides({StringUtility.Join(", ", strideValues)}))");
                 }
                 else
                 {
@@ -1123,5 +1198,65 @@ internal sealed class KernelCSourceConvertVisitor : CSourceConvertVisitor, IDisp
 
             IndentScope.Writer.Write($";\n");
         }
+    }
+
+    private string AllocateLocalName(string preferredName)
+    {
+        if (_localNames.Add(preferredName))
+        {
+            return preferredName;
+        }
+
+        var suffix = _localNameSuffixes.TryGetValue(preferredName, out var nextSuffix)
+            ? nextSuffix
+            : 1;
+        string candidate;
+        do
+        {
+            candidate = $"{preferredName}_{suffix}";
+            suffix++;
+        }
+        while (!_localNames.Add(candidate));
+
+        _localNameSuffixes[preferredName] = suffix;
+        return candidate;
+    }
+
+    private string GetBufferElementType(TIR.Buffer buffer)
+    {
+        if (buffer.ElemType is not ReferenceType)
+        {
+            return buffer.ElemType.ToC();
+        }
+
+        if (buffer.MemSpan.Buffer.Start is not IVar parameter)
+        {
+            throw new InvalidOperationException(
+                $"NTT reference buffer {buffer.Name} must be backed by a runtime ABI parameter.");
+        }
+
+        var parameterIndex = Array.IndexOf(TensorParams, parameter);
+        if (parameterIndex < 0)
+        {
+            throw new InvalidOperationException(
+                $"NTT reference buffer {buffer.Name} backing parameter {parameter.Name} is not in the runtime ABI.");
+        }
+
+        return $"typename std::remove_cvref_t<T{parameterIndex}>::element_type";
+    }
+
+    private string GetWorkspacePointer(
+        PrimFunction callee,
+        IReadOnlyDictionary<MemoryLocation, BaseExpr> workspaceArguments,
+        MemoryLocation location)
+    {
+        if (!workspaceArguments.TryGetValue(location, out var argument) || argument is not TIR.Buffer buffer)
+        {
+            throw new InvalidOperationException(
+                $"NTT call to {callee.Name} requires a bufferized {location} workspace argument.");
+        }
+
+        var view = VisitBuffer(buffer, local: true);
+        return $"reinterpret_cast<std::byte *>({view.Name}.elements().data())";
     }
 }

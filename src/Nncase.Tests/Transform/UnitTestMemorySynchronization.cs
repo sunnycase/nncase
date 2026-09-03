@@ -159,6 +159,7 @@ public sealed class UnitTestMemorySynchronization : TestClassBase
             maxState,
             sumState,
             accState,
+            None.Default,
             layout,
             2048,
             DataTypes.BFloat16,
@@ -1264,6 +1265,7 @@ public sealed class UnitTestMemorySynchronization : TestClassBase
             data,
             data,
             0,
+            None.Default,
             data,
             new[] { AttentionDimKind.Seq, AttentionDimKind.Head, AttentionDimKind.Dim },
             4);
@@ -1372,6 +1374,7 @@ public sealed class UnitTestMemorySynchronization : TestClassBase
             layer1Data,
             layer1Data,
             layer1,
+            None.Default,
             layer1Data,
             new[] { AttentionDimKind.Seq, AttentionDimKind.Head, AttentionDimKind.Dim },
             4);

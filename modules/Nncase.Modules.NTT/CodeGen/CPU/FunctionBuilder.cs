@@ -6,8 +6,10 @@ using System.Threading.Tasks;
 using NetFabric.Hyperlinq;
 using Nncase.CodeGen.NTT;
 using Nncase.IR;
+using Nncase.IR.Affine;
 using Nncase.IR.Shapes;
 using Nncase.Targets;
+using Nncase.TIR;
 using Nncase.Utilities;
 
 namespace Nncase.CodeGen.NTT;
@@ -49,46 +51,38 @@ internal class FunctionBuilder
     {
         if (baseFunc is TIR.PrimFunction primFunc)
         {
-            if (primFunc.Role != FunctionRole.ScheduledRegion)
+            ValidateDirectTirContract(primFunc);
+
+            // 1. write the rdata
+            SerializeGlobalRdata(primFunc.SchedResult.Rdatas, 0, "rdata");
+            SerializeGlobalRdata(primFunc.SchedResult.ChipLocalRdatas, _chipLocalRdataBase, "chip-local rdata");
+
+            // 2. write the local rdatas
+            var blockLocalRdataPoolSize = SerializeLocalRdata(primFunc.SchedResult.BlockLocalRdatas, _blockLocalRdataWriters, "b");
+
+            // 3. build function.
+            var visitor = new KernelCSourceConvertVisitor(TargetOptions, _chipLocalRdataBase);
+            visitor.Visit(primFunc);
+            var functionCSource = visitor.GetCSource();
+
+            // 4. write the kernel desc
+            using (var writer = _sectionManager.GetWriter(LinkableKernelFunction.KernelHeaderSectionName))
             {
-                // 1. write the rdata
-                SerializeGlobalRdata(primFunc.SchedResult.Rdatas, 0, "rdata");
-                SerializeGlobalRdata(primFunc.SchedResult.ChipLocalRdatas, _chipLocalRdataBase, "chip-local rdata");
-
-                // 2. write the local rdatas
-                var blockLocalRdataPoolSize = SerializeLocalRdata(primFunc.SchedResult.BlockLocalRdatas, _blockLocalRdataWriters, "b");
-
-                // 3. build function.
-                var visitor = new KernelCSourceConvertVisitor(TargetOptions, _chipLocalRdataBase);
-                visitor.Visit(primFunc);
-                var functionCSource = visitor.GetCSource();
-
-                // 4. write the kernel desc
-                using (var writer = _sectionManager.GetWriter(LinkableKernelFunction.KernelHeaderSectionName))
-                {
-                    var entryAbi = KernelEntryAbiLayout.Create(primFunc);
-                    var header = default(KernelDescHeader);
-                    header.OutputAlign = checked((uint)entryAbi.OutputAlignment);
-                    header.LocalDataAlign = (uint)primFunc.SchedResult.DataAlign;
-                    header.OutputPoolSize = entryAbi.OutputPoolSize;
-                    header.LocalDataPoolSize = primFunc.SchedResult.DataUsage;
-                    header.BlockLocalDataPoolSize = primFunc.SchedResult.BlockLocalDataPoolSize;
-                    writer.Write(ref header);
-                }
-
-                var memoryPoolDesc = new KernelMemoryPoolDesc(
-                    _mergedRdataPoolSize,
-                    blockLocalRdataPoolSize);
-                var kernelDescSection = new LinkedSection(_sectionManager.GetContent(LinkableKernelFunction.KernelHeaderSectionName)!, ".desc", 0, 8, (uint)sizeof(KernelDescHeader));
-                return new LinkableKernelFunction(_id, primFunc, functionCSource, memoryPoolDesc, _sectionManager.GetContent(WellknownSectionNames.Text)!, kernelDescSection);
+                var entryAbi = KernelEntryAbiLayout.Create(primFunc);
+                var header = default(KernelDescHeader);
+                header.OutputAlign = checked((uint)entryAbi.OutputAlignment);
+                header.LocalDataAlign = (uint)primFunc.SchedResult.DataAlign;
+                header.OutputPoolSize = entryAbi.OutputPoolSize;
+                header.LocalDataPoolSize = primFunc.SchedResult.DataUsage;
+                header.BlockLocalDataPoolSize = primFunc.SchedResult.BlockLocalDataPoolSize;
+                writer.Write(ref header);
             }
-            else
-            {
-                var visitor = new DeviceCSourceConvertVisitor(TargetOptions);
-                visitor.Visit(primFunc);
-                var header = visitor.GetHeader();
-                return new LinkableDeviceFunction(_id, primFunc, header, _sectionManager.GetContent(WellknownSectionNames.Text)!);
-            }
+
+            var memoryPoolDesc = new KernelMemoryPoolDesc(
+                _mergedRdataPoolSize,
+                blockLocalRdataPoolSize);
+            var kernelDescSection = new LinkedSection(_sectionManager.GetContent(LinkableKernelFunction.KernelHeaderSectionName)!, ".desc", 0, 8, (uint)sizeof(KernelDescHeader));
+            return new LinkableKernelFunction(_id, primFunc, functionCSource, memoryPoolDesc, _sectionManager.GetContent(WellknownSectionNames.Text)!, kernelDescSection);
         }
         else if (baseFunc is Fusion fusion)
         {
@@ -99,6 +93,40 @@ internal class FunctionBuilder
         }
 
         throw new NotSupportedException($"the {baseFunc.GetType()} {baseFunc.Name} is notsupport for codegen!");
+    }
+
+    private static void ValidateDirectTirContract(TIR.PrimFunction function)
+    {
+        if (function.Role == FunctionRole.ScheduledRegion)
+        {
+            throw new NotSupportedException(
+                $"NTT does not accept AutoTiling ScheduledRegion PrimFunction {function.Name}. " +
+                "NTT kernels own block-local tiling and SIMD scheduling.");
+        }
+
+        foreach (var expr in ExprCollector.Collect(function.Body))
+        {
+            var scheduledConstruct = expr switch
+            {
+                Grid => "Affine Grid",
+                PipelineFor => "PipelineFor",
+                TIR.For => "For",
+                Call { Target: TileLoad } => "TileLoad",
+                Call { Target: TileStore } => "TileStore",
+                Call call when call.Metadata.BlockMicroKernel is not null => "block microkernel metadata",
+                TIR.Buffer buffer when buffer.MemSpan.Buffer.Location is MemoryLocation.Cache or MemoryLocation.Shared or MemoryLocation.Register
+                    => $"compiler-managed {buffer.MemSpan.Buffer.Location} buffer {buffer.Name}",
+                TIR.Buffer buffer when buffer.StorageEncoding is not null
+                    => $"storage-encoded buffer {buffer.Name}",
+                _ => null,
+            };
+            if (scheduledConstruct is not null)
+            {
+                throw new NotSupportedException(
+                    $"NTT direct PrimFunction {function.Name} contains {scheduledConstruct}. " +
+                    "Block-local loops, staging, tiling, and vector scheduling belong in the handwritten NTT kernel.");
+            }
+        }
     }
 
     private void SerializeGlobalRdata(

@@ -11,6 +11,7 @@ using DryIoc;
 using Nncase.Evaluator;
 using Nncase.Evaluator.Buffers;
 using Nncase.Evaluator.Distributed;
+using Nncase.Evaluator.Heterogeneous;
 using Nncase.Evaluator.Imaging;
 using Nncase.Evaluator.Math;
 using Nncase.Evaluator.NN;
@@ -37,6 +38,7 @@ public static class EvaluatorApplicationPart
         return registrator.RegisterModule<EvaluatorModule>()
             .RegisterModule<BufferModule>()
             .RegisterModule<DistributedModule>()
+            .RegisterModule<HeterogeneousModule>()
             .RegisterModule<ImagingModule>()
             .RegisterModule<MathModule>()
             .RegisterModule<NNModule>()

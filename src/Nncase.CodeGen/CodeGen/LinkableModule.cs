@@ -23,6 +23,12 @@ public abstract class LinkableModule : ILinkableModule
 
     public SectionManager SectionManager { get; }
 
+    public string ModuleKind => PublicFunctions.Count > 0
+        ? PublicFunctions[0].SourceFunction.ModuleKind
+        : throw new InvalidOperationException("A linkable module must contain at least one public function.");
+
+    public IReadOnlySet<string> DependencyModuleKinds { get; } = new HashSet<string>(StringComparer.Ordinal);
+
     public IReadOnlyList<ILinkableFunction> PublicFunctions => _functions;
 
     public ILinkedModule Link(ILinkContext linkContext)

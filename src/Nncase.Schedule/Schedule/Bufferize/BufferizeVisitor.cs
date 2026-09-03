@@ -55,13 +55,17 @@ public sealed class BufferizeVisitor : ExprRewriter
         if (!func.SchedResult.IsScheduled)
         {
             (var buffers, var lifetimes) = new LifetimeCollector().Collect(func);
-            var scheduleResult = BufferScheduler.Schedule(lifetimes, x => x switch
-            {
-                MemoryLocation.Rdata => new BufferScheduleOptions(_currentRdataStart),
-                MemoryLocation.ChipLocalRdata => new BufferScheduleOptions(_currentChipLocalRdataStart),
-                MemoryLocation.BlockLocalRdata => new BufferScheduleOptions(_currentBlockLocalRdataStart),
-                _ => new BufferScheduleOptions(),
-            });
+            var scheduleResult = BufferScheduler.Schedule(
+                lifetimes,
+                location => new BufferScheduleOptions(
+                    location switch
+                    {
+                        MemoryLocation.Rdata => _currentRdataStart,
+                        MemoryLocation.ChipLocalRdata => _currentChipLocalRdataStart,
+                        MemoryLocation.BlockLocalRdata => _currentBlockLocalRdataStart,
+                        _ => 0,
+                    },
+                    GetMinimumAllocationAlignment(location)));
             ReuseReadOnlyRDataResult(scheduleResult, MemoryLocation.Rdata, _rdataRanges);
             ReuseReadOnlyRDataResult(scheduleResult, MemoryLocation.ChipLocalRdata, _chipLocalRdataRanges);
 
@@ -86,6 +90,45 @@ public sealed class BufferizeVisitor : ExprRewriter
         }
 
         return func;
+    }
+
+    private int GetMinimumAllocationAlignment(MemoryLocation location)
+    {
+        if (_targetMachine is null)
+        {
+            return 1;
+        }
+
+        var memorySpace = location switch
+        {
+            MemoryLocation.Data or
+            MemoryLocation.Shared or
+            MemoryLocation.BlockLocalData => null,
+            MemoryLocation.BlockLocalRdata => GetBoundMemorySpace(MemoryLocation.BlockLocalData),
+            MemoryLocation.Output or
+            MemoryLocation.Rdata or
+            MemoryLocation.ChipLocalData or
+            MemoryLocation.ChipLocalRdata => _targetMachine.GetMemorySpace(_targetMachine.RootMemorySpace),
+            _ => throw new NotSupportedException(
+                $"Target allocation alignment is not defined for TIR memory location {location}."),
+        };
+        return memorySpace is null
+            ? 1
+            : _targetMachine.GetMemoryResource(memorySpace).AllocationGranularityBytes;
+    }
+
+    private TargetMemorySpaceSpec GetBoundMemorySpace(MemoryLocation location)
+    {
+        var memorySpaces = _targetMachine!.MemorySpaces.Values
+            .Where(space => space.TIRBinding?.Location == location)
+            .ToArray();
+        return memorySpaces.Length switch
+        {
+            1 => memorySpaces[0],
+            _ => throw new InvalidOperationException(
+                $"Target {_targetMachine.Id} must define exactly one memory space for TIR location {location}, " +
+                $"got {memorySpaces.Length}."),
+        };
     }
 
     protected override BaseExpr RewriteLeafCall(Call expr)

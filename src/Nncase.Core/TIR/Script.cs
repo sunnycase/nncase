@@ -77,6 +77,16 @@ public static class T
         return new Call(new TileStore(), src, dest);
     }
 
+    public static Call ChannelProduce(Expr channel, Expr value, string channelId, int phase)
+    {
+        return new Call(new ChannelProduce(channelId, phase), channel, value);
+    }
+
+    public static Call ChannelConsume(Expr channel, Expr destination, string channelId, int phase)
+    {
+        return new Call(new ChannelConsume(channelId, phase), channel, destination);
+    }
+
     /// <summary>
     /// Store value to the buffer.
     /// Equivalent to ((DType*)buffer_var)[index] = value.
@@ -436,6 +446,9 @@ public static class T
             source.MemSpan.Buffer,
             (source.MemSpan.Start + byteOffset).Simplify(),
             byteSize);
+        var distributedStorageKind = distributedType is null
+            ? DistributedBufferStorageKind.CompactLocal
+            : source.DistributedStorageKind;
         return new Buffer(
             name,
             elemType,
@@ -444,7 +457,7 @@ public static class T
             strides.ToArray(),
             distributedType,
             source.StorageEncoding,
-            distributedStorageKind: source.DistributedStorageKind);
+            distributedStorageKind: distributedStorageKind);
     }
 
     /// <summary>

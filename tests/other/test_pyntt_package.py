@@ -123,11 +123,12 @@ def test_pyntt_grid_barrier_axis_groups_match_current_flagtree_api():
         Path(__file__).resolve().parents[2]
         / "pyntt/pyntt/codegen/templates/triton/module.py.jinja"
     ).read_text(encoding="utf-8")
-    assert ".axis_group({{ pyrepr(group.axis_names) }})" in template
-    assert "group_shape" not in template
+    assert "_PYNTT_GRID_MESH_VALUE.axis_group(" in template
+    assert "{{ pyrepr(group.axis_names) }}" in template
+    assert "group_shape={{ pyrepr(group.shape) }}" in template
 
 
-def test_pyntt_grid_barrier_axis_groups_reject_sub_axis_groups():
+def test_pyntt_grid_barrier_axis_groups_preserve_sub_axis_group_shape():
     _add_pyntt_to_path()
     from pyntt.codegen.render import _grid_barrier_axis_groups
 
@@ -153,8 +154,13 @@ def test_pyntt_grid_barrier_axis_groups_reject_sub_axis_groups():
         ],
     }
 
-    with pytest.raises(ValueError, match="does not support sub-axis groups"):
-        _grid_barrier_axis_groups(manifest, topology)
+    assert _grid_barrier_axis_groups(manifest, topology) == (
+        {
+            "key": "0x4",
+            "axis_names": ("block_y",),
+            "shape": (4,),
+        },
+    )
 
 
 def test_pyntt_target_options_do_not_expose_removed_pipeline_policy():
@@ -261,6 +267,42 @@ def test_pyntt_elementwise_iteration_uses_explicit_physical_tile_width():
     assert "zero_coord" not in template
     assert "raw_coord" not in template
     assert "raw_lane_coord" not in template
+
+
+def test_pyntt_slice_preserves_vector_lane_coordinates():
+    _add_pyntt_to_path()
+    from pyntt.codegen.render import _slice_template_context
+
+    context = _slice_template_context(
+        {
+            "InputShape": [1, 4, 2, 32],
+            "OutputShape": [1, 4, 1, 32],
+            "InputStrides": [0, 64, 32, 1],
+            "OutputStrides": [0, 32, 0, 1],
+            "InputVectorLaneShape": [8],
+            "OutputVectorLaneShape": [8],
+            "Starts": [0, 0, 0, 0],
+            "Strides": [1, 1, 1, 1],
+        }
+    )
+
+    assert context["lane_count"] == 8
+    assert context["tile_shape"] == "((block_size // 8), 8)"
+    assert context["tensor_coordinates"] == (
+        "index0",
+        "index1",
+        "index2",
+        "major_raw",
+    )
+    assert context["lane_coordinates"] == ("lane_raw0",)
+    assert "(index1) * (64)" in context["input_access"]["ScalarOffset"]
+    assert context["input_access"]["ScalarOffset"].endswith(
+        "major_raw) * 8 + lane_raw0"
+    )
+    assert "(index1) * (32)" in context["output_access"]["ScalarOffset"]
+    assert context["output_access"]["ScalarOffset"].endswith(
+        "major_raw) * 8 + lane_raw0"
+    )
 
 
 def test_pyntt_inline_norm_reduction_caps_its_physical_tile_to_the_extent():
@@ -453,8 +495,13 @@ def test_pyntt_runtime_validates_torch_inputs_and_reuses_storage(tmp_path):
 
     rdata_path = tmp_path / "rdata.bin"
     rdata_path.write_bytes(bytes([1, 2, 3]))
-    rdata = materialize_rdata((x,), f"file:{rdata_path}", 3)
-    rdata_again = materialize_rdata((x,), f"file:{rdata_path}", 3)
+    rdata_spec = {
+        "source": f"file:{rdata_path}",
+        "source_offset_bytes": 0,
+        "bytes": 3,
+    }
+    rdata = materialize_rdata((x,), rdata_spec, 3)
+    rdata_again = materialize_rdata((x,), rdata_spec, 3)
     assert rdata.dtype == torch.uint8
     assert rdata.tolist() == [1, 2, 3]
     assert rdata_again.data_ptr() == rdata.data_ptr()
@@ -462,11 +509,107 @@ def test_pyntt_runtime_validates_torch_inputs_and_reuses_storage(tmp_path):
     table_paths = [tmp_path / f"rdata_table_{index}.bin" for index in range(2)]
     for index, path in enumerate(table_paths, start=1):
         path.write_bytes(bytes([index]))
-    sources = tuple(f"file:{path}" for path in table_paths)
+    sources = tuple(
+        {
+            "source": f"file:{path}",
+            "source_offset_bytes": 0,
+            "bytes": 1,
+        }
+        for path in table_paths
+    )
     rdata_table = materialize_rdata_table((x,), sources, 1)
     rdata_table_again = materialize_rdata_table((x,), sources, 1)
     assert rdata_table.tolist() == [1, 2]
     assert rdata_table_again.data_ptr() == rdata_table.data_ptr()
+
+    sliced_path = tmp_path / "sliced_rdata.bin"
+    sliced_path.write_bytes(bytes([10, 11, 12, 13, 20, 21, 22, 23]))
+    sliced_specs = tuple(
+        {
+            "source": f"file:{sliced_path}",
+            "source_offset_bytes": index * 4,
+            "bytes": 4,
+        }
+        for index in range(2)
+    )
+    sliced0 = materialize_rdata((x,), sliced_specs[0], 4)
+    sliced1 = materialize_rdata((x,), sliced_specs[1], 4)
+    assert sliced0.tolist() == [10, 11, 12, 13]
+    assert sliced1.tolist() == [20, 21, 22, 23]
+    assert sliced0.data_ptr() != sliced1.data_ptr()
+    assert materialize_rdata((x,), sliced_specs[0], 4).data_ptr() == sliced0.data_ptr()
+
+
+def test_pyntt_runtime_validates_object_tensor_fields_in_one_batch():
+    torch = pytest.importorskip("torch")
+    _add_pyntt_to_path()
+
+    from pyntt.runtime.errors import PyNTTArgumentError
+    from pyntt.runtime.tensor import require_object_tensor_fields
+
+    state = {
+        "pyntt_object_kind": "state",
+        "first": torch.zeros((2,), dtype=torch.float32),
+        "second": torch.zeros((2, 3), dtype=torch.int32),
+    }
+    fields = (
+        ("first", "float32", (2,)),
+        ("second", "int32", (2, 3)),
+    )
+
+    assert require_object_tensor_fields(
+        state, "state", "cpu", fields=fields
+    ) == (state["first"], state["second"])
+
+    state["second"] = torch.zeros((3, 2), dtype=torch.int32)
+    with pytest.raises(PyNTTArgumentError, match="second.*must have shape"):
+        require_object_tensor_fields(state, "state", "cpu", fields=fields)
+
+
+def test_pyntt_runtime_validates_kv_metadata_fields_in_one_batch():
+    torch = pytest.importorskip("torch")
+    _add_pyntt_to_path()
+
+    from pyntt.runtime.errors import PyNTTArgumentError
+    from pyntt.runtime.tensor import require_kv_cache_tensor_fields
+
+    class KVCache:
+        def __init__(self):
+            self.accesses = {"query_start_loc": 0, "seq_lens": 0}
+            self._query_start_loc = torch.tensor([0, 1], dtype=torch.int32)
+            self._seq_lens = torch.tensor([1], dtype=torch.int32)
+
+        @property
+        def query_start_loc(self):
+            self.accesses["query_start_loc"] += 1
+            return self._query_start_loc
+
+        @property
+        def seq_lens(self):
+            self.accesses["seq_lens"] += 1
+            return self._seq_lens
+
+    cache = KVCache()
+    query_start_loc, seq_lens, num_seqs = require_kv_cache_tensor_fields(
+        cache,
+        "cpu",
+        fields=(("query_start_loc", "int32"), ("seq_lens", "int32")),
+        include_num_seqs=True,
+    )
+
+    assert query_start_loc is cache._query_start_loc
+    assert seq_lens is cache._seq_lens
+    assert num_seqs == 1
+    assert cache.accesses == {"query_start_loc": 1, "seq_lens": 1}
+
+    cache._seq_lens = cache._seq_lens.to(torch.int64)
+    with pytest.raises(PyNTTArgumentError, match="seq_lens.*dtype"):
+        require_kv_cache_tensor_fields(
+            cache,
+            "cpu",
+            fields=(("query_start_loc", "int32"), ("seq_lens", "int32")),
+            include_num_seqs=True,
+        )
 
 
 def test_pyntt_runtime_uses_authoritative_kv_cache_capacity_without_scanning():
@@ -537,12 +680,25 @@ def test_pyntt_runtime_uses_authoritative_kv_cache_capacity_without_scanning():
         )
 
 
-def test_pyntt_runtime_reuses_bounded_host_tensor_descriptors():
+def test_pyntt_runtime_reuses_bounded_host_tensor_descriptors(monkeypatch):
     torch = pytest.importorskip("torch")
     pytest.importorskip("triton.tools.tensor_descriptor")
     _add_pyntt_to_path()
 
+    import pyntt.runtime.triton as triton_runtime
     from pyntt.runtime.triton import TritonTensorDescriptorCache
+
+    original_view_typed_buffer = triton_runtime.view_typed_buffer
+    view_calls = 0
+
+    def counted_view_typed_buffer(*args, **kwargs):
+        nonlocal view_calls
+        view_calls += 1
+        return original_view_typed_buffer(*args, **kwargs)
+
+    monkeypatch.setattr(
+        triton_runtime, "view_typed_buffer", counted_view_typed_buffer
+    )
 
     cache = TritonTensorDescriptorCache()
     spec = {
@@ -561,12 +717,14 @@ def test_pyntt_runtime_reuses_bounded_host_tensor_descriptors():
     first = cache.materialize_many("kernel", (spec,), {"rdata": storage})[0]
     second = cache.materialize_many("kernel", (spec,), {"rdata": storage})[0]
     assert second is first
+    assert view_calls == 1
 
     replacement_storage = torch.empty_like(storage)
     replacement = cache.materialize_many(
         "kernel", (spec,), {"rdata": replacement_storage}
     )[0]
     assert replacement is not first
+    assert view_calls == 2
 
 
 def test_pyntt_runtime_reuses_per_owner_tensor_map_tables():
@@ -580,7 +738,8 @@ def test_pyntt_runtime_reuses_per_owner_tensor_map_tables():
     cache = TritonTensorDescriptorCache()
     entries = tuple(
         {
-            "offset_bytes": owner * 64,
+            "owner_index": owner,
+            "offset_bytes": 0,
             "shape": (4, 16),
             "strides": (16, 1),
             "source_shape_axes": ((), ()),
@@ -595,6 +754,7 @@ def test_pyntt_runtime_reuses_per_owner_tensor_map_tables():
         "block_shape": (4, 16),
         "padding": "zero",
         "swizzle_mode": 0,
+        "owner_indexing": {"kind": "fixed", "stride_bytes": 64},
         "entry_size_bytes": 128,
         "entries": entries,
     }
@@ -611,6 +771,51 @@ def test_pyntt_runtime_reuses_per_owner_tensor_map_tables():
         "kernel", (spec,), {"rdata": replacement_storage}
     )[0]
     assert replacement is not first
+
+
+def test_pyntt_runtime_uses_caller_workspace_stride_for_descriptor_owners():
+    torch = pytest.importorskip("torch")
+    if not torch.cuda.is_available():
+        pytest.skip("tensor-map tables require CUDA")
+    _add_pyntt_to_path()
+
+    from pyntt.runtime.triton import (
+        TritonTensorDescriptorCache,
+        make_host_tensor_descriptor_source,
+    )
+
+    entries = tuple(
+        {
+            "owner_index": owner,
+            "offset_bytes": 0,
+            "shape": (4, 16),
+            "strides": (16, 1),
+            "source_shape_axes": ((), ()),
+        }
+        for owner in range(2)
+    )
+    spec = {
+        "kind": "table",
+        "name": "rhs_descriptor_table",
+        "source": "data",
+        "dtype": "uint8",
+        "block_shape": (4, 16),
+        "padding": "zero",
+        "swizzle_mode": 0,
+        "owner_indexing": {"kind": "source_pool", "stride_bytes": 0},
+        "entry_size_bytes": 128,
+        "entries": entries,
+    }
+    backing = torch.empty((160,), dtype=torch.uint8, device="cuda")
+    local_owner_view = backing.narrow(0, 0, 64)
+    source = make_host_tensor_descriptor_source(local_owner_view, 80)
+
+    table = TritonTensorDescriptorCache().materialize_many(
+        "kernel", (spec,), {"data": source}
+    )[0]
+
+    assert table.dtype == torch.uint8
+    assert table.numel() == 256
 
 
 @pytest.mark.parametrize(
@@ -961,7 +1166,7 @@ def test_pyntt_renderer_canonicalizes_unit_block_cyclic_tma_dimensions():
         "logical_strides": [128, 1],
         "vector_lane_shape": [8, 2, 8],
         "contiguous_rebase_extent_elements": 0,
-        "owner_stride_bytes": 0,
+        "owner_indexing": None,
     }
 
     spec = _k_major_gemv_host_descriptor_spec(
@@ -1013,7 +1218,7 @@ def test_pyntt_renderer_accepts_selected_fp8_packed_gemv_lane_shape():
         "logical_strides": [128, 1],
         "vector_lane_shape": [8, 2, 16],
         "contiguous_rebase_extent_elements": 0,
-        "owner_stride_bytes": 0,
+        "owner_indexing": None,
     }
 
     spec = _k_major_gemv_host_descriptor_spec(
@@ -1071,7 +1276,7 @@ def test_pyntt_renderer_preserves_one_block_cyclic_n_block_per_mma_tile():
                 "lhs_scale": "66048",
             },
             "SharedWorkspaceShapes": {
-                "rhs_stage": [2, 4, 1, 64, 128],
+                "rhs_stage": [2, 4, 64, 128],
                 "lhs_quantized": [4, 128],
                 "lhs_scale": [4, 1],
             },
@@ -1091,7 +1296,7 @@ def test_pyntt_renderer_preserves_one_block_cyclic_n_block_per_mma_tile():
         "logical_strides": [16, 1],
         "vector_lane_shape": [2, 16],
         "contiguous_rebase_extent_elements": 0,
-        "owner_stride_bytes": 0,
+        "owner_indexing": None,
     }
 
     spec = _n_major_k_packed_gemv_host_descriptor_spec(model, backing)
@@ -1100,6 +1305,7 @@ def test_pyntt_renderer_preserves_one_block_cyclic_n_block_per_mma_tile():
     assert spec["swizzle_mode"] == 3
     assert len(spec["entries"]) == 8
     assert spec["entries"][0] == {
+        "owner_index": 0,
         "offset_bytes": 256,
         "shape": (64, 512),
         "strides": (512, 1),
@@ -1140,6 +1346,14 @@ def test_pyntt_nvfp4_accesses_map_local_n_through_block_cyclic_storage():
         }
 
     def microkernel(family):
+        shared_workspace_offsets = {
+            "packed_weight_stage": "0",
+            "weight_scale_stage": "65536",
+        }
+        shared_workspace_shapes = {
+            "packed_weight_stage": [4, 128, 128],
+            "weight_scale_stage": [4, 128, 16],
+        }
         return {
             "Family": family,
             "Variant": "mma_tma_smem_pipeline",
@@ -1150,12 +1364,8 @@ def test_pyntt_nvfp4_accesses_map_local_n_through_block_cyclic_storage():
                 "num_stages": 4,
                 "group_size": 16,
             },
-            "SharedWorkspaceOffsets": {
-                "packed_weight_stage": "0",
-            },
-            "SharedWorkspaceShapes": {
-                "packed_weight_stage": [4, 128, 128],
-            },
+            "SharedWorkspaceOffsets": shared_workspace_offsets,
+            "SharedWorkspaceShapes": shared_workspace_shapes,
             "ConsumerSharedWorkspaceNames": [],
         }
 
@@ -1180,9 +1390,12 @@ def test_pyntt_nvfp4_accesses_map_local_n_through_block_cyclic_storage():
         "RhsScale": scale_pointer,
         "Output": output_pointer,
         "RhsPackedDescriptorName": "rhs_packed_descriptor",
+        "RhsScaleDescriptorName": "rhs_scale_descriptor",
+        "HasAddend": False,
+        "HasNormStats": False,
     }
     matmul_context = _nvfp4_matmul_template_context(matmul)
-    assert matmul_context["n_tiles_per_activation_batch"] == 2
+    assert matmul_context["n_tiles_per_activation_batch"] == 5
     matmul_packed = _access_pointer(
         matmul, "RhsPacked", "rhs_packed", matmul_context["packed_weight_access"]
     )
@@ -1214,12 +1427,25 @@ def test_pyntt_nvfp4_accesses_map_local_n_through_block_cyclic_storage():
         "UpWeightPacked": packed_pointer,
         "GateWeightScale": scale_pointer,
         "UpWeightScale": scale_pointer,
+        "GateInputGlobalScale": pointer((1,), (1,), 0),
+        "UpInputGlobalScale": pointer((1,), (1,), 0),
         "Output": output_pointer,
         "GateWeightPackedDescriptorName": "gate_weight_packed_descriptor",
         "UpWeightPackedDescriptorName": "up_weight_packed_descriptor",
+        "GateWeightScaleDescriptorName": "gate_weight_scale_descriptor",
+        "UpWeightScaleDescriptorName": "up_weight_scale_descriptor",
     }
     glu_context = _nvfp4_matmul_glu_template_context(glu)
-    assert glu_context["n_tiles_per_activation_batch"] == 1
+    assert glu_context["n_tiles_per_activation_batch"] == 5
+    assert glu_context["shared_input_quantization"] is True
+    glu["UpInputGlobalScale"] = {
+        **glu["UpInputGlobalScale"],
+        "Expression": "other_pointer",
+    }
+    assert (
+        _nvfp4_matmul_glu_template_context(glu)["shared_input_quantization"]
+        is False
+    )
     gate = glu_context["projections"][0]
     glu_packed = _access_pointer(
         glu,
@@ -1262,6 +1488,15 @@ def test_pyntt_nvfp4_descriptor_reinterprets_target_packed_k_lanes():
         "Hierarchy": [1],
         "Strides": [80, 1],
     }
+    scale_pointer = {
+        "Expression": "rhs_scale",
+        "DistributedStorageKind": "CanonicalGlobal",
+        "GlobalShape": [640, 320],
+        "GlobalOffsets": [0, 0],
+        "ShardAxes": [{"Stages": []}, {"Stages": []}],
+        "Hierarchy": [1],
+        "Strides": [320, 1],
+    }
     model = {
         "GroupSize": 16,
         "MicroKernel": {
@@ -1274,8 +1509,14 @@ def test_pyntt_nvfp4_descriptor_reinterprets_target_packed_k_lanes():
                 "num_stages": 4,
                 "group_size": 16,
             },
-            "SharedWorkspaceOffsets": {"packed_weight_stage": "0"},
-            "SharedWorkspaceShapes": {"packed_weight_stage": [4, 128, 128]},
+            "SharedWorkspaceOffsets": {
+                "packed_weight_stage": "0",
+                "weight_scale_stage": "65536",
+            },
+            "SharedWorkspaceShapes": {
+                "packed_weight_stage": [4, 128, 128],
+                "weight_scale_stage": [4, 128, 16],
+            },
             "ConsumerSharedWorkspaceNames": [],
         },
         "LhsShape": [1, 640],
@@ -1290,7 +1531,11 @@ def test_pyntt_nvfp4_descriptor_reinterprets_target_packed_k_lanes():
         "RhsScaleStrides": [320, 1],
         "OutputStrides": [0, 1],
         "RhsPacked": pointer,
+        "RhsScale": scale_pointer,
         "RhsPackedDescriptorName": "rhs_packed_descriptor",
+        "RhsScaleDescriptorName": "rhs_scale_descriptor",
+        "HasAddend": False,
+        "HasNormStats": False,
     }
     backing = {
         "name": "rhs_packed_descriptor",
@@ -1301,21 +1546,21 @@ def test_pyntt_nvfp4_descriptor_reinterprets_target_packed_k_lanes():
         "logical_strides": [80, 1],
         "vector_lane_shape": [2, 16],
         "contiguous_rebase_extent_elements": 0,
-        "owner_stride_bytes": 0,
+        "owner_indexing": None,
     }
 
     spec = _nvfp4_n_major_host_descriptor_spec(
         model, backing, pointer_key="RhsPacked"
     )
     assert spec["block_shape"] == (128, 4, 32)
-    assert len(spec["entries"]) == 5
+    assert len(spec["entries"]) == 1
     assert spec["entries"][0] == {
+        "owner_index": 0,
         "offset_bytes": 256,
-        "shape": (128, 80, 32),
+        "shape": (640, 80, 32),
         "strides": (2560, 32, 1),
         "source_shape_axes": ((), (), ()),
     }
-    assert spec["entries"][1]["offset_bytes"] == 256 + 128 * 2560
 
 
 def test_pyntt_nvfp4_descriptor_preserves_block_cyclic_n_and_k_axes():
@@ -1352,6 +1597,15 @@ def test_pyntt_nvfp4_descriptor_preserves_block_cyclic_n_and_k_axes():
         "Hierarchy": [4, 8],
         "Strides": [272, 1],
     }
+    scale_pointer = {
+        "Expression": "rhs_scale",
+        "DistributedStorageKind": "CanonicalGlobal",
+        "GlobalShape": [640, 272],
+        "GlobalOffsets": [0, 0],
+        "ShardAxes": [{"Stages": []}, {"Stages": []}],
+        "Hierarchy": [1],
+        "Strides": [272, 1],
+    }
     model = {
         "GroupSize": 16,
         "MicroKernel": {
@@ -1364,8 +1618,14 @@ def test_pyntt_nvfp4_descriptor_preserves_block_cyclic_n_and_k_axes():
                 "num_stages": 4,
                 "group_size": 16,
             },
-            "SharedWorkspaceOffsets": {"packed_weight_stage": "0"},
-            "SharedWorkspaceShapes": {"packed_weight_stage": [4, 128, 128]},
+            "SharedWorkspaceOffsets": {
+                "packed_weight_stage": "0",
+                "weight_scale_stage": "65536",
+            },
+            "SharedWorkspaceShapes": {
+                "packed_weight_stage": [4, 128, 128],
+                "weight_scale_stage": [4, 128, 16],
+            },
             "ConsumerSharedWorkspaceNames": [],
         },
         "LhsShape": [1, 544],
@@ -1377,10 +1637,14 @@ def test_pyntt_nvfp4_descriptor_preserves_block_cyclic_n_and_k_axes():
         "OutputVectorLanes": [8],
         "LhsStrides": [0, 1],
         "RhsPackedStrides": [272, 1],
-        "RhsScaleStrides": [1088, 1],
+        "RhsScaleStrides": [272, 1],
         "OutputStrides": [0, 1],
         "RhsPacked": pointer,
+        "RhsScale": scale_pointer,
         "RhsPackedDescriptorName": "rhs_packed_descriptor",
+        "RhsScaleDescriptorName": "rhs_scale_descriptor",
+        "HasAddend": False,
+        "HasNormStats": False,
     }
     backing = {
         "name": "rhs_packed_descriptor",
@@ -1391,26 +1655,27 @@ def test_pyntt_nvfp4_descriptor_preserves_block_cyclic_n_and_k_axes():
         "logical_strides": [272, 1],
         "vector_lane_shape": [2, 16],
         "contiguous_rebase_extent_elements": 0,
-        "owner_stride_bytes": 0,
+        "owner_indexing": None,
     }
 
     spec = _nvfp4_n_major_host_descriptor_spec(
         model, backing, pointer_key="RhsPacked"
     )
     assert spec["block_shape"] == (2, 64, 4, 32)
-    assert len(spec["entries"]) == 32 * 5
+    assert len(spec["entries"]) == 32
     assert spec["entries"][0] == {
+        "owner_index": 0,
         "offset_bytes": 256,
-        "shape": (2, 64, 68, 32),
+        "shape": (10, 64, 68, 32),
         "strides": (512 * 272 * 32, 272 * 32, 4 * 32, 1),
         "source_shape_axes": ((), (), (), ()),
     }
-    assert spec["entries"][1]["offset_bytes"] == 256 + 1024 * 272 * 32
-    assert spec["entries"][5]["offset_bytes"] == 256 + 64 * 272 * 32
-    assert spec["entries"][8 * 5]["offset_bytes"] == 256 + 32
+    assert spec["entries"][1]["offset_bytes"] == 256 + 64 * 272 * 32
+    assert spec["entries"][8]["offset_bytes"] == 256 + 32
+    assert {entry["owner_index"] for entry in spec["entries"]} == {0}
 
 
-def test_pyntt_renderer_uses_one_rank3_descriptor_for_block_cyclic_mma_tile():
+def test_pyntt_renderer_splits_logical_mma_tile_at_block_cyclic_boundaries():
     _add_pyntt_to_path()
     from pyntt.codegen.render import _n_major_k_packed_gemv_host_descriptor_spec
 
@@ -1452,7 +1717,7 @@ def test_pyntt_renderer_uses_one_rank3_descriptor_for_block_cyclic_mma_tile():
                 "lhs_scale": "65792",
             },
             "SharedWorkspaceShapes": {
-                "rhs_stage": [2, 2, 1, 128, 128],
+                "rhs_stage": [2, 2, 128, 128],
                 "lhs_quantized": [2, 128],
                 "lhs_scale": [2, 1],
             },
@@ -1472,24 +1737,32 @@ def test_pyntt_renderer_uses_one_rank3_descriptor_for_block_cyclic_mma_tile():
         "logical_strides": [16, 1],
         "vector_lane_shape": [2, 16],
         "contiguous_rebase_extent_elements": 0,
-        "owner_stride_bytes": 0,
+        "owner_indexing": None,
     }
 
     spec = _n_major_k_packed_gemv_host_descriptor_spec(model, backing)
 
-    assert spec["block_shape"] == (2, 64, 128)
-    assert len(spec["entries"]) == 6
-    assert [entry["shape"][:2] for entry in spec["entries"]] == [
-        (2, 64),
-        (2, 64),
-        (1, 64),
-        (2, 64),
-        (2, 64),
-        (1, 64),
+    assert spec["block_shape"] == (64, 128)
+    assert len(spec["entries"]) == 12
+    assert [entry["shape"][0] for entry in spec["entries"]] == [
+        64,
+        64,
+        64,
+        64,
+        64,
+        1,
+        64,
+        64,
+        64,
+        64,
+        64,
+        1,
     ]
     assert spec["entries"][0]["offset_bytes"] == 256
-    assert spec["entries"][1]["offset_bytes"] == 256 + 256 * 512
-    assert spec["entries"][3]["offset_bytes"] == 256 + 64 * 512
+    assert spec["entries"][1]["offset_bytes"] == 256 + 128 * 512
+    assert spec["entries"][2]["offset_bytes"] == 256 + 256 * 512
+    assert spec["entries"][6]["offset_bytes"] == 256 + 64 * 512
+    assert {entry["owner_index"] for entry in spec["entries"]} == {0}
 
 
 def test_pyntt_renderer_uses_dense_coordinates_for_compact_local_tma():
@@ -1535,7 +1808,7 @@ def test_pyntt_renderer_uses_dense_coordinates_for_compact_local_tma():
         "logical_strides": [2, 1],
         "vector_lane_shape": [8, 2, 8],
         "contiguous_rebase_extent_elements": 0,
-        "owner_stride_bytes": 24576,
+        "owner_indexing": {"kind": "fixed", "stride_bytes": 24576},
     }
 
     spec = _k_major_gemv_host_descriptor_spec(
@@ -1556,8 +1829,73 @@ def test_pyntt_renderer_uses_dense_coordinates_for_compact_local_tma():
             (extent - 1) * stride
             for extent, stride in zip(entry["shape"], entry["strides"])
         )
-        assert entry["offset_bytes"] == owner * backing["owner_stride_bytes"]
-        assert span_elements * 2 <= backing["owner_stride_bytes"]
+        assert entry["owner_index"] == owner
+        assert entry["offset_bytes"] == 0
+        assert span_elements * 2 <= backing["owner_indexing"]["stride_bytes"]
+
+
+def test_pyntt_renderer_rebases_compact_local_tma_on_single_backing():
+    _add_pyntt_to_path()
+    from pyntt.codegen.render import (
+        _tma_descriptor_table_axis_entry,
+        _tma_owner_backing_base_elements,
+    )
+
+    def fixed(value):
+        return {"TritonExpression": str(value), "FixedValue": value}
+
+    pointer = {
+        "DistributedStorageKind": "CompactLocal",
+        "GlobalShape": [fixed(96)],
+        "ShardAxes": [
+            {
+                "Stages": [
+                    {
+                        "HierarchyAxes": [0],
+                        "Distribution": "Contiguous",
+                        "Granularity": fixed(24),
+                        "BlockSize": 0,
+                    }
+                ]
+            }
+        ],
+        "Hierarchy": [4],
+    }
+    backing = {"owner_indexing": None}
+    entry = _tma_descriptor_table_axis_entry(
+        pointer,
+        0,
+        (2,),
+        tile_extent=16,
+        context="test",
+    )
+
+    assert entry["base"] == 48
+    assert _tma_owner_backing_base_elements(
+        pointer,
+        backing,
+        (entry,),
+        (80,),
+        scalar_lanes_per_logical_element=2,
+        context="test",
+    ) == 48 * 80 * 2
+
+
+def test_pyntt_renderer_keeps_owner_indexed_compact_local_tma_dense():
+    _add_pyntt_to_path()
+    from pyntt.codegen.render import _tma_owner_backing_base_elements
+
+    pointer = {"DistributedStorageKind": "CompactLocal"}
+    backing = {"owner_indexing": {"kind": "fixed", "stride_bytes": 4096}}
+
+    assert _tma_owner_backing_base_elements(
+        pointer,
+        backing,
+        ({"base": 17},),
+        (80,),
+        scalar_lanes_per_logical_element=32,
+        context="test",
+    ) == 0
 
 
 def test_pyntt_renderer_maps_local_kv_head_to_block_cyclic_global_head():
@@ -1917,6 +2255,151 @@ def test_pyntt_renderer_outlines_only_large_packed_gemv_stages(block_k, expected
     )
 
 
+def test_pyntt_packed_gemv_accepts_bounded_nonuniform_owner_n_extent():
+    _add_pyntt_to_path()
+    from pyntt.codegen.render import _packed_gemv_pipeline_template_context
+
+    def fixed(value):
+        return {
+            "PythonExpression": str(value),
+            "TritonExpression": str(value),
+            "FixedValue": value,
+            "MinValue": value,
+            "MaxValue": value,
+        }
+
+    dynamic_n = {
+        "PythonExpression": "431 + tail",
+        "TritonExpression": "431 + tail",
+        "FixedValue": None,
+        "MinValue": 431,
+        "MaxValue": 432,
+    }
+    strides = [fixed(15520), fixed(1)]
+    pointer = {
+        "DistributedStorageKind": "CanonicalGlobal",
+        "GlobalShape": [fixed(160), fixed(15520)],
+        "GlobalOffsets": [fixed(0), fixed(0)],
+        "Strides": strides,
+        "ShardAxes": [
+            {"Stages": []},
+            {
+                "Stages": [
+                    {
+                        "HierarchyAxes": [0, 1],
+                        "Distribution": "BlockCyclic",
+                        "Granularity": None,
+                        "BlockSize": 1,
+                    }
+                ]
+            },
+        ],
+        "Hierarchy": [4, 9],
+    }
+    model = {
+        "FunctionName": "lm_head",
+        "Comment": "nonuniform LM-head owner",
+        "NoInline": False,
+        "NumWarps": 8,
+        "TargetWorkerWidth": 32,
+        "Lhs": {
+            "DistributedStorageKind": "CanonicalGlobal",
+            "GlobalShape": [fixed(1), fixed(5120)],
+            "GlobalOffsets": [fixed(0), fixed(0)],
+            "Strides": [fixed(0), fixed(1)],
+            "ShardAxes": [{"Stages": []}, {"Stages": []}],
+            "Hierarchy": [4, 9],
+        },
+        "Rhs": pointer,
+        "Output": {
+            "DistributedStorageKind": "CanonicalGlobal",
+            "GlobalShape": [fixed(1), fixed(15520)],
+            "GlobalOffsets": [fixed(0), fixed(0)],
+            "Strides": [fixed(0), fixed(1)],
+            "ShardAxes": pointer["ShardAxes"],
+            "Hierarchy": [4, 9],
+        },
+        "LhsShape": [fixed(1), fixed(5120)],
+        "RhsShape": [fixed(160), dynamic_n],
+        "OutputShape": [fixed(1), dynamic_n],
+        "LhsGlobalOffsets": [fixed(0), fixed(0)],
+        "RhsGlobalOffsets": [fixed(0), fixed(0)],
+        "OutputGlobalOffsets": [fixed(0), fixed(0)],
+        "LhsStrides": [fixed(0), fixed(1)],
+        "RhsStrides": strides,
+        "OutputStrides": [fixed(0), fixed(1)],
+        "LhsDType": "float8e4m3fn",
+        "RhsDType": "float8e4m3fn",
+        "OutputDType": "float32",
+        "TransposeA": False,
+        "TransposeB": False,
+        "RhsLayout": "k_major",
+        "RhsNPackedLaneCount": 1,
+        "RhsNVectorLaneCount": 16,
+        "RhsKPackLaneCount": 2,
+        "RhsKVectorLaneCount": 16,
+        "OutputNPackedLaneCount": 1,
+        "OutputNVectorLaneCount": 16,
+        "HasAddend": False,
+        "HasNormStats": False,
+        "HasOperandScales": False,
+        "RhsDescriptorName": "lm_head_rhs_descriptor",
+        "RhsDescriptorOriginElements": "0",
+        "Scale": 1.0,
+        "MicroKernel": {
+            "Family": "triton.matmul",
+            "Variant": "simt_fma_smem_pipeline",
+            "Parameters": {
+                "block_m": 1,
+                "block_n": 64,
+                "block_k": 512,
+                "num_stages": 2,
+            },
+            "SharedWorkspaceOffsets": {"rhs_stage": "0"},
+            "SharedWorkspaceShapes": {"rhs_stage": [2, 64, 512]},
+            "TransferPipelineChannels": [
+                {"Name": "weight", "SharedWorkspaceNames": ["rhs_stage"]}
+            ],
+            "HasTransferPipeline": True,
+            "ConsumerSharedWorkspaceNames": [],
+        },
+    }
+
+    context = _packed_gemv_pipeline_template_context(
+        model, allow_unscaled_fp8=True
+    )
+
+    assert context["runtime_num_n_tiles"] == "tl.cdiv(active_n, 64)"
+    assert context["num_n_tiles"] == 108
+    assert context["tma_block_shape"] == (16, 4, 4, 128)
+
+
+def test_pyntt_renderer_bounds_paired_gemv_reduction_by_register_partition():
+    _add_pyntt_to_path()
+    from pyntt.codegen.render import _packed_gemv_register_bounded_reduction_group
+
+    model = {
+        "NoInline": True,
+        "NumWarps": 8,
+        "TargetWorkerWidth": 32,
+        "KernelConfig": {
+            "consumer_registers": 240,
+            "uniform_registers": 168,
+            "register_granularity": 8,
+        },
+    }
+
+    assert (
+        _packed_gemv_register_bounded_reduction_group(
+            model,
+            block_n=64,
+            maximum_reduction_group=256,
+            accumulator_count=2,
+        )
+        == 32
+    )
+
+
 @pytest.mark.parametrize(
     ("cache_block_size", "expected_block_n", "expected_candidates"),
     [(32, 32, (32,)), (256, 64, (32, 64))],
@@ -2077,7 +2560,13 @@ def test_pyntt_qkv_mma_pipeline_uses_bf16_packed_lanes():
     _add_pyntt_to_path()
     from pyntt.codegen.render import _packed_gemv_vector_lane_shape
 
-    assert _packed_gemv_vector_lane_shape("mma_smem_pipeline") == (8, 2, 8)
+    assert _packed_gemv_vector_lane_shape(
+        {
+            "NVectorLaneCount": 8,
+            "KPackLaneCount": 2,
+            "KVectorLaneCount": 8,
+        }
+    ) == (8, 2, 8)
 
 
 def test_pyntt_qkv_mma_pipeline_uses_selected_variant(monkeypatch):
@@ -2092,7 +2581,7 @@ def test_pyntt_qkv_mma_pipeline_uses_selected_variant(monkeypatch):
     monkeypatch.setattr(
         render,
         "_microkernel_context",
-        lambda model, family, variant: {
+        lambda model, family, variant, **kwargs: {
             "parameters": {"block_n": 31, "block_k": 1024, "num_stages": 2}
         },
     )
@@ -2106,6 +2595,7 @@ def test_pyntt_qkv_mma_pipeline_uses_selected_variant(monkeypatch):
         "KPackLaneCount": 2,
         "KVectorLaneCount": 8,
         "InputShape": [1, 2048],
+        "InputActiveShape": [1, 2048],
         "InputStrides": [2048, 1],
         "WeightShape": [128, 20],
         "QOutputShape": [1, 96],
@@ -2298,6 +2788,41 @@ def test_pyntt_kernel_templates_own_their_triton_source():
     assert 'ctx["microkernel"]["shared_workspace_offsets"]' in common_source
 
 
+def test_pyntt_nvfp4_glu_consumer_follows_producer_pipe_sequence_order():
+    template_path = (
+        Path(__file__).resolve().parents[2]
+        / "pyntt/pyntt/codegen/templates/triton/kernels/nvfp4_matmul_glu"
+        / "mma_tma_smem_pipeline.py.jinja"
+    )
+    source = template_path.read_text(encoding="utf-8")
+    producer, consumer = source.split(
+        'def {{ model["FunctionName"] }}__consumer', maxsplit=1
+    )
+
+    n_loop = '{% for n_tile in range(n_batch_start, n_batch_end) %}'
+    projection_loop = '{% for projection in ctx["projections"] %}'
+    producer_wait_prefix = producer[: producer.index("_slot = writer.acquire")]
+    consumer_wait_prefix = consumer[: consumer.index("_ready = reader.wait")]
+
+    assert producer_wait_prefix.rfind(n_loop) < producer_wait_prefix.rfind(
+        projection_loop
+    )
+    assert consumer_wait_prefix.rfind(n_loop) < consumer_wait_prefix.rfind(
+        projection_loop
+    )
+
+
+def test_pyntt_renderer_emits_castable_masked_load_zero():
+    _add_pyntt_to_path()
+    from pyntt.codegen.render import _load_zero_literal
+
+    assert _load_zero_literal("float8e4m3fn") == "0.0"
+    assert _load_zero_literal("bfloat16") == "0"
+    assert _load_zero_literal("uint8") == "0"
+    with pytest.raises(ValueError, match="masked-load dtype"):
+        _load_zero_literal("unsupported")
+
+
 def test_pyntt_renderer_preserves_codegen_scope_device_boundary():
     _add_pyntt_to_path()
     from pyntt.codegen.render import render_manifest
@@ -2398,6 +2923,43 @@ def test_pyntt_renderer_passes_nested_device_arguments_directly():
     assert "parent(data)" in source
     assert "child(parent_ptr)" in source
     assert "pyntt_call_frame" not in source
+
+
+def test_pyntt_gated_delta_net_descriptor_role_survives_device_rebinding(monkeypatch):
+    _add_pyntt_to_path()
+    import pyntt.codegen.render as render
+
+    calls = []
+
+    def capture_role(model, backing, weight):
+        calls.append((backing["name"], weight))
+        return {"name": backing["name"], "weight": weight}
+
+    monkeypatch.setattr(
+        render,
+        "_gated_delta_net_projection_host_descriptor_spec",
+        capture_role,
+    )
+    helper = {
+        "template": "triton/kernels/gated_delta_net/recurrent_core.py.jinja",
+        "model": {
+            "FunctionName": "recurrent",
+            "BWeightDescriptorName": "formal_b",
+            "AWeightDescriptorName": "formal_a",
+        },
+    }
+    specs = render._pipeline_helper_descriptor_specs(helper)
+
+    assert [name for name, _ in specs] == ["formal_b", "formal_a"]
+    assert specs[0][1](helper["model"], {"name": "actual_b__resource0"}) == {
+        "name": "actual_b__resource0",
+        "weight": "B",
+    }
+    assert specs[1][1](helper["model"], {"name": "actual_a__resource0"}) == {
+        "name": "actual_a__resource0",
+        "weight": "A",
+    }
+    assert calls == [("actual_b__resource0", "B"), ("actual_a__resource0", "A")]
 
 
 def test_pyntt_renderer_inlines_nested_device_helpers(monkeypatch):
@@ -2808,3 +3370,43 @@ def test_pyntt_interpreter_isolates_prepared_state_by_execution_device():
     assert interpreter.lookup_prepared_triton_kernel("top", "cuda:1") is prepared1
     assert interpreter.lookup_launch_resources("top", "cuda:0") is resources0
     assert interpreter.lookup_launch_resources("top", "cuda:1") is resources1
+
+
+def test_pyntt_interpreter_reuses_canonical_pipeline_channels(monkeypatch):
+    _add_pyntt_to_path()
+    from pyntt.ir import ModuleSpec
+    from pyntt.runtime.errors import PyNTTSpecError
+    from pyntt.runtime.interpreter import PyNTTInterpreter
+    from pyntt.runtime.pipeline import PipelineChannel
+
+    class FakeChannel:
+        def __init__(self, payload_bytes):
+            self.payload_bytes = payload_bytes
+            self.reset_count = 0
+
+        def reset(self):
+            self.reset_count += 1
+
+    allocations = []
+
+    def allocate(payload_bytes):
+        channel = FakeChannel(payload_bytes)
+        allocations.append(channel)
+        return channel
+
+    monkeypatch.setattr(PipelineChannel, "allocate", allocate)
+    interpreter = PyNTTInterpreter(ModuleSpec("test", "triton", ()))
+    specs = (("gpu_to_cpu", 64), ("cpu_to_gpu", 32))
+
+    first = interpreter.prepare_pipeline_channels(specs)
+    second = interpreter.prepare_pipeline_channels(specs)
+
+    assert first is second
+    assert tuple(allocations) == first
+    assert [channel.reset_count for channel in allocations] == [2, 2]
+
+    mutable_specs = [["gpu_to_cpu", 64]]
+    assert interpreter.prepare_pipeline_channels(mutable_specs) == (allocations[0],)
+    mutable_specs[0][1] = 128
+    with pytest.raises(PyNTTSpecError, match="prepared for 64 payload bytes"):
+        interpreter.prepare_pipeline_channels(mutable_specs)

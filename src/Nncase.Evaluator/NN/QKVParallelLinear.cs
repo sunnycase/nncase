@@ -5,6 +5,7 @@ using System;
 using System.Linq;
 using Nncase.CostModel;
 using Nncase.IR;
+using Nncase.IR.Math;
 using Nncase.IR.NN;
 using Nncase.Utilities;
 using OrtKISharp;
@@ -23,9 +24,9 @@ public sealed class QKVParallelLinearEvaluator : IEvaluator<QKVParallelLinear>, 
         var kWeight = context.GetArgumentValueAsTensor(target, QKVParallelLinear.KWeight);
         var vWeight = context.GetArgumentValueAsTensor(target, QKVParallelLinear.VWeight);
         return Value.FromTensors(
-            Project(input, qWeight, context.GetArgumentValue(target, QKVParallelLinear.QBias), context.GetArgumentValue(target, QKVParallelLinear.QInputScale), context.GetArgumentValue(target, QKVParallelLinear.QWeightScale), target.OutputDataType),
-            Project(input, kWeight, context.GetArgumentValue(target, QKVParallelLinear.KBias), context.GetArgumentValue(target, QKVParallelLinear.KInputScale), context.GetArgumentValue(target, QKVParallelLinear.KWeightScale), target.OutputDataType),
-            Project(input, vWeight, context.GetArgumentValue(target, QKVParallelLinear.VBias), context.GetArgumentValue(target, QKVParallelLinear.VInputScale), context.GetArgumentValue(target, QKVParallelLinear.VWeightScale), target.OutputDataType));
+            Project(input, qWeight, context.GetArgumentValue(target, QKVParallelLinear.QBias), context.GetArgumentValue(target, QKVParallelLinear.QInputScale), context.GetArgumentValue(target, QKVParallelLinear.QWeightScale), target.OutputDataType, target.QuantizationMode),
+            Project(input, kWeight, context.GetArgumentValue(target, QKVParallelLinear.KBias), context.GetArgumentValue(target, QKVParallelLinear.KInputScale), context.GetArgumentValue(target, QKVParallelLinear.KWeightScale), target.OutputDataType, target.QuantizationMode),
+            Project(input, vWeight, context.GetArgumentValue(target, QKVParallelLinear.VBias), context.GetArgumentValue(target, QKVParallelLinear.VInputScale), context.GetArgumentValue(target, QKVParallelLinear.VWeightScale), target.OutputDataType, target.QuantizationMode));
     }
 
     public IRType Visit(ITypeInferenceContext context, QKVParallelLinear target)
@@ -37,9 +38,27 @@ public sealed class QKVParallelLinearEvaluator : IEvaluator<QKVParallelLinear>, 
         var qBias = context.CheckArgumentType<IRType>(target, QKVParallelLinear.QBias);
         var kBias = context.CheckArgumentType<IRType>(target, QKVParallelLinear.KBias);
         var vBias = context.CheckArgumentType<IRType>(target, QKVParallelLinear.VBias);
-        var q = VisitProjection(input, qWeight, target.OutputDataType);
-        var k = VisitProjection(input, kWeight, target.OutputDataType);
-        var v = VisitProjection(input, vWeight, target.OutputDataType);
+        var qInputScale = context.CheckArgumentType<IRType>(target, QKVParallelLinear.QInputScale);
+        var kInputScale = context.CheckArgumentType<IRType>(target, QKVParallelLinear.KInputScale);
+        var vInputScale = context.CheckArgumentType<IRType>(target, QKVParallelLinear.VInputScale);
+        var qWeightScale = context.CheckArgumentType<IRType>(target, QKVParallelLinear.QWeightScale);
+        var kWeightScale = context.CheckArgumentType<IRType>(target, QKVParallelLinear.KWeightScale);
+        var vWeightScale = context.CheckArgumentType<IRType>(target, QKVParallelLinear.VWeightScale);
+        if (CheckScaleContract(
+                target,
+                qInputScale,
+                kInputScale,
+                vInputScale,
+                qWeightScale,
+                kWeightScale,
+                vWeightScale) is { } scaleError)
+        {
+            return scaleError;
+        }
+
+        var q = VisitProjection(input, qWeight, qInputScale, qWeightScale, target, "q");
+        var k = VisitProjection(input, kWeight, kInputScale, kWeightScale, target, "k");
+        var v = VisitProjection(input, vWeight, vInputScale, vWeightScale, target, "v");
         if (q is InvalidType)
         {
             return q;
@@ -99,11 +118,36 @@ public sealed class QKVParallelLinearEvaluator : IEvaluator<QKVParallelLinear>, 
         };
     }
 
-    private static Tensor Project(Tensor input, Tensor weight, IValue bias, IValue inputScale, IValue weightScale, DataType outputDataType)
+    private static Tensor Project(
+        Tensor input,
+        Tensor weight,
+        IValue bias,
+        IValue inputScale,
+        IValue weightScale,
+        DataType outputDataType,
+        MatMulQuantizationMode quantizationMode)
     {
-        _ = inputScale;
-        var effectiveWeight = DequantizeWeight(weight, weightScale, input.ElementType);
-        var result = Math.MatMulEvaluator.InferValue(input.ElementType, input, effectiveWeight, outputDataType).AsTensor();
+        var result = quantizationMode switch
+        {
+            MatMulQuantizationMode.None => Math.MatMulEvaluator.InferValue(
+                input.ElementType,
+                input,
+                weight.ElementType == input.ElementType ? weight : weight.CastElementTo(input.ElementType),
+                outputDataType).AsTensor(),
+            MatMulQuantizationMode.StaticTensor => Math.ScaledMatMulEvaluator.Evaluate(
+                input,
+                weight,
+                inputScale.AsTensor(),
+                weightScale.AsTensor(),
+                outputDataType).AsTensor(),
+            MatMulQuantizationMode.DynamicTensor => EvaluateDynamicTensorProjection(
+                input,
+                weight,
+                weightScale.AsTensor(),
+                outputDataType),
+            _ => throw new NotSupportedException(
+                $"Unsupported QKVParallelLinear quantization mode: {quantizationMode}."),
+        };
         if (!IsNone(bias))
         {
             var biasTensor = bias.AsTensor().CastElementTo(result.ElementType);
@@ -113,29 +157,192 @@ public sealed class QKVParallelLinearEvaluator : IEvaluator<QKVParallelLinear>, 
         return result;
     }
 
-    private static Tensor DequantizeWeight(Tensor weight, IValue weightScale, DataType outputType)
+    public static Tensor EvaluateDynamicTensorProjection(
+        Tensor input,
+        Tensor weight,
+        Tensor weightScale,
+        DataType outputDataType)
     {
-        if (IsNone(weightScale))
+        if (input.Rank != 2 || weight.Rank != 2 || weightScale.Rank != 1 ||
+            input.Dimensions[1] != weight.Dimensions[0] ||
+            weightScale.Dimensions[0] != weight.Dimensions[1])
         {
-            return weight.ElementType == outputType ? weight : weight.CastElementTo(outputType);
+            throw new InvalidOperationException(
+                "Dynamic-tensor QKV projection expects input=[M,K], weight=[K,N], and weight_scale=[N], " +
+                $"got input=[{string.Join(",", input.Dimensions.ToArray())}], " +
+                $"weight=[{string.Join(",", weight.Dimensions.ToArray())}], " +
+                $"weight_scale=[{string.Join(",", weightScale.Dimensions.ToArray())}].");
         }
 
-        var weightFloat = weight.CastElementTo(DataTypes.Float32).ToOrtTensor();
-        var scaleFloat = weightScale.AsTensor().CastElementTo(DataTypes.Float32).ToOrtTensor();
-        return OrtKI.Mul(weightFloat, scaleFloat).ToTensor().CastElementTo(outputType);
+        var m = checked((int)input.Dimensions[0]);
+        var k = checked((int)input.Dimensions[1]);
+        var n = checked((int)weight.Dimensions[1]);
+        var inputValues = input.CastElementTo(DataTypes.Float32).ToArray<float>();
+        var normalizedInput = new float[inputValues.Length];
+        var rowScales = new float[m];
+        for (var row = 0; row < m; row++)
+        {
+            var maxAbs = 0F;
+            for (var index = 0; index < k; index++)
+            {
+                maxAbs = System.Math.Max(
+                    maxAbs,
+                    System.Math.Abs(inputValues[(row * k) + index]));
+            }
+
+            var scale = System.Math.Max(maxAbs, 1E-12F) / (float)Float8E4M3.MaxNormal;
+            rowScales[row] = scale;
+            for (var index = 0; index < k; index++)
+            {
+                normalizedInput[(row * k) + index] = inputValues[(row * k) + index] / scale;
+            }
+        }
+
+        var dequantizedInput = Tensor.From<float>(normalizedInput, input.Dimensions.ToArray())
+            .CastElementTo(DataTypes.Float8E4M3)
+            .CastElementTo(DataTypes.Float32)
+            .ToArray<float>();
+        for (var row = 0; row < m; row++)
+        {
+            for (var index = 0; index < k; index++)
+            {
+                dequantizedInput[(row * k) + index] *= rowScales[row];
+            }
+        }
+
+        var dequantizedWeight = weight.CastElementTo(DataTypes.Float32).ToArray<float>();
+        var weightScaleValues = weightScale.CastElementTo(DataTypes.Float32).ToArray<float>();
+        for (var index = 0; index < k; index++)
+        {
+            for (var column = 0; column < n; column++)
+            {
+                dequantizedWeight[(index * n) + column] *= weightScaleValues[column];
+            }
+        }
+
+        return OrtKI.MatMul(
+                Tensor.From<float>(dequantizedInput, input.Dimensions.ToArray()).ToOrtTensor(),
+                Tensor.From<float>(dequantizedWeight, weight.Dimensions.ToArray()).ToOrtTensor())
+            .ToTensor()
+            .CastElementTo(outputDataType);
     }
 
     private static bool IsNone(IValue value) => value is NoneValue || value.Type is NoneType;
 
-    private static IRType VisitProjection(IRType input, IRType weight, DataType outputDataType)
+    private static IRType VisitProjection(
+        IRType input,
+        IRType weight,
+        IRType inputScale,
+        IRType weightScale,
+        QKVParallelLinear target,
+        string name)
     {
-        return (input, weight) switch
+        var output = target.QuantizationMode switch
         {
-            (DistributedType a, DistributedType b) => Math.MatMulEvaluator.VisitDistributedType(a, b with { TensorType = b.TensorType with { DType = a.TensorType.DType } }, NoneType.Default, outputDataType: outputDataType),
-            (TensorType a, TensorType b) => Math.MatMulEvaluator.VisitTensorType(a, b with { DType = a.DType }, NoneType.Default, outputDataType: outputDataType),
-            _ => new InvalidType($"QKVParallelLinear input/weight types are not supported: {input}, {weight}."),
+            MatMulQuantizationMode.None or MatMulQuantizationMode.DynamicTensor =>
+                (input, weight) switch
+                {
+                    (DistributedType a, DistributedType b) => Math.MatMulEvaluator.VisitDistributedType(
+                        a,
+                        b with { TensorType = b.TensorType with { DType = a.TensorType.DType } },
+                        NoneType.Default,
+                        outputDataType: target.OutputDataType),
+                    (TensorType a, TensorType b) => Math.MatMulEvaluator.VisitTensorType(
+                        a,
+                        b with { DType = a.DType },
+                        NoneType.Default,
+                        outputDataType: target.OutputDataType),
+                    _ => new InvalidType($"QKVParallelLinear input/weight types are not supported: {input}, {weight}."),
+                },
+            MatMulQuantizationMode.StaticTensor => Math.ScaledMatMulEvaluator.InferType(
+                new ScaledMatMul(target.OutputDataType),
+                input,
+                weight,
+                inputScale,
+                weightScale),
+            _ => new InvalidType(
+                $"Unsupported QKVParallelLinear quantization mode: {target.QuantizationMode}."),
         };
+        if (output is InvalidType || target.QuantizationMode != MatMulQuantizationMode.DynamicTensor)
+        {
+            return output;
+        }
+
+        return CheckDynamicTensorWeightScale(name, output, weightScale) ?? output;
     }
+
+    private static InvalidType? CheckScaleContract(
+        QKVParallelLinear target,
+        IRType qInputScale,
+        IRType kInputScale,
+        IRType vInputScale,
+        IRType qWeightScale,
+        IRType kWeightScale,
+        IRType vWeightScale)
+    {
+        var inputScales = new[] { qInputScale, kInputScale, vInputScale };
+        var weightScales = new[] { qWeightScale, kWeightScale, vWeightScale };
+        var valid = target.QuantizationMode switch
+        {
+            MatMulQuantizationMode.None =>
+                inputScales.All(scale => scale is NoneType) &&
+                weightScales.All(scale => scale is NoneType),
+            MatMulQuantizationMode.StaticTensor =>
+                inputScales.All(Math.ScaledMatMulEvaluator.IsScaleType) &&
+                weightScales.All(Math.ScaledMatMulEvaluator.IsScaleType),
+            MatMulQuantizationMode.DynamicTensor =>
+                inputScales.All(scale => scale is NoneType) &&
+                weightScales.All(scale => scale is TensorType or DistributedType),
+            _ => false,
+        };
+        return valid
+            ? null
+            : new InvalidType(
+                $"QKVParallelLinear scale operands do not match quantization mode {target.QuantizationMode}; " +
+                $"input scales=[{string.Join(",", inputScales.Select(scale => scale is not NoneType))}], " +
+                $"weight scales=[{string.Join(",", weightScales.Select(scale => scale is not NoneType))}].");
+    }
+
+    private static InvalidType? CheckDynamicTensorWeightScale(
+        string name,
+        IRType output,
+        IRType weightScale)
+    {
+        var outputTensor = GetTensorType(output);
+        var scaleTensor = GetTensorType(weightScale);
+        if (outputTensor is null || scaleTensor is null ||
+            scaleTensor.DType is not PrimType scaleType || !scaleType.IsFloat() ||
+            scaleTensor.Shape is not RankedShape { Rank: 1 } ||
+            outputTensor.Shape is not RankedShape outputShape ||
+            scaleTensor.Shape[0] != outputShape[^1])
+        {
+            return new InvalidType(
+                $"Dynamic-tensor QKV {name} weight scale must be a floating [N] tensor matching the output, " +
+                $"got scale={weightScale}, output={output}.");
+        }
+
+        if (output is DistributedType outputDistributed)
+        {
+            if (weightScale is not DistributedType scaleDistributed ||
+                scaleDistributed.Placement != outputDistributed.Placement ||
+                scaleDistributed.Partial is not null ||
+                scaleDistributed.AxisPolicies[0] != outputDistributed.AxisPolicies[^1])
+            {
+                return new InvalidType(
+                    $"Dynamic-tensor QKV {name} weight scale must use the output N distribution, " +
+                    $"got scale={weightScale}, output={output}.");
+            }
+        }
+
+        return null;
+    }
+
+    private static TensorType? GetTensorType(IRType type) => type switch
+    {
+        TensorType tensor => tensor,
+        DistributedType distributed => distributed.TensorType,
+        _ => null,
+    };
 
     private static InvalidType? CheckBiasType(string name, IRType output, IRType bias)
     {

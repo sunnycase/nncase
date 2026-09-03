@@ -736,6 +736,71 @@ public sealed class UnitTestCPUKernels : TestClassBase
     }
 
     [Theory]
+    [InlineData(false)]
+    [InlineData(true)]
+    public async Task TestBFloat16NormStatsApply(bool useMean)
+    {
+        var targetOptions = (NTTTargetOptions)CompileOptions.TargetOptions;
+        targetOptions.Hierarchies[0] = [1];
+        targetOptions.HierarchyNames = "b";
+        targetOptions.HierarchyLevels = "b";
+
+        var inputShape = new long[] { 1, 2, 128 };
+        var parameterShape = new long[] { 128 };
+        var input = new Var(
+            "input",
+            new TensorType(DataTypes.BFloat16, inputShape));
+        var scale = new Var(
+            "scale",
+            new TensorType(DataTypes.BFloat16, parameterShape));
+        var bias = new Var(
+            "bias",
+            new TensorType(DataTypes.BFloat16, parameterShape));
+        var scaleValue = IR.F.Random.Normal(
+            DataTypes.BFloat16,
+            0.5f,
+            0.25f,
+            2,
+            parameterShape).Evaluate().AsTensor();
+        var biasValue = IR.F.Random.Normal(
+            DataTypes.BFloat16,
+            0.0f,
+            0.1f,
+            3,
+            parameterShape).Evaluate().AsTensor();
+        var stats = IR.F.NN.NormStats(2, input, useMean);
+        var output = IR.F.NN.NormApply(
+            2,
+            1e-6f,
+            input,
+            stats,
+            scale,
+            bias,
+            useMean);
+        var result = new IR.Tuple(stats, output);
+        var feedDict = new Dictionary<IVar, IValue>
+        {
+            {
+                input,
+                IR.F.Random.Normal(
+                    DataTypes.BFloat16,
+                    0.0f,
+                    1.0f,
+                    1,
+                    inputShape).Evaluate()
+            },
+            { scale, Value.FromTensor(scaleValue) },
+            { bias, Value.FromTensor(biasValue) },
+        };
+
+        await RunCases(
+            $"NormStatsApply_{useMean}",
+            feedDict,
+            new BaseExpr[] { result },
+            enableAutoDist: false);
+    }
+
+    [Theory]
     [MemberData(nameof(TestVectorizeBinaryData))]
     public async Task TestVectorizeBinary(BinaryOp op, long[] lhsShape, long[] rhsShape, int[] hierarchy, int[][] sbps, PostOpKind[] postOpKinds, int count)
     {
@@ -2386,7 +2451,9 @@ public sealed class UnitTestCPUKernels : TestClassBase
         }
 
         compiler.AutoTilingPass(pmgr);
-        compiler.TIRPass(pmgr);
+        compiler.TIRSelectionPass(pmgr);
+        compiler.FinalizeTIRCallGraphPass(pmgr);
+        compiler.TIRLoweringPass(pmgr);
         await pmgr.RunAsync(module);
     }
 }

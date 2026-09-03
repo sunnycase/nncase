@@ -163,6 +163,28 @@ public sealed class BlockScaledMatMulEvaluator :
                 $"for rhs {rhsShape}, got {scaleShape}.");
         }
 
+        if (lhs is DistributedType lhsDistributed &&
+            rhs is DistributedType rhsDistributed)
+        {
+            if (rhsScale is not DistributedType scaleDistributed ||
+                scaleDistributed.Placement != lhsDistributed.Placement ||
+                scaleDistributed.Partial is not null ||
+                scaleDistributed.AxisPolicies.Any(policy => policy is not SBPBroadCast))
+            {
+                return new InvalidType(
+                    "BlockScaledMatMul requires a replicated rhs scale on the matrix placement.");
+            }
+
+            if (!HasQuantizationBlockAlignedReductionShards(
+                    rhsDistributed,
+                    target.WeightBlockK))
+            {
+                return new InvalidType(
+                    $"BlockScaledMatMul rhs reduction shards must be contiguous and aligned to " +
+                    $"the weight K block {target.WeightBlockK}, got {rhsDistributed.AxisPolicies[^2]}.");
+            }
+        }
+
         return (lhs, rhs) switch
         {
             (TensorType lhsValue, TensorType rhsValue) => MatMulEvaluator.VisitTensorType(
@@ -224,5 +246,105 @@ public sealed class BlockScaledMatMulEvaluator :
         return tensor?.Shape is RankedShape { Rank: > 0 } shape && shape[^1].IsFixed
             ? checked((uint)shape[^1].FixedValue)
             : 1U;
+    }
+
+    private static bool HasQuantizationBlockAlignedReductionShards(
+        DistributedType rhs,
+        long blockSize)
+    {
+        var reductionAxis = rhs.TensorType.Shape.Rank - 2;
+        if (rhs.AxisPolicies[reductionAxis] is not SBPSplit split)
+        {
+            return true;
+        }
+
+        var globalExtent = rhs.TensorType.Shape[reductionAxis];
+        if (!globalExtent.IsFixed ||
+            blockSize <= 0 ||
+            (globalExtent.FixedValue % blockSize) != 0)
+        {
+            return false;
+        }
+
+        // Type inference is on AutoDistributed's hot candidate path. Prove the
+        // boundary invariant from the ordered split stages instead of building
+        // one symbolic LocalShardDescriptor for every placement owner.
+        var maximumParentExtent = globalExtent.FixedValue;
+        var parentExtentsAreUniform = true;
+        foreach (var stage in split.Stages)
+        {
+            var shardCount = stage.HierarchyAxes.Aggregate(
+                1L,
+                (count, axis) => checked(count * rhs.Placement.Hierarchy[axis]));
+            switch (stage.Distribution)
+            {
+                case ContiguousSplit contiguous:
+                    long localCapacity;
+                    if (contiguous.Granularity is { } granularity)
+                    {
+                        if (!granularity.IsFixed || granularity.FixedValue <= 0)
+                        {
+                            return false;
+                        }
+
+                        localCapacity = granularity.FixedValue;
+                    }
+                    else
+                    {
+                        // A later implicit split would derive different capacities
+                        // from non-uniform parent tails, so its boundaries cannot be
+                        // proven from one stage descriptor.
+                        if (!parentExtentsAreUniform)
+                        {
+                            return false;
+                        }
+
+                        localCapacity = MathUtility.CeilDiv(maximumParentExtent, shardCount);
+                    }
+
+                    if (checked(localCapacity * shardCount) < maximumParentExtent)
+                    {
+                        return false;
+                    }
+
+                    if (maximumParentExtent > localCapacity &&
+                        (localCapacity % blockSize) != 0)
+                    {
+                        return false;
+                    }
+
+                    parentExtentsAreUniform = parentExtentsAreUniform &&
+                        maximumParentExtent % localCapacity == 0;
+                    maximumParentExtent = System.Math.Min(maximumParentExtent, localCapacity);
+                    break;
+                case BlockCyclicSplit blockCyclic:
+                    // A block-cyclic shard is a single contiguous interval only
+                    // when each owner receives at most one block at this stage.
+                    if (maximumParentExtent > checked(shardCount * blockCyclic.BlockSize))
+                    {
+                        return false;
+                    }
+
+                    if (maximumParentExtent > blockCyclic.BlockSize &&
+                        (blockCyclic.BlockSize % blockSize) != 0)
+                    {
+                        return false;
+                    }
+
+                    parentExtentsAreUniform = parentExtentsAreUniform &&
+                        maximumParentExtent % blockCyclic.BlockSize == 0;
+                    maximumParentExtent = System.Math.Min(maximumParentExtent, blockCyclic.BlockSize);
+                    break;
+                default:
+                    return false;
+            }
+
+            if ((maximumParentExtent % blockSize) != 0)
+            {
+                return false;
+            }
+        }
+
+        return true;
     }
 }

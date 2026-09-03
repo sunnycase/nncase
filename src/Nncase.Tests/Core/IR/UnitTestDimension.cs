@@ -193,6 +193,18 @@ public sealed class UnitTestDimension
     }
 
     [Fact]
+    public void TestTryDivExactlyProvesAlignedAffineSum()
+    {
+        var y = new DimVar("y");
+        var x = new DimVar("x");
+        var aligned = (11141120 * y) + (1392640 * x);
+        var unaligned = aligned + 4;
+
+        Assert.True(Dimension.TryDivExactly(aligned, 16, out _));
+        Assert.False(Dimension.TryDivExactly(unaligned, 16, out _));
+    }
+
+    [Fact]
     public void TestDimensionMinMaxInferRange()
     {
         var lhs = new DimVar("lhs")

@@ -7,6 +7,20 @@
 {{ common.mesh_coordinates(model["MeshAxes"]) }}
     input0 = {{ ptr(model, "Input") }}
     output = {{ ptr(model, "Output") }}
+{% if ctx["reduction_parallel"] %}
+{% for axis in ctx["loop_axes"] %}
+{{ "    " * loop.index }}for out_idx{{ axis }} in tl.range(0, {{ dim(model["OutputShape"][axis]) }}):
+{% endfor %}
+{% set body = "    " * ((ctx["loop_axes"] | length) + 1) %}
+{{ body }}acc = tl.full((block_size,), {{ model["InitValue"] }}, tl.float32)
+{{ body }}for reduce_start in tl.range(0, {{ dim(model["InputShape"][ctx["reduction_axis"]]) }}, block_size):
+{{ body }}    reduce_lane = reduce_start + tl.arange(0, block_size)
+{{ body }}    reduce_mask = reduce_lane < {{ dim(model["InputShape"][ctx["reduction_axis"]]) }}
+{{ body }}    value0 = tl.load({{ access_pointer(model, "Input", "input0", ctx["input_access"]) }}, mask=reduce_mask, other={{ model["InitValue"] }}).to(tl.float32)
+{{ body }}    acc = {{ model["UpdateExpression"] }}
+{{ body }}result = {{ ctx["finalize_expression"] }}
+{{ body }}tl.store({{ access_pointer(model, "Output", "output", ctx["output_access"]) }}, result)
+{% else %}
 {% for axis in ctx["loop_axes"] %}
 {{ "    " * loop.index }}for out_idx{{ axis }} in tl.range(0, {{ dim(model["OutputShape"][axis]) }}):
 {% endfor %}
@@ -24,6 +38,7 @@
 {{ reduce_body }}acc = {{ model["UpdateExpression"] }}
 {{ body }}result = {{ model["FinalizeExpression"] }}
 {{ body }}tl.store({{ access_pointer(model, "Output", "output", ctx["output_access"]) }}, result, mask=mask)
+{% endif %}
 
 
 {{ phases.dispatch(model) }}

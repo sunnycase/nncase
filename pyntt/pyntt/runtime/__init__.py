@@ -8,6 +8,8 @@ from .tensor import allocate_outputs, materialize_results, resolve_execution_dev
 from .tuning import select_tuning_parameter
 from .triton import ensure_triton_allocator
 from .workspace import RDataCache, WorkspacePool, allocate_workspace, materialize_rdata, materialize_rdata_table
+from .cpu import CpuFunctionSpec, CpuInputSpec, CpuInvocation, CpuNttModule, CpuOutputSpec
+from .pipeline import PIPELINE_CHANNEL_HEADER_BYTES, PipelineChannel
 
 __all__ = [
     "LocalShard",
@@ -16,12 +18,19 @@ __all__ = [
     "PyNTTError",
     "PyNTTInterpreter",
     "PyNTTModule",
+    "PipelineChannel",
+    "PIPELINE_CHANNEL_HEADER_BYTES",
     "PyNTTSpecError",
     "RDataCache",
     "ShardedTensorSpec",
     "WorkspacePool",
     "allocate_outputs",
     "allocate_workspace",
+    "CpuFunctionSpec",
+    "CpuInputSpec",
+    "CpuInvocation",
+    "CpuNttModule",
+    "CpuOutputSpec",
     "ensure_triton_allocator",
     "local_shard_1d",
     "materialize_rdata",

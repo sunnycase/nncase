@@ -25,7 +25,11 @@ public sealed class FuseGatherReduceNormApplyPass : ModulePass
 
     protected override Task<IRModule> RunCoreAsync(IRModule input, RunPassContext context)
     {
-        foreach (var function in input.Functions.OfType<PrimFunction>().Where(function => function.ModuleKind == _moduleKind))
+        foreach (var function in input.Functions
+                     .OfType<PrimFunction>()
+                     .Where(function =>
+                         function.ModuleKind == _moduleKind &&
+                         CompileSession.IsFunctionActive(function)))
         {
             var useCounts = CollectBufferCallUseCounts(function.Body);
             var rewriter = new FusionRewriter(useCounts);

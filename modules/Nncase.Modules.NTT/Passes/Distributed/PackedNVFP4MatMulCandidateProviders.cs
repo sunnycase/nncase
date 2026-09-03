@@ -26,17 +26,21 @@ internal static class PackedNVFP4DistributedCandidates
         int weightScaleIndex,
         int inputGlobalScaleIndex,
         int weightGlobalScaleIndex,
+        TensorType outputTensor,
+        int? addendIndex,
         bool allowReductionSplit)
     {
         if (!TryGetSourceTensorType(context, inputIndex, out var inputTensor) ||
             !TryGetSourceTensorType(context, weightPackedIndex, out var weightPackedTensor) ||
             !TryGetSourceTensorType(context, weightScaleIndex, out var weightScaleTensor) ||
             !TryGetSourceTensorType(context, inputGlobalScaleIndex, out var inputGlobalScaleTensor) ||
-            !TryGetSourceTensorType(context, weightGlobalScaleIndex, out var weightGlobalScaleTensor) ||
-            context.SourceCall.CheckedType is not TensorType outputTensor)
+            !TryGetSourceTensorType(context, weightGlobalScaleIndex, out var weightGlobalScaleTensor))
         {
             yield break;
         }
+
+        var hasAddend = addendIndex is { } index &&
+            context.AvailableInputTypes[index].Any(type => type is not NoneType);
 
         foreach (var placement in GetPlacements(context))
         {
@@ -63,6 +67,7 @@ internal static class PackedNVFP4DistributedCandidates
                             weightScaleTensor,
                             inputGlobalScaleTensor,
                             weightGlobalScaleTensor,
+                            hasAddend,
                             out var candidate))
                     {
                         yield return candidate;
@@ -85,6 +90,7 @@ internal static class PackedNVFP4DistributedCandidates
         TensorType weightScaleTensor,
         TensorType inputGlobalScaleTensor,
         TensorType weightGlobalScaleTensor,
+        bool hasAddend,
         out PackedNVFP4ProjectionCandidate candidate)
     {
         candidate = null!;
@@ -158,7 +164,8 @@ internal static class PackedNVFP4DistributedCandidates
             weightPacked,
             weightScale,
             inputGlobalScale,
-            weightGlobalScale);
+            weightGlobalScale,
+            hasAddend ? requestedOutput : NoneType.Default);
         if (output is not DistributedType distributedOutput ||
             distributedOutput.TensorType != requestedOutput.TensorType ||
             !distributedOutput.AxisPolicies.SequenceEqual(requestedOutput.AxisPolicies))
@@ -172,6 +179,7 @@ internal static class PackedNVFP4DistributedCandidates
             weightScale,
             inputGlobalScale,
             weightGlobalScale,
+            hasAddend ? distributedOutput : NoneType.Default,
             distributedOutput);
         return true;
     }
@@ -249,6 +257,7 @@ internal sealed class PackedNVFP4MatMulCandidateProvider :
                     candidate.WeightScale,
                     candidate.InputGlobalScale,
                     candidate.WeightGlobalScale,
+                    candidate.Addend,
                 ],
                 "packed-nvfp4-matmul-sbp"))
             .Distinct()
@@ -260,7 +269,8 @@ internal sealed class PackedNVFP4MatMulCandidateProvider :
         DistributedCandidateContext context,
         PackedNVFP4MatMul target)
     {
-        if (context.AvailableInputTypes.Count != 5)
+        if (context.AvailableInputTypes.Count != 6 ||
+            context.SourceCall.CheckedType is not TensorType outputTensor)
         {
             return [];
         }
@@ -278,7 +288,90 @@ internal sealed class PackedNVFP4MatMulCandidateProvider :
             PackedNVFP4MatMul.RhsScale.Index,
             PackedNVFP4MatMul.LhsGlobalScale.Index,
             PackedNVFP4MatMul.RhsGlobalScale.Index,
+            outputTensor,
+            PackedNVFP4MatMul.Addend.Index,
             allowReductionSplit: true);
+    }
+}
+
+internal sealed class PackedNVFP4MatMulNormStatsCandidateProvider :
+    DistributedCandidateProvider<PackedNVFP4MatMulNormStats>
+{
+    public override bool IsExhaustive => true;
+
+    public override IReadOnlyList<IRType> GetReturnCandidateTypes(
+        DistributedCandidateContext context,
+        PackedNVFP4MatMulNormStats target,
+        IReadOnlyList<IRType> defaultReturnTypes)
+        => Enumerate(context, target)
+            .Select(candidate => candidate.Output)
+            .Distinct()
+            .ToArray();
+
+    public override bool TryGetInputTypeTuples(
+        DistributedCandidateContext context,
+        PackedNVFP4MatMulNormStats target,
+        IRType returnType,
+        out IReadOnlyList<DistributedCandidateTuple> tuples)
+    {
+        tuples = Enumerate(context, target)
+            .Where(candidate => candidate.Output == returnType)
+            .Select(candidate => new DistributedCandidateTuple(
+                [
+                    candidate.Projection.Input,
+                    candidate.Projection.WeightPacked,
+                    candidate.Projection.WeightScale,
+                    candidate.Projection.InputGlobalScale,
+                    candidate.Projection.WeightGlobalScale,
+                    candidate.Projection.Addend,
+                ],
+                "packed-nvfp4-matmul-norm-stats-sbp"))
+            .Distinct()
+            .ToArray();
+        return true;
+    }
+
+    private static IEnumerable<PackedNVFP4NormStatsCandidate> Enumerate(
+        DistributedCandidateContext context,
+        PackedNVFP4MatMulNormStats target)
+    {
+        if (context.AvailableInputTypes.Count != 6 ||
+            context.SourceCall.CheckedType is not TupleType { Count: 2 } sourceOutput ||
+            sourceOutput.Fields[0] is not TensorType valueOutputTensor)
+        {
+            yield break;
+        }
+
+        foreach (var projection in PackedNVFP4DistributedCandidates.EnumerateProjection(
+                     context,
+                     target.OutputDataType,
+                     target.GroupSize,
+                     target.InputKVectorLaneCount,
+                     target.RhsKPackLaneCount,
+                     target.RhsKVectorLaneCount,
+                     target.OutputNVectorLaneCount,
+                     PackedNVFP4MatMulNormStats.Lhs.Index,
+                     PackedNVFP4MatMulNormStats.RhsPacked.Index,
+                     PackedNVFP4MatMulNormStats.RhsScale.Index,
+                     PackedNVFP4MatMulNormStats.LhsGlobalScale.Index,
+                     PackedNVFP4MatMulNormStats.RhsGlobalScale.Index,
+                     valueOutputTensor,
+                     PackedNVFP4MatMulNormStats.Addend.Index,
+                     allowReductionSplit: false))
+        {
+            var output = PackedNVFP4MatMulNormStatsEvaluator.InferType(
+                target,
+                projection.Input,
+                projection.WeightPacked,
+                projection.WeightScale,
+                projection.InputGlobalScale,
+                projection.WeightGlobalScale,
+                projection.Addend);
+            if (output is not InvalidType)
+            {
+                yield return new(projection, output);
+            }
+        }
     }
 }
 
@@ -326,7 +419,8 @@ internal sealed class PackedNVFP4MatMulGluCandidateProvider :
         DistributedCandidateContext context,
         PackedNVFP4MatMulGlu target)
     {
-        if (context.AvailableInputTypes.Count != 9)
+        if (context.AvailableInputTypes.Count != 9 ||
+            context.SourceCall.CheckedType is not TensorType outputTensor)
         {
             yield break;
         }
@@ -344,6 +438,8 @@ internal sealed class PackedNVFP4MatMulGluCandidateProvider :
             PackedNVFP4MatMulGlu.GateWeightScale.Index,
             PackedNVFP4MatMulGlu.GateInputGlobalScale.Index,
             PackedNVFP4MatMulGlu.GateWeightGlobalScale.Index,
+            outputTensor,
+            addendIndex: null,
             allowReductionSplit: false)
             .ToArray();
         var upCandidates = PackedNVFP4DistributedCandidates.EnumerateProjection(
@@ -359,6 +455,8 @@ internal sealed class PackedNVFP4MatMulGluCandidateProvider :
             PackedNVFP4MatMulGlu.UpWeightScale.Index,
             PackedNVFP4MatMulGlu.UpInputGlobalScale.Index,
             PackedNVFP4MatMulGlu.UpWeightGlobalScale.Index,
+            outputTensor,
+            addendIndex: null,
             allowReductionSplit: false)
             .ToArray();
 
@@ -403,6 +501,11 @@ internal sealed record PackedNVFP4ProjectionCandidate(
     IRType WeightScale,
     IRType InputGlobalScale,
     IRType WeightGlobalScale,
+    IRType Addend,
+    IRType Output);
+
+internal sealed record PackedNVFP4NormStatsCandidate(
+    PackedNVFP4ProjectionCandidate Projection,
     IRType Output);
 
 internal sealed record PackedNVFP4MatMulGluCandidate(

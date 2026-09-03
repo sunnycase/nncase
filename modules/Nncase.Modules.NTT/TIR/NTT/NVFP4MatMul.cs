@@ -22,6 +22,8 @@ public sealed partial class NVFP4MatMul : NTTKernelOp
 
     public static readonly ParameterInfo Output = new(typeof(NVFP4MatMul), 5, "output", memoryEffect: MemoryEffect.ReductionWrite);
 
+    public static readonly ParameterInfo Addend = new(typeof(NVFP4MatMul), 6, "addend", memoryEffect: MemoryEffect.Read);
+
     public long GroupSize { get; }
 
     public override string DisplayProperty() => $"GroupSize: {GroupSize}";

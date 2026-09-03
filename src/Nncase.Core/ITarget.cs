@@ -104,6 +104,30 @@ public interface ITarget
     IModuleCompiler GetModuleCompiler(string moduleKind);
 
     /// <summary>
+    /// Gets the target that owns target-specific lowering for a module kind.
+    /// Composite targets override this to delegate heterogeneous compilation
+    /// units to their concrete backend targets.
+    /// </summary>
+    ITarget GetModuleTarget(string moduleKind) => this;
+
+    /// <summary>
+    /// Gets compile options for one module-kind compilation unit.
+    /// </summary>
+    CompileOptions GetModuleCompileOptions(string moduleKind, CompileOptions options)
+        => options;
+
+    /// <summary>
+    /// Selects the preferred module kind for a semantic operation. Placement
+    /// passes validate the result against the selected module compiler.
+    /// </summary>
+    string GetPreferredModuleKind(BaseFunction owner, Call call, CompileOptions options)
+        => ModuleCompilers.Count == 1
+            ? ModuleCompilers[0].ModuleKind
+            : throw new InvalidOperationException(
+                $"Composite target {Name} must define operation placement across " +
+                $"[{string.Join(", ", ModuleCompilers.Select(compiler => compiler.ModuleKind))}].");
+
+    /// <summary>
     /// create the current target's command and parser.
     /// </summary>
     /// <returns>command.</returns>

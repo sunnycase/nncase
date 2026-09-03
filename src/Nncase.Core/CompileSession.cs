@@ -31,11 +31,20 @@ public sealed class CompileSession : IServiceProvider, IDisposable
     /// <param name="serviceProvider">Service provider.</param>
     /// <param name="target">Target.</param>
     /// <param name="compileOptions">Compile options.</param>
-    internal CompileSession(IResolverContext serviceProvider, ITarget target, CompileOptions compileOptions)
+    /// <param name="activeModuleKind">Optional backend module selected by this session.</param>
+    /// <param name="activeFunctionRole">Optional function role selected by this session.</param>
+    internal CompileSession(
+        IResolverContext serviceProvider,
+        ITarget target,
+        CompileOptions compileOptions,
+        string? activeModuleKind = null,
+        FunctionRole? activeFunctionRole = null)
     {
         _serviceProvider = serviceProvider;
         Target = target;
         CompileOptions = compileOptions;
+        ActiveModuleKind = activeModuleKind;
+        ActiveFunctionRole = activeFunctionRole;
     }
 
     /// <summary>
@@ -49,23 +58,69 @@ public sealed class CompileSession : IServiceProvider, IDisposable
     public CompileOptions CompileOptions { get; }
 
     /// <summary>
+    /// Gets the module kind selected for a target-specific compilation unit.
+    /// Null denotes a whole-module, target-independent session.
+    /// </summary>
+    public string? ActiveModuleKind { get; }
+
+    /// <summary>
+    /// Gets the function role selected for a role-specific compilation unit.
+    /// Null denotes that the session does not select functions by role.
+    /// </summary>
+    public FunctionRole? ActiveFunctionRole { get; }
+
+    /// <summary>
     /// Gets compiler.
     /// </summary>
     public ICompiler Compiler => _compiler ??= this.GetRequiredService<ICompiler>();
+
+    /// <summary>
+    /// Tests whether a function belongs to this compilation unit.
+    /// </summary>
+    /// <param name="function">Function to test.</param>
+    /// <returns>True when the function belongs to the active compilation unit.</returns>
+    public bool IsFunctionActive(BaseFunction function)
+    {
+        if (ActiveFunctionRole is { } activeFunctionRole)
+        {
+            return function.Role == activeFunctionRole &&
+                (ActiveModuleKind is null ||
+                 string.Equals(function.ModuleKind, ActiveModuleKind, StringComparison.Ordinal));
+        }
+
+        if (ActiveModuleKind is { } activeModuleKind)
+        {
+            return function.Role != FunctionRole.ModuleDispatch &&
+                string.Equals(function.ModuleKind, activeModuleKind, StringComparison.Ordinal);
+        }
+
+        return true;
+    }
 
     /// <summary>
     /// Create new compile session.
     /// </summary>
     /// <param name="target">Compile target.</param>
     /// <param name="compileOptions">Compile options.</param>
+    /// <param name="activeModuleKind">Optional backend module selected by this session.</param>
+    /// <param name="activeFunctionRole">Optional function role selected by this session.</param>
     /// <returns>Created compile session.</returns>
-    public static CompileSession Create(ITarget target, CompileOptions compileOptions)
+    public static CompileSession Create(
+        ITarget target,
+        CompileOptions compileOptions,
+        string? activeModuleKind = null,
+        FunctionRole? activeFunctionRole = null)
     {
         var childContainer = CompilerServices.CreateScope();
         childContainer.RegisterInstance(target);
         childContainer.RegisterInstance(compileOptions);
 
-        var session = new CompileSession(childContainer, target, compileOptions);
+        var session = new CompileSession(
+            childContainer,
+            target,
+            compileOptions,
+            activeModuleKind,
+            activeFunctionRole);
         childContainer.RegisterInstance(session);
         return session;
     }

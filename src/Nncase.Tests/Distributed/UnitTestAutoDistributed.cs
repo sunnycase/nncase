@@ -13,11 +13,13 @@ using Nncase.Diagnostics;
 using Nncase.Evaluator.IR.NTT;
 using Nncase.Evaluator.NN;
 using Nncase.IR;
+using Nncase.IR.Heterogeneous;
 using Nncase.IR.Math;
 using Nncase.IR.NN;
 using Nncase.IR.NTT;
 using Nncase.IR.Shapes;
 using Nncase.Passes.Distributed;
+using Nncase.Passes.Rules.NTT;
 using Nncase.Passes.Rules.ShapeBucket;
 using Nncase.Targets;
 using Nncase.Tests.TestFixture;
@@ -47,6 +49,28 @@ public sealed class UnitTestDistribAutoDistributed : TestClassBase
         var main = new Function("main", lhs + rhs, [lhs, rhs]);
         var pass = new AutoDistributedPass(false, CPUTarget.Kind, CompileOptions);
         pass.RunAsync(main, new()).Wait();
+    }
+
+    [Fact]
+    public async Task TestPreservesSemanticRegionWhenMaterializingSelectedOperation()
+    {
+        var lhs = new Var("lhs", new TensorType(DataTypes.Float32, [32, 1]));
+        var rhs = new Var("rhs", new TensorType(DataTypes.Float32, [16]));
+        var add = Assert.IsType<Call>(IR.F.Math.Add(lhs, rhs));
+        var region = new SemanticRegion(
+            SemanticRegionKinds.Attention,
+            "model.layers.0.linear_attn");
+        add.Metadata.SemanticRegion = region;
+        var main = new Function("main", add, [lhs, rhs]);
+
+        var distributed = Assert.IsType<Function>(
+            await new AutoDistributedPass(false, CPUTarget.Kind, CompileOptions).RunAsync(main, new()));
+
+        var selectedAdd = Assert.Single(
+            ExprCollector.Collect(distributed.Body)
+                .OfType<Call>()
+                .Where(call => call.Target is Binary));
+        Assert.Equal(region, selectedAdd.Metadata.SemanticRegion);
     }
 
     [Fact]
@@ -112,6 +136,329 @@ public sealed class UnitTestDistribAutoDistributed : TestClassBase
         var tuple = Assert.Single(tuples);
         Assert.Equal(producerSplitType, tuple.InputTypes[0]);
         Assert.Equal(producerSplitType, tuple.InputTypes[1]);
+    }
+
+    [Fact]
+    public void TestPipelineChannelConsumeProducesDemandedMaterializedShard()
+    {
+        var options = new PyNTTTargetOptions
+        {
+            HierarchyNames = "yx",
+            HierarchyLevels = "bb",
+            Hierarchies = [new[] { 4, 8 }],
+        };
+        CompileOptions.TargetOptions = options;
+        var placement = new Placement([4, 8], "yx", "bb");
+        var payloadType = new TensorType(
+            new VectorType(DataTypes.BFloat16, [8]),
+            new RankedShape(24, 32, 1));
+        var shardedPayloadType = new DistributedType(
+            payloadType,
+            [SBP.B, SBP.SBlockCyclic([0, 1], 1), SBP.B],
+            placement);
+        var channelType = TensorType.Scalar(new ReferenceType(new PipelineChannelType()));
+        var channel = new Var("channel", channelType);
+        var sourceCall = Assert.IsType<Call>(IR.F.Heterogeneous.Consume(
+            channel,
+            None.Default,
+            "cpu_to_pyntt",
+            0,
+            payloadType));
+        Assert.True(sourceCall.InferenceType());
+        var context = new DistributedCandidateContext(
+            CompileOptions,
+            options,
+            PyNTTTarget.Kind,
+            sourceCall,
+            [
+                new IRType[] { channelType },
+                new IRType[] { NoneType.Default },
+            ]);
+        var provider = new PipelineChannelConsumeCandidateProvider();
+        var target = Assert.IsType<Consume>(sourceCall.Target);
+
+        var returnTypes = provider.GetReturnCandidateTypes(
+            context,
+            target,
+            [shardedPayloadType]);
+        Assert.Equal(new IRType[] { shardedPayloadType }, returnTypes);
+        Assert.True(provider.TryGetInputTypeTuples(
+            context,
+            target,
+            shardedPayloadType,
+            out var tuples));
+        var tuple = Assert.Single(tuples);
+        Assert.Equal(channelType, tuple.InputTypes[Consume.Channel.Index]);
+        Assert.Equal(NoneType.Default, tuple.InputTypes[Consume.Dependency.Index]);
+
+        var candidateTarget = provider.CreateCandidateTarget(context, target, shardedPayloadType);
+        var candidateCall = new Call(candidateTarget, channel, None.Default);
+        Assert.True(candidateCall.InferenceType());
+        Assert.Equal(shardedPayloadType, candidateCall.CheckedType);
+    }
+
+    [Fact]
+    public void TestQKVParallelLinearCandidateProviderDerivesTupleWithoutCartesianInputs()
+    {
+        var options = new PyNTTTargetOptions
+        {
+            HierarchyNames = "yx",
+            HierarchyLevels = "bb",
+            Hierarchies = [new[] { 4, 8 }],
+        };
+        CompileOptions.TargetOptions = options;
+        var placement = new Placement([4, 8], "yx", "bb");
+        var inputTensor = new TensorType(DataTypes.BFloat16, [1, 64]);
+        var qWeightTensor = new TensorType(DataTypes.Float8E4M3, [64, 128]);
+        var kvWeightTensor = new TensorType(DataTypes.Float8E4M3, [64, 32]);
+        var inputType = new DistributedType(inputTensor, [SBP.B, SBP.B], placement);
+        var qWeightType = new DistributedType(
+            qWeightTensor,
+            [SBP.B, SBP.SBlockCyclic([0, 1], 8)],
+            placement);
+        var kvWeightType = new DistributedType(
+            kvWeightTensor,
+            [SBP.B, SBP.SBlockCyclic([1], 8)],
+            placement);
+        var qOutputType = new DistributedType(
+            new TensorType(DataTypes.BFloat16, [1, 128]),
+            [SBP.B, SBP.SBlockCyclic([0, 1], 8)],
+            placement);
+        var kvOutputType = new DistributedType(
+            new TensorType(DataTypes.BFloat16, [1, 32]),
+            [SBP.B, SBP.SBlockCyclic([1], 8)],
+            placement);
+
+        var input = new Var("input", inputTensor);
+        var qWeight = new Var("q_weight", qWeightTensor);
+        var kWeight = new Var("k_weight", kvWeightTensor);
+        var vWeight = new Var("v_weight", kvWeightTensor);
+        var sourceCall = Assert.IsType<Call>(IR.F.NN.QKVParallelLinear(
+            input,
+            qWeight,
+            kWeight,
+            vWeight,
+            None.Default,
+            None.Default,
+            None.Default,
+            None.Default,
+            None.Default,
+            None.Default,
+            None.Default,
+            None.Default,
+            None.Default,
+            4,
+            1,
+            DataTypes.BFloat16));
+        Assert.True(sourceCall.InferenceType());
+        var context = new DistributedCandidateContext(
+            CompileOptions,
+            options,
+            PyNTTTarget.Kind,
+            sourceCall,
+            [
+                new IRType[] { inputType },
+                new IRType[] { qWeightType },
+                new IRType[] { kvWeightType },
+                new IRType[] { kvWeightType },
+                new IRType[] { NoneType.Default },
+                new IRType[] { NoneType.Default },
+                new IRType[] { NoneType.Default },
+                new IRType[] { NoneType.Default },
+                new IRType[] { NoneType.Default },
+                new IRType[] { NoneType.Default },
+                new IRType[] { NoneType.Default },
+                new IRType[] { NoneType.Default },
+                new IRType[] { NoneType.Default },
+            ]);
+        var provider = new QKVParallelLinearCandidateProvider();
+        var target = Assert.IsType<QKVParallelLinear>(sourceCall.Target);
+        var expectedOutput = new TupleType([qOutputType, kvOutputType, kvOutputType]);
+
+        var returnTypes = provider.GetReturnCandidateTypes(context, target, []);
+        Assert.Contains(expectedOutput, returnTypes);
+        Assert.True(provider.TryGetInputTypeTuples(
+            context,
+            target,
+            expectedOutput,
+            out var tuples));
+        var tuple = Assert.Single(tuples);
+        Assert.Equal(13, tuple.InputTypes.Count);
+        Assert.Equal(inputType, tuple.InputTypes[QKVParallelLinear.Input.Index]);
+        Assert.Equal(qWeightType, tuple.InputTypes[QKVParallelLinear.QWeight.Index]);
+        Assert.Equal(kvWeightType, tuple.InputTypes[QKVParallelLinear.KWeight.Index]);
+        Assert.Equal(kvWeightType, tuple.InputTypes[QKVParallelLinear.VWeight.Index]);
+    }
+
+    [Fact]
+    public void TestPackedDynamicQKVCandidateProviderDiscoversOutputNSplitsFromSourceTypes()
+    {
+        var options = new PyNTTTargetOptions
+        {
+            HierarchyNames = "yx",
+            HierarchyLevels = "bb",
+            Hierarchies = [new[] { 4, 8 }],
+        };
+        CompileOptions.TargetOptions = options;
+        var placement = new Placement([4, 8], "yx", "bb");
+        var inputTensor = new TensorType(DataTypes.BFloat16, [1, 5120]);
+        var qWeightTensor = new TensorType(
+            new VectorType(DataTypes.Float8E4M3, [2, 16]),
+            [12288, 160]);
+        var kvWeightTensor = new TensorType(
+            new VectorType(DataTypes.Float8E4M3, [2, 16]),
+            [1024, 160]);
+        var qScaleTensor = new TensorType(new VectorType(DataTypes.BFloat16, [8]), [1536]);
+        var kvScaleTensor = new TensorType(new VectorType(DataTypes.BFloat16, [8]), [128]);
+
+        var input = new Var("input", inputTensor);
+        var qWeight = new Var("q_weight", qWeightTensor);
+        var kWeight = new Var("k_weight", kvWeightTensor);
+        var vWeight = new Var("v_weight", kvWeightTensor);
+        var qScale = new Var("q_scale", qScaleTensor);
+        var kScale = new Var("k_scale", kvScaleTensor);
+        var vScale = new Var("v_scale", kvScaleTensor);
+        var sourceCall = Assert.IsType<Call>(IR.F.NTT.PackedQKVParallelLinear(
+            input,
+            qWeight,
+            kWeight,
+            vWeight,
+            None.Default,
+            None.Default,
+            None.Default,
+            None.Default,
+            None.Default,
+            None.Default,
+            qScale,
+            kScale,
+            vScale,
+            24,
+            4,
+            DataTypes.BFloat16,
+            PackedMatMulRhsLayout.NMajorKPacked,
+            8,
+            MatMulQuantizationMode.DynamicTensor));
+        Assert.True(sourceCall.InferenceType());
+
+        DistributedType Replicate(TensorType tensorType) => new(
+            tensorType,
+            Enumerable.Repeat<SBP>(SBP.B, tensorType.Shape.Rank).ToArray(),
+            placement);
+        var context = new DistributedCandidateContext(
+            CompileOptions,
+            options,
+            PyNTTTarget.Kind,
+            sourceCall,
+            [
+                new IRType[] { Replicate(inputTensor) },
+                new IRType[] { Replicate(qWeightTensor) },
+                new IRType[] { Replicate(kvWeightTensor) },
+                new IRType[] { Replicate(kvWeightTensor) },
+                new IRType[] { NoneType.Default },
+                new IRType[] { NoneType.Default },
+                new IRType[] { NoneType.Default },
+                new IRType[] { NoneType.Default },
+                new IRType[] { NoneType.Default },
+                new IRType[] { NoneType.Default },
+                new IRType[] { Replicate(qScaleTensor) },
+                new IRType[] { Replicate(kvScaleTensor) },
+                new IRType[] { Replicate(kvScaleTensor) },
+            ]);
+        var provider = new PackedQKVParallelLinearCandidateProvider();
+        var target = Assert.IsType<PackedQKVParallelLinear>(sourceCall.Target);
+
+        var returnTypes = provider.GetReturnCandidateTypes(context, target, []);
+        var splitOutputs = returnTypes.OfType<TupleType>().Where(type =>
+            type.Fields[0] is DistributedType q &&
+            type.Fields[1] is DistributedType k &&
+            type.Fields[2] is DistributedType v &&
+            q.AxisPolicies[^1] is SBPSplit &&
+            q.AxisPolicies[^1] == k.AxisPolicies[^1] &&
+            q.AxisPolicies[^1] == v.AxisPolicies[^1]).ToArray();
+        Assert.NotEmpty(splitOutputs);
+        var splitOutput = splitOutputs[0];
+        Assert.True(provider.TryGetInputTypeTuples(context, target, splitOutput, out var tuples));
+        Assert.NotEmpty(tuples);
+        Assert.All(tuples, tuple =>
+        {
+            Assert.IsType<SBPSplit>(Assert.IsType<DistributedType>(
+                tuple.InputTypes[PackedQKVParallelLinear.QWeight.Index]).AxisPolicies[0]);
+            Assert.IsType<SBPSplit>(Assert.IsType<DistributedType>(
+                tuple.InputTypes[PackedQKVParallelLinear.QWeightScale.Index]).AxisPolicies[0]);
+        });
+    }
+
+    [Fact]
+    public void TestProviderFactorsEquivalentInputRealizationsFromOperationContracts()
+    {
+        var options = new PyNTTTargetOptions
+        {
+            HierarchyNames = "yx",
+            HierarchyLevels = "bb",
+            Hierarchies = [new[] { 2, 2 }],
+        };
+        CompileOptions.TargetOptions = options;
+        var input = new Var("input", new TensorType(DataTypes.BFloat16, [1, 64]));
+        var qWeight = new Var("q_weight", new TensorType(DataTypes.Float8E4M3, [64, 128]));
+        var kWeight = new Var("k_weight", new TensorType(DataTypes.Float8E4M3, [64, 32]));
+        var vWeight = new Var("v_weight", new TensorType(DataTypes.Float8E4M3, [64, 32]));
+        var qWeightScale = new Var("q_weight_scale", new TensorType(DataTypes.BFloat16, [128]));
+        var kWeightScale = new Var("k_weight_scale", new TensorType(DataTypes.BFloat16, [32]));
+        var vWeightScale = new Var("v_weight_scale", new TensorType(DataTypes.BFloat16, [32]));
+        var qkv = IR.F.NN.QKVParallelLinear(
+            input,
+            qWeight,
+            kWeight,
+            vWeight,
+            None.Default,
+            None.Default,
+            None.Default,
+            None.Default,
+            None.Default,
+            None.Default,
+            IR.F.Math.Unary(UnaryOp.Abs, qWeightScale),
+            IR.F.Math.Unary(UnaryOp.Abs, kWeightScale),
+            IR.F.Math.Unary(UnaryOp.Abs, vWeightScale),
+            4,
+            1,
+            DataTypes.BFloat16,
+            MatMulQuantizationMode.DynamicTensor);
+        var main = new Function(
+            "main",
+            qkv,
+            [input, qWeight, kWeight, vWeight, qWeightScale, kWeightScale, vWeightScale]);
+        Assert.True(main.InferenceType());
+
+        var rewriter = new AutoDistributedRewriter(
+            CompileOptions,
+            options,
+            AutoDistributedPhase.Final,
+            PyNTTTarget.Kind);
+        _ = rewriter.BuildSearchGraph(main);
+        var graphField = typeof(AutoDistributedRewriter).GetField(
+            "_rootSearchGraph",
+            BindingFlags.Instance | BindingFlags.NonPublic);
+        var graph = Assert.IsType<DistributedSearchGraph>(graphField?.GetValue(rewriter));
+        var candidates = graph.Vertices
+            .Where(node => node.Expr is QKVParallelLinear)
+            .Select(node =>
+            {
+                Assert.True(graph.TryGetOutEdges(node, out var edges));
+                var inputTypes = edges
+                    .Where(edge => edge.InputIndex >= 0)
+                    .OrderBy(edge => edge.InputIndex)
+                    .Select(edge => edge.InputGraph.Vertices.First().IRType.ToString());
+                return $"{node.IRType}|{string.Join('|', inputTypes)}";
+            })
+            .ToArray();
+
+        Assert.NotEmpty(candidates);
+        Assert.All(candidates.GroupBy(candidate => candidate), group => Assert.Single(group));
+        Assert.Contains(
+            graph.Clusters
+                .OfType<DistributedSearchGraph>()
+                .SelectMany(cluster => cluster.Clusters.OfType<DistributedSearchGraph>()),
+            bucket => bucket.Vertices.Count(node => node.Kind == SearchableNodeKind.TypeAdapter) > 1);
     }
 
     [Fact]
@@ -349,7 +696,7 @@ public sealed class UnitTestDistribAutoDistributed : TestClassBase
         var convolutionCall = IR.F.NN.GatedDeltaNetConvolution(
             qkv,
             state,
-            Buffer("conv_weight", bf16, convDim, convKernelSize),
+            Buffer("conv_weight", packedActivation, convDim / 8, convKernelSize),
             0,
             convKernelSize);
         var convolutionOutput = Assert.IsType<TupleType>(convolutionCall.CheckedType);
@@ -946,6 +1293,7 @@ public sealed class UnitTestDistribAutoDistributed : TestClassBase
                 new IRType[] { weightScaleType },
                 new IRType[] { globalScaleType },
                 new IRType[] { globalScaleType },
+                new IRType[] { NoneType.Default },
             ]);
         var matmulProvider = new PackedNVFP4MatMulCandidateProvider();
         var matmulTarget = Assert.IsType<PackedNVFP4MatMul>(matmulCall.Target);
@@ -1107,6 +1455,154 @@ public sealed class UnitTestDistribAutoDistributed : TestClassBase
     }
 
     [Fact]
+    public void TestBlockScaledMatMulRequiresReplicatedScaleAndBlockAlignedReductionShards()
+    {
+        var placement = new Placement([24], "b", "b");
+        var lhsTensor = new TensorType(DataTypes.BFloat16, [1, 6144]);
+        var rhsTensor = new TensorType(DataTypes.Float8E4M3, [6144, 5120]);
+        var scaleTensor = new TensorType(DataTypes.BFloat16, [5120, 6]);
+        var target = new Nncase.IR.Math.BlockScaledMatMul(
+            DataTypes.BFloat16,
+            1,
+            1024);
+        var reductionLhs = new DistributedType(
+            lhsTensor,
+            [SBP.B, SBP.SContiguous([0], 256)],
+            placement);
+        var reductionRhs = new DistributedType(
+            rhsTensor,
+            [SBP.SContiguous([0], 256), SBP.B],
+            placement);
+        var splitScale = new DistributedType(
+            scaleTensor,
+            [SBP.SContiguous([0], 214), SBP.B],
+            placement);
+        var replicatedScale = new DistributedType(
+            scaleTensor,
+            [SBP.B, SBP.B],
+            placement);
+
+        var splitScaleResult = Nncase.Evaluator.Math.BlockScaledMatMulEvaluator.InferType(
+            target,
+            reductionLhs,
+            reductionRhs,
+            splitScale);
+        Assert.IsType<InvalidType>(splitScaleResult);
+
+        var unalignedReductionResult = Nncase.Evaluator.Math.BlockScaledMatMulEvaluator.InferType(
+            target,
+            reductionLhs,
+            reductionRhs,
+            replicatedScale);
+        Assert.IsType<InvalidType>(unalignedReductionResult);
+
+        var columnLhs = new DistributedType(lhsTensor, [SBP.B, SBP.B], placement);
+        var columnRhs = new DistributedType(
+            rhsTensor,
+            [SBP.B, SBP.SContiguous([0], 214)],
+            placement);
+        var columnResult = Nncase.Evaluator.Math.BlockScaledMatMulEvaluator.InferType(
+            target,
+            columnLhs,
+            columnRhs,
+            replicatedScale);
+        Assert.IsType<DistributedType>(columnResult);
+
+        var alignedPlacement = new Placement([6], "b", "b");
+        var alignedLhs = new DistributedType(
+            lhsTensor,
+            [SBP.B, SBP.SContiguous([0], 1024)],
+            alignedPlacement);
+        var alignedRhs = new DistributedType(
+            rhsTensor,
+            [SBP.SContiguous([0], 1024), SBP.B],
+            alignedPlacement);
+        var alignedScale = new DistributedType(
+            scaleTensor,
+            [SBP.B, SBP.B],
+            alignedPlacement);
+        var alignedResult = Nncase.Evaluator.Math.BlockScaledMatMulEvaluator.InferType(
+            target,
+            alignedLhs,
+            alignedRhs,
+            alignedScale);
+        Assert.IsType<DistributedType>(alignedResult);
+    }
+
+    [Fact]
+    public void TestBlockScaledMatMulCandidateProviderBuildsOnlyLegalScaleAndReductionTuples()
+    {
+        var options = new PyNTTTargetOptions
+        {
+            HierarchyNames = "b",
+            HierarchyLevels = "b",
+            Hierarchies = [new[] { 24 }],
+        };
+        CompileOptions.TargetOptions = options;
+        var placement = new Placement([24], "b", "b");
+        var lhsTensor = new TensorType(DataTypes.BFloat16, [1, 6144]);
+        var rhsTensor = new TensorType(DataTypes.Float8E4M3, [6144, 5120]);
+        var scaleTensor = new TensorType(DataTypes.BFloat16, [5120, 6]);
+        var lhs = new Var("lhs", lhsTensor);
+        var rhs = new Var("rhs", rhsTensor);
+        var scale = new Var("scale", scaleTensor);
+        var sourceCall = IR.F.Math.BlockScaledMatMul(
+            lhs,
+            rhs,
+            scale,
+            DataTypes.BFloat16,
+            1,
+            1024);
+        Assert.True(sourceCall.InferenceType());
+
+        var broadcastLhs = new DistributedType(lhsTensor, [SBP.B, SBP.B], placement);
+        var unalignedReductionLhs = new DistributedType(
+            lhsTensor,
+            [SBP.B, SBP.SContiguous([0], 256)],
+            placement);
+        var columnRhs = new DistributedType(
+            rhsTensor,
+            [SBP.B, SBP.SContiguous([0], 214)],
+            placement);
+        var unalignedReductionRhs = new DistributedType(
+            rhsTensor,
+            [SBP.SContiguous([0], 256), SBP.B],
+            placement);
+        var broadcastScale = new DistributedType(scaleTensor, [SBP.B, SBP.B], placement);
+        var splitScale = new DistributedType(
+            scaleTensor,
+            [SBP.SContiguous([0], 214), SBP.B],
+            placement);
+        var outputTensor = Assert.IsType<TensorType>(sourceCall.CheckedType);
+        var columnOutput = new DistributedType(
+            outputTensor,
+            [SBP.B, SBP.SContiguous([0], 214)],
+            placement);
+        var context = new DistributedCandidateContext(
+            CompileOptions,
+            options,
+            PyNTTTarget.Kind,
+            sourceCall,
+            [
+                new IRType[] { broadcastLhs, unalignedReductionLhs },
+                new IRType[] { columnRhs, unalignedReductionRhs },
+                new IRType[] { splitScale, broadcastScale },
+            ]);
+        var provider = new BlockScaledMatMulCandidateProvider();
+        var target = Assert.IsType<Nncase.IR.Math.BlockScaledMatMul>(sourceCall.Target);
+
+        Assert.True(provider.TryGetInputTypeTuples(
+            context,
+            target,
+            columnOutput,
+            out var tuples));
+        var tuple = Assert.Single(tuples);
+        Assert.Equal(broadcastLhs, tuple.InputTypes[0]);
+        Assert.Equal(columnRhs, tuple.InputTypes[1]);
+        Assert.Equal(broadcastScale, tuple.InputTypes[2]);
+    }
+
+    [Fact]
     public void TestPackedBlockScaledMatMulNormStatsCandidatePreservesOutputSplit()
     {
         var options = new PyNTTTargetOptions
@@ -1175,6 +1671,7 @@ public sealed class UnitTestDistribAutoDistributed : TestClassBase
         var provider = new PackedBlockScaledMatMulNormStatsCandidateProvider();
         var target = Assert.IsType<PackedBlockScaledMatMulNormStats>(sourceCall.Target);
 
+        Assert.True(provider.IsExhaustive);
         var returnTypes = provider.GetReturnCandidateTypes(context, target, []);
 
         var tupleType = Assert.IsType<TupleType>(PackedBlockScaledMatMulNormStatsEvaluator.InferType(
@@ -1434,6 +1931,72 @@ public sealed class UnitTestDistribAutoDistributed : TestClassBase
     }
 
     [Fact]
+    public void TestPackedBlockScaledMatMulCandidateRejectsUnalignedReductionShardWithoutFallback()
+    {
+        var options = new PyNTTTargetOptions
+        {
+            HierarchyNames = "b",
+            HierarchyLevels = "b",
+            Hierarchies = [new[] { 24 }],
+        };
+        CompileOptions.TargetOptions = options;
+        var placement = new Placement([24], "b", "b");
+        var lhsTensor = new TensorType(DataTypes.BFloat16, [1, 6144]);
+        var rhsTensor = new TensorType(
+            new VectorType(DataTypes.Float8E4M3, [2, 16]),
+            [5120, 192]);
+        var rhsScaleTensor = new TensorType(DataTypes.BFloat16, [5120, 6]);
+        var lhs = new Var("lhs", lhsTensor);
+        var rhs = new Var("rhs", rhsTensor);
+        var rhsScale = new Var("rhs_scale", rhsScaleTensor);
+        var sourceCall = Assert.IsType<Call>(IR.F.NTT.PackedBlockScaledMatMul(
+            lhs,
+            rhs,
+            rhsScale,
+            DataTypes.BFloat16,
+            1,
+            1024,
+            PackedMatMulRhsLayout.NMajorKPacked,
+            8));
+        Assert.True(sourceCall.InferenceType());
+
+        var broadcastLhs = new DistributedType(lhsTensor, [SBP.B, SBP.B], placement);
+        var unalignedReductionLhs = new DistributedType(
+            lhsTensor,
+            [SBP.B, SBP.SContiguous([0], 256)],
+            placement);
+        var broadcastRhs = new DistributedType(rhsTensor, [SBP.B, SBP.B], placement);
+        var broadcastScale = new DistributedType(rhsScaleTensor, [SBP.B, SBP.B], placement);
+        var outputTensor = Assert.IsType<TensorType>(sourceCall.CheckedType);
+        var output = new DistributedType(
+            outputTensor,
+            [SBP.B, SBP.SContiguous([0], 214)],
+            placement);
+        var context = new DistributedCandidateContext(
+            CompileOptions,
+            options,
+            PyNTTTarget.Kind,
+            sourceCall,
+            [
+                new IRType[] { broadcastLhs, unalignedReductionLhs },
+                new IRType[] { broadcastRhs },
+                new IRType[] { broadcastScale },
+                new IRType[] { NoneType.Default },
+            ]);
+        var provider = new PackedBlockScaledMatMulCandidateProvider();
+        var target = Assert.IsType<PackedBlockScaledMatMul>(sourceCall.Target);
+
+        Assert.True(provider.IsExhaustive);
+        Assert.True(provider.TryGetInputTypeTuples(context, target, output, out var tuples));
+        var tuple = Assert.Single(tuples);
+        Assert.Equal(broadcastLhs, tuple.InputTypes[PackedBlockScaledMatMul.Lhs.Index]);
+        Assert.Equal(broadcastScale, tuple.InputTypes[PackedBlockScaledMatMul.RhsScale.Index]);
+        var selectedRhs = Assert.IsType<DistributedType>(
+            tuple.InputTypes[PackedBlockScaledMatMul.Rhs.Index]);
+        Assert.Equal(SBP.B, selectedRhs.AxisPolicies[1]);
+    }
+
+    [Fact]
     public void TestPagedAttentionPartialCombineDistributionContract()
     {
         var options = new PyNTTTargetOptions();
@@ -1516,7 +2079,8 @@ public sealed class UnitTestDistribAutoDistributed : TestClassBase
                 combineTarget,
                 partialMaxType,
                 partialSumType,
-                partialAccType));
+                partialAccType,
+                NoneType.Default));
         Assert.Equal(queryType, combinedType);
 
         var broadcastQueryType = new DistributedType(
@@ -1548,7 +2112,8 @@ public sealed class UnitTestDistribAutoDistributed : TestClassBase
                 splitCombineTarget,
                 broadcastPartialType[0],
                 broadcastPartialType[1],
-                broadcastPartialType[2]));
+                broadcastPartialType[2],
+                NoneType.Default));
 
         var splitDimOutputType = new DistributedType(
             queryTensorType,
@@ -1567,7 +2132,23 @@ public sealed class UnitTestDistribAutoDistributed : TestClassBase
                 splitDimCombineTarget,
                 partialMaxType,
                 partialSumType,
-                partialAccType));
+                partialAccType,
+                NoneType.Default));
+
+        Assert.Equal(
+            splitDimOutputType,
+            PagedAttentionCombineEvaluator.InferType(
+                splitDimCombineTarget,
+                partialMaxType,
+                partialSumType,
+                partialAccType,
+                splitDimOutputType));
+        Assert.IsType<InvalidType>(PagedAttentionCombineEvaluator.InferType(
+            splitDimCombineTarget,
+            partialMaxType,
+            partialSumType,
+            partialAccType,
+            queryType));
 
         var invalidOutputType = new DistributedType(
             queryTensorType,
@@ -1583,7 +2164,111 @@ public sealed class UnitTestDistribAutoDistributed : TestClassBase
                 4),
             partialMaxType,
             partialSumType,
-            partialAccType));
+            partialAccType,
+            NoneType.Default));
+
+        var query = new Var("query", queryType);
+        var kvCaches = new Var("kv_caches", cacheTensorType);
+        var extra = new Var("extra", extraType);
+        var scale = new Var("scale", scaleTensorType);
+        var outputGate = new Var("output_gate", queryType);
+        var attention = IR.F.NN.PagedAttention(
+            query,
+            kvCaches,
+            extra,
+            scale,
+            0,
+            outputGate,
+            layout.ToArray(),
+            2048);
+        Assert.Equal(queryType, attention.CheckedType);
+        var attentionCall = Assert.IsType<Call>(attention);
+
+        var providerContext = new DistributedCandidateContext(
+            CompileOptions,
+            options,
+            PyNTTTarget.Kind,
+            attentionCall,
+            [
+                new IRType[] { queryType, broadcastQueryType },
+                new IRType[] { cacheTensorType },
+                new IRType[] { extraType },
+                new IRType[] { scaleTensorType },
+                new IRType[] { new DimensionType(DimensionKind.Fixed) },
+                new IRType[] { queryType, broadcastQueryType },
+            ]);
+        var provider = new PagedAttentionCandidateProvider();
+        Assert.True(provider.IsExhaustive);
+        Assert.Equal(
+            new IRType[] { queryType, broadcastQueryType },
+            provider.GetReturnCandidateTypes(
+                providerContext,
+                Assert.IsType<PagedAttention>(attentionCall.Target),
+                [queryType, broadcastQueryType]));
+        Assert.True(provider.TryGetInputTypeTuples(
+            providerContext,
+            Assert.IsType<PagedAttention>(attentionCall.Target),
+            queryType,
+            out var attentionTuples));
+        var attentionTuple = Assert.Single(attentionTuples);
+        Assert.Equal(queryType, attentionTuple.InputTypes[PagedAttention.Q.Index]);
+        Assert.Equal(queryType, attentionTuple.InputTypes[PagedAttention.OutputGate.Index]);
+
+        var decomposed = Assert.IsType<Call>(CompilerServices.Rewrite(
+            attention,
+            [new DecomposePagedAttention(0, 4)],
+            new()));
+        Assert.IsType<PagedAttentionCombine>(decomposed.Target);
+        Assert.Same(outputGate, decomposed[PagedAttentionCombine.OutputGate]);
+        Assert.Equal(attention.CheckedType, decomposed.CheckedType);
+
+        var combineProviderContext = new DistributedCandidateContext(
+            CompileOptions,
+            options,
+            PyNTTTarget.Kind,
+            decomposed,
+            [
+                new IRType[] { partialMaxType, partialSumType },
+                new IRType[] { partialSumType, partialMaxType },
+                new IRType[] { partialAccType, partialMaxType },
+                new IRType[] { queryType, broadcastQueryType },
+            ]);
+        var combineProvider = new PagedAttentionCombineCandidateProvider();
+        Assert.True(combineProvider.IsExhaustive);
+        Assert.True(combineProvider.TryGetInputTypeTuples(
+            combineProviderContext,
+            Assert.IsType<PagedAttentionCombine>(decomposed.Target),
+            queryType,
+            out var combineTuples));
+        var combineTuple = Assert.Single(combineTuples);
+        Assert.Equal(partialMaxType, combineTuple.InputTypes[PagedAttentionCombine.MaxState.Index]);
+        Assert.Equal(partialSumType, combineTuple.InputTypes[PagedAttentionCombine.SumState.Index]);
+        Assert.Equal(partialAccType, combineTuple.InputTypes[PagedAttentionCombine.AccState.Index]);
+        Assert.Equal(queryType, combineTuple.InputTypes[PagedAttentionCombine.OutputGate.Index]);
+    }
+
+    [Fact]
+    public void TestPagedAttentionCombineAppliesRawOutputGate()
+    {
+        IRArray<AttentionDimKind> layout =
+            [AttentionDimKind.Seq, AttentionDimKind.Head, AttentionDimKind.Dim];
+        var outputType = new TensorType(DataTypes.Float32, new RankedShape(1, 1, 2));
+        var combine = IR.F.NTT.PagedAttentionCombine(
+            Tensor.From(new[] { 0F }, new long[] { 1, 1, 1 }),
+            Tensor.From(new[] { 1F }, new long[] { 1, 1, 1 }),
+            Tensor.From(new[] { 2F, 4F }, new long[] { 1, 1, 2 }),
+            Tensor.From(new[] { 0F, MathF.Log(3F) }, new long[] { 1, 1, 2 }),
+            layout,
+            2,
+            DataTypes.Float32,
+            outputType,
+            0,
+            2);
+
+        Assert.Equal(outputType, combine.CheckedType);
+        var actual = combine.Evaluate().AsTensor().ToArray<float>();
+        Assert.Equal(1F, actual[0], 5);
+        Assert.Equal(3F, actual[1], 5);
     }
 
     [Fact]
@@ -3009,6 +3694,60 @@ public sealed class UnitTestDistribAutoDistributed : TestClassBase
         Assert.Equal(
             SBP.SContiguous(context.HierarchyAxes, context.ContiguousGranularity),
             candidates[1]);
+    }
+
+    [Theory]
+    [InlineData(2176, 8, 4)]
+    [InlineData(640, 8, 4)]
+    public void TestPyNTTSplitCandidatesExposeLargestBalancedBlockGranule(
+        int maximumExtent,
+        long preferredBlockSize,
+        long balancedBlockSize)
+    {
+        var tensorType = new TensorType(new VectorType(DataTypes.BFloat16, [8]), [maximumExtent]);
+        var placement = new Placement([4, 8], "yx", "bb");
+        var context = new DistributedSplitCandidateContext(
+            tensorType,
+            0,
+            placement,
+            new[] { 0, 1 },
+            1,
+            maximumExtent);
+
+        var candidates = new PyNTTDistributedSplitCandidateProvider(128)
+            .GetCandidates(context);
+
+        Assert.Collection(
+            candidates,
+            candidate => Assert.Equal(
+                preferredBlockSize,
+                Assert.IsType<BlockCyclicSplit>(Assert.Single(candidate.Stages).Distribution).BlockSize),
+            candidate => Assert.Equal(
+                balancedBlockSize,
+                Assert.IsType<BlockCyclicSplit>(Assert.Single(candidate.Stages).Distribution).BlockSize));
+    }
+
+    [Theory]
+    [InlineData(1024)]
+    [InlineData(18992)]
+    public void TestPyNTTSplitCandidatesDoNotExpandWithoutAnExactBalancedGranule(int maximumExtent)
+    {
+        var tensorType = new TensorType(new VectorType(DataTypes.BFloat16, [8]), [maximumExtent]);
+        var placement = new Placement([4, 8], "yx", "bb");
+        var context = new DistributedSplitCandidateContext(
+            tensorType,
+            0,
+            placement,
+            new[] { 0, 1 },
+            1,
+            maximumExtent);
+
+        var candidates = new PyNTTDistributedSplitCandidateProvider(128).GetCandidates(context);
+
+        var candidate = Assert.Single(candidates);
+        Assert.Equal(
+            8,
+            Assert.IsType<BlockCyclicSplit>(Assert.Single(candidate.Stages).Distribution).BlockSize);
     }
 
     [Fact]

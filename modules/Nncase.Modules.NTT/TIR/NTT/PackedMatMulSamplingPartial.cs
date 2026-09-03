@@ -28,6 +28,14 @@ public sealed partial class PackedMatMulSamplingPartial : NTTKernelOp
 
     public static readonly ParameterInfo Addend = new(typeof(PackedMatMulSamplingPartial), 7, "addend", memoryEffect: MemoryEffect.Read);
 
+    public static readonly ParameterInfo LhsScale = new(typeof(PackedMatMulSamplingPartial), 8, "lhs_scale", memoryEffect: MemoryEffect.Read);
+
+    public static readonly ParameterInfo RhsScale = new(typeof(PackedMatMulSamplingPartial), 9, "rhs_scale", memoryEffect: MemoryEffect.Read);
+
+    public DataType AccumulatorDataType { get; }
+
+    public DataType OutputDataType { get; }
+
     public IR.NTT.PackedMatMulRhsLayout RhsLayout { get; }
 
     public DistributedType PackedOutputType { get; }
@@ -37,5 +45,6 @@ public sealed partial class PackedMatMulSamplingPartial : NTTKernelOp
     public SamplerConfig Config { get; }
 
     public override string DisplayProperty()
-        => $"RhsLayout: {RhsLayout}, Config: {Config}";
+        => $"AccumulatorDataType: {AccumulatorDataType}, OutputDataType: {OutputDataType}, " +
+           $"RhsLayout: {RhsLayout}, Config: {Config}";
 }

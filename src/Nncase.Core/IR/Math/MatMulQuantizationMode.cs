@@ -19,6 +19,12 @@ public enum MatMulQuantizationMode
     StaticTensor,
 
     /// <summary>
+    /// Activations are quantized dynamically per logical row and weights carry
+    /// one inverse scale per output channel.
+    /// </summary>
+    DynamicTensor,
+
+    /// <summary>
     /// Activations are quantized dynamically per K block and weights carry a
     /// two-dimensional [N-block, K-block] inverse-scale tensor.
     /// </summary>

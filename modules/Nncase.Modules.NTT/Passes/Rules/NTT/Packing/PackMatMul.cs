@@ -121,11 +121,6 @@ public sealed partial class PackMatMulRhsKMajor : RewriteRule<Pattern>
 
     private Expr? GetReplace(VectorizedMatMul matMul, Call caller, Expr lhs, Expr rhs)
     {
-        if (lhs.CheckedDataType == DataTypes.Float8E4M3 || lhs.CheckedDataType == DataTypes.Float8E5M2)
-        {
-            return null;
-        }
-
         var lhsShape = lhs.CheckedShape;
         var rhsShape = rhs.CheckedShape;
         if (lhs.CheckedDataType is VectorType ||

@@ -7,7 +7,7 @@ using Nncase.Utilities;
 
 namespace Nncase.Passes.Distributed;
 
-internal static class BroadcastCandidateUtility
+public static class BroadcastCandidateUtility
 {
     public static bool TryLiftInputLayout(
         DistributedType inputType,

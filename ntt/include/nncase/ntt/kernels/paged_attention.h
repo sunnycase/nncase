@@ -25,6 +25,15 @@
 #include <type_traits>
 
 namespace nncase::ntt {
+namespace detail {
+template <class TAttention, class TGate> struct apply_attention_output_gate {
+    constexpr auto operator()(const TAttention &attention,
+                              const TGate &gate) const noexcept {
+        return attention * ntt::sigmoid(gate);
+    }
+};
+} // namespace detail
+
 #if false
 template <class T0, class T1, class T2, class T3, class T4, class T5, class T6,
           class T7, class T8>
@@ -166,7 +175,6 @@ constexpr void update_paged_attention_kv_cache(const TSlots &slots_tensor,
             }
         }
 
-        distributed::topology_synchronize();
     } else {
         for (size_t head_id = 0; head_id < num_heads; head_id++) {
             kv_cache.template update_slots<Kind>(layer_id, head_id,
@@ -178,13 +186,14 @@ constexpr void update_paged_attention_kv_cache(const TSlots &slots_tensor,
 }
 
 template <FixedDimensions QLayout, ShardedTensor TQ, Tensor TKVCache,
-          Tensor TScale, class TOutput, Tensor TExtra>
+          Tensor TScale, class TOutputGate, class TOutput, Tensor TExtra>
     requires(Tensor<std::decay_t<TOutput>>)
 constexpr void
 paged_attention(const TQ &q_tensor, TKVCache &kv_cache_tensor,
                 TExtra &extra_tensor, /* [head_q, max_query_len, max_seq_len] +
                                         [head_q, max_query_len, 1] */
-                const TScale &scale, size_t layer_id, TOutput &&output_tensor,
+                const TScale &scale, size_t layer_id,
+                const TOutputGate &output_gate, TOutput &&output_tensor,
                 const QLayout &q_layout) noexcept {
     auto &kv_cache = kv_cache_tensor(fixed_shape_v<>);
     using kv_cache_t = typename std::decay_t<decltype(kv_cache)>;
@@ -221,6 +230,60 @@ paged_attention(const TQ &q_tensor, TKVCache &kv_cache_tensor,
                context_len = kv_cache.context_len(seq_id),
                query_len = seq_len - context_len;
          seq_id < kv_cache.num_seqs(); seq_id++, query_start_loc += query_len) {
+        if (seq_len == 1 && query_len == 1) {
+            constexpr auto head_dim_block_size =
+                fixed_shape_v<
+                    (dim_t)caching::paged_kvcache_dim_kind::head_dim,
+                    (dim_t)caching::paged_kvcache_dim_kind::block_size>;
+            constexpr auto block_size_head_dim =
+                fixed_shape_v<
+                    (dim_t)caching::paged_kvcache_dim_kind::block_size,
+                    (dim_t)caching::paged_kvcache_dim_kind::head_dim>;
+            static_assert(
+                config_t::value_block_layout == head_dim_block_size ||
+                    config_t::value_block_layout == block_size_head_dim,
+                "paged_attention supports only 2-D value block layouts.");
+
+            const auto block_id = kv_cache.get_block_id(seq_id, 0);
+            for (size_t q_head_id = 0;
+                 q_head_id < local_q_shape[head_index]; q_head_id++) {
+                const auto global_q_head_id =
+                    global_q_offset[head_index] + q_head_id;
+                const auto v_head_id =
+                    global_q_head_id / (num_q_heads / num_kv_heads);
+                const auto v_block = kv_cache.template get_block<
+                    caching::attention_cache_kind::value>(
+                    layer_id, v_head_id, block_id);
+
+                q_slice_start[head_index] = q_head_id;
+                q_slice_start[seq_index] = query_start_loc;
+                auto output_slice =
+                    output_tensor.view(q_slice_start, q_slice_shape)
+                        .squeeze(q_squeeze);
+
+                if constexpr (config_t::value_block_layout ==
+                              head_dim_block_size) {
+                    const auto value_slice =
+                        v_block
+                            .view(make_zeros_shape<2>(),
+                                  ntt::make_shape(v_block.shape()[0_dim],
+                                                  dim_one))
+                            .squeeze(fixed_shape_v<1>);
+                    ntt::tensor_copy_sync(value_slice, output_slice);
+                } else {
+                    const auto value_slice =
+                        v_block
+                            .view(make_zeros_shape<2>(),
+                                  ntt::make_shape(dim_one,
+                                                  v_block.shape()[1_dim]))
+                            .squeeze(fixed_shape_v<0>);
+                    ntt::tensor_copy_sync(value_slice, output_slice);
+                }
+            }
+
+            continue;
+        }
+
         const auto s_shape =
             ntt::make_shape(local_q_shape[head_index], query_len, seq_len);
         const auto reduce_s_shape =
@@ -274,23 +337,10 @@ paged_attention(const TQ &q_tensor, TKVCache &kv_cache_tensor,
                         caching::attention_cache_kind::key>(layer_id, k_head_id,
                                                             block_id);
 
-                    static_assert(
-                        config_t::block_layout ==
-                            fixed_shape_v<
-                                (dim_t)
-                                    caching::paged_kvcache_dim_kind::head_dim,
-                                (dim_t)caching::paged_kvcache_dim_kind::
-                                    block_size>,
-                        "block layout is not supported.");
                     auto valid_block_size =
                         ntt::min(seq_len - context_bid * config_t::block_size,
                                  config_t::block_size);
 
-                    // [dim', valid_block_size]<dim>
-                    auto k_slice =
-                        k_block.view(make_zeros_shape<2>(),
-                                     ntt::make_shape(k_block.shape()[0_dim],
-                                                     valid_block_size));
                     // [1, valid_block_size]
                     auto s_slice =
                         s.view(ntt::make_shape(q_head_id, q_id,
@@ -300,11 +350,42 @@ paged_attention(const TQ &q_tensor, TKVCache &kv_cache_tensor,
                                                valid_block_size))
                             .squeeze(fixed_shape_v<1>);
 
-                    // [1, valid_block_size] = [1, dim']<dim> @ [dim',
-                    // valid_block_size]<dim>
-                    ntt::matmul<false>(q_slice, k_slice, s_slice, nullptr,
-                                       fixed_shape_v<1>, {}, fixed_shape_v<0>,
-                                       ntt::fixed_shape_v<>);
+                    constexpr auto head_dim_block_size =
+                        fixed_shape_v<
+                            (dim_t)caching::paged_kvcache_dim_kind::head_dim,
+                            (dim_t)caching::paged_kvcache_dim_kind::block_size>;
+                    constexpr auto block_size_head_dim =
+                        fixed_shape_v<
+                            (dim_t)caching::paged_kvcache_dim_kind::block_size,
+                            (dim_t)caching::paged_kvcache_dim_kind::head_dim>;
+                    static_assert(
+                        config_t::key_block_layout == head_dim_block_size ||
+                            config_t::key_block_layout == block_size_head_dim,
+                        "paged_attention supports only 2-D key block layouts.");
+                    if constexpr (config_t::key_block_layout ==
+                                  head_dim_block_size) {
+                        // [1, valid_block_size] = [1, dim'] @
+                        // [dim', valid_block_size]
+                        auto k_slice = k_block.view(
+                            make_zeros_shape<2>(),
+                            ntt::make_shape(k_block.shape()[0_dim],
+                                            valid_block_size));
+                        ntt::matmul<false>(
+                            q_slice, k_slice, s_slice, nullptr,
+                            fixed_shape_v<1>, {}, fixed_shape_v<0>,
+                            ntt::fixed_shape_v<>);
+                    } else {
+                        // [1, valid_block_size] = [1, dim'] @
+                        // [valid_block_size, dim']^T
+                        auto k_slice = k_block.view(
+                            make_zeros_shape<2>(),
+                            ntt::make_shape(valid_block_size,
+                                            k_block.shape()[1_dim]));
+                        ntt::matmul<false, false, true>(
+                            q_slice, k_slice, s_slice, nullptr,
+                            fixed_shape_v<1>, {}, fixed_shape_v<1>,
+                            ntt::fixed_shape_v<>);
+                    }
                 }
             }
         }
@@ -378,25 +459,66 @@ paged_attention(const TQ &q_tensor, TKVCache &kv_cache_tensor,
                         layer_id, v_head_id,
                         kv_cache.get_block_id(seq_id, context_bid));
 
-                    // [dim',valid_block_size]<dim>
-                    const auto v_slice = v_block.view(
-                        make_zeros_shape<2>(),
-                        ntt::make_shape(v_block.shape()[0], valid_block_size));
-                    // clang-format off
-                    // [1, dim']<dim> = [1, valid_block_size] @ [dim',valid_block_size]<dim>
-                    // clang-format on
-                    if (context_bid == 0) {
-                        ntt::matmul<false, false, true>(
-                            s_slice, v_slice, d_slice, nullptr, fixed_shape_v<>,
-                            fixed_shape_v<>, fixed_shape_v<0>, fixed_shape_v<>);
+                    constexpr auto head_dim_block_size =
+                        fixed_shape_v<
+                            (dim_t)caching::paged_kvcache_dim_kind::head_dim,
+                            (dim_t)caching::paged_kvcache_dim_kind::block_size>;
+                    constexpr auto block_size_head_dim =
+                        fixed_shape_v<
+                            (dim_t)caching::paged_kvcache_dim_kind::block_size,
+                            (dim_t)caching::paged_kvcache_dim_kind::head_dim>;
+                    static_assert(
+                        config_t::value_block_layout == head_dim_block_size ||
+                            config_t::value_block_layout ==
+                                block_size_head_dim,
+                        "paged_attention supports only 2-D value block layouts.");
+                    if constexpr (config_t::value_block_layout ==
+                                  head_dim_block_size) {
+                        // [1, dim'] = [1, valid_block_size] @
+                        // [dim', valid_block_size]^T
+                        const auto v_slice = v_block.view(
+                            make_zeros_shape<2>(),
+                            ntt::make_shape(v_block.shape()[0_dim],
+                                            valid_block_size));
+                        if (context_bid == 0) {
+                            ntt::matmul<false, false, true>(
+                                s_slice, v_slice, d_slice, nullptr,
+                                fixed_shape_v<>, fixed_shape_v<>,
+                                fixed_shape_v<0>, fixed_shape_v<>);
+                        } else {
+                            ntt::matmul<true, false, true>(
+                                s_slice, v_slice, d_slice, nullptr,
+                                fixed_shape_v<>, fixed_shape_v<>,
+                                fixed_shape_v<0>, fixed_shape_v<>);
+                        }
                     } else {
-                        ntt::matmul<true, false, true>(
-                            s_slice, v_slice, d_slice, nullptr, fixed_shape_v<>,
-                            fixed_shape_v<>, fixed_shape_v<0>, fixed_shape_v<>);
+                        // [1, dim'] = [1, valid_block_size] @
+                        // [valid_block_size, dim']
+                        const auto v_slice = v_block.view(
+                            make_zeros_shape<2>(),
+                            ntt::make_shape(valid_block_size,
+                                            v_block.shape()[1_dim]));
+                        if (context_bid == 0) {
+                            ntt::matmul<false>(
+                                s_slice, v_slice, d_slice, nullptr,
+                                fixed_shape_v<>, fixed_shape_v<>,
+                                fixed_shape_v<1>, fixed_shape_v<>);
+                        } else {
+                            ntt::matmul<true>(
+                                s_slice, v_slice, d_slice, nullptr,
+                                fixed_shape_v<>, fixed_shape_v<>,
+                                fixed_shape_v<1>, fixed_shape_v<>);
+                        }
                     }
                 }
             }
         }
+    }
+
+    if constexpr (!std::is_same_v<std::decay_t<TOutputGate>, std::nullptr_t>) {
+        static_assert(Tensor<std::decay_t<TOutputGate>>);
+        ntt::binary<detail::apply_attention_output_gate>(
+            output_tensor, output_gate, output_tensor);
     }
 }
 

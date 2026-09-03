@@ -23,7 +23,9 @@ public sealed class ForwardTerminalStoreDestinationsPass : ModulePass
     {
         foreach (var function in input.Functions
                      .OfType<PrimFunction>()
-                     .Where(function => function.ModuleKind == _moduleKind))
+                     .Where(function =>
+                         function.ModuleKind == _moduleKind &&
+                         CompileSession.IsFunctionActive(function)))
         {
             var rewriter = new DestinationForwardingRewriter(function);
             rewriter.Rewrite(function);

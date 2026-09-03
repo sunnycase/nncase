@@ -3,6 +3,8 @@
 
 using DryIoc.ImTools;
 using Nncase.IR;
+using Nncase.IR.Heterogeneous;
+using Nncase.IR.Math;
 using Nncase.IR.NN;
 using Nncase.TIR;
 
@@ -50,6 +52,14 @@ public static class CSourceExtensions
         ReduceOp.Mean => "mean",
         ReduceOp.Prod => "prod",
         _ => throw new NotImplementedException(),
+    };
+
+    public static string ToC(this MatMulQuantizationMode mode) => mode switch
+    {
+        MatMulQuantizationMode.None => "qkv_quantization_mode::none",
+        MatMulQuantizationMode.StaticTensor => "qkv_quantization_mode::static_tensor",
+        MatMulQuantizationMode.DynamicTensor => "qkv_quantization_mode::dynamic_tensor",
+        _ => throw new ArgumentOutOfRangeException(nameof(mode), mode, null),
     };
 
     public static string ToC(this IR.NN.AttentionCacheKind mode) => mode switch
@@ -101,7 +111,20 @@ public static class CSourceExtensions
 
     public static string ToC(this IPagedAttentionConfig config)
     {
-        return $"caching::make_paged_attention_config<{config.NumLayers}, {config.NumKVHeads}, {config.HeadDim}, {config.KVPrimType.ToC()}, {config.BlockSize}>({config.KeyCacheLayout.ToC()}, {config.ValueCacheLayout.ToC()}, {config.GetBlockLayout(AttentionCacheKind.Key).ToC()}, {config.GetBlockLayout(AttentionCacheKind.Value).ToC()}, {config.KeyVectorizedAxes.ToC()}, {config.ValueVectorizedAxes.ToC()}, {config.KeyLanes.ToC()}, {config.ValueLanes.ToC()}, {config.ShardingAxes.ToC()}, {config.AxisPolicies.OfType<SBP>().ToC()})";
+        var arguments = new List<string>
+        {
+            config.KeyCacheLayout.ToC(),
+            config.ValueCacheLayout.ToC(),
+            config.GetBlockLayout(AttentionCacheKind.Key).ToC(),
+            config.GetBlockLayout(AttentionCacheKind.Value).ToC(),
+            config.KeyVectorizedAxes.ToC(),
+            config.ValueVectorizedAxes.ToC(),
+            config.KeyLanes.ToC(),
+            config.ValueLanes.ToC(),
+            config.ShardingAxes.ToC(),
+        };
+        arguments.AddRange(config.AxisPolicies.OfType<SBP>().Select(policy => new[] { policy }.ToC()));
+        return $"caching::make_paged_attention_config<{config.NumLayers}, {config.NumKVHeads}, {config.HeadDim}, {config.KVPrimType.ToC()}, {config.BlockSize}>({string.Join(", ", arguments)})";
     }
 
     public static string ToC(this DataType dataType) => dataType switch
@@ -110,6 +133,7 @@ public static class CSourceExtensions
         PrimType ptype => ptype.ToC(),
         PagedAttentionKVCacheType => $"paged_attention_kv_cache_t",
         PointerType => "uint8_t *",
+        ReferenceType { ElemType: PipelineChannelType } => "nncase::ntt::runtime::pipeline_channel *",
         ReferenceType rtype => $"{rtype.ElemType.ToC()}",
         VectorType vtype => $"vector<{vtype.ElemType.ToC()}, {string.Join(",", vtype.Lanes)}>",
         _ => throw new NotSupportedException(dataType.ToString()),

@@ -190,6 +190,116 @@ def {{ model["FunctionName"] }}__consumer(reader, {% if ctx["use_complete_consum
             {{ ctx["consumer_weight_layout_name"] }},
         )
 {% endfor %}
+{% if ctx["scale_group_spans_stages"] %}
+        for scale_group in tl.range(0, {{ ctx["num_scale_groups"] }}):
+            input_abs_max = 0.0
+            for scale_stage in tl.static_range(0, {{ ctx["stages_per_scale_group"] }}):
+                for scale_k_group in tl.static_range(0, {{ ctx["reduction_groups_per_stage"] }}):
+                    scale_group_pipeline_offs_k = (
+                        scale_group * {{ ctx["scale_group_k"] }}
+                        + scale_stage * {{ ctx["block_k"] }}
+                        + scale_k_group * {{ ctx["reduction_group"] }}
+                        + local_k_vector
+                    )
+                    scale_group_input_value = tle.encoding(
+                        tl.load(
+                            {{ access_pointer(model, "Input", "input0", ctx["scale_group_input_access"]) }}
+                        ),
+                        {{ ctx["consumer_lhs_layout_name"] }},
+                    ).to(tl.float32)
+                    input_abs_max = tl.maximum(
+                        input_abs_max,
+                        tl.max(tl.abs(scale_group_input_value[None, :]), axis=1),
+                    )
+            input_scale = tl.maximum(
+                input_abs_max / 448.0,
+                1.0e-12,
+            )
+            for stage_in_scale_group in tl.static_range(0, {{ ctx["stages_per_scale_group"] }}):
+                k_tile = (
+                    scale_group * {{ ctx["stages_per_scale_group"] }}
+                    + stage_in_scale_group
+                )
+{% for projection in ctx["projections"] %}
+                {{ projection["lower"] }}_sequence = (
+                    (n_tile * {{ ctx["num_k_tiles"] }} + k_tile)
+                    * {{ ctx["projection_count"] }}
+                    + {{ projection["sequence_offset"] }}
+                ).to(tl.int32)
+                {{ projection["lower"] }}_ready = reader.wait(
+                    {{ projection["lower"] }}_sequence
+                )
+{% endfor %}
+                for k_group in tl.static_range(0, {{ ctx["reduction_groups_per_stage"] }}):
+                    shared_k = k_group * {{ ctx["reduction_group"] }} + local_k
+                    shared_payload = (
+                        local_n % {{ model["NVectorLaneCount"] }}
+                        * {{ ctx["k_atom"] }}
+                        + shared_k % {{ ctx["k_atom"] }}
+                    )
+                    pipeline_offs_k = (
+                        k_tile * {{ ctx["block_k"] }}
+                        + k_group * {{ ctx["reduction_group"] }}
+                        + local_k_vector
+                    )
+                    input_value = tle.encoding(
+                        tl.load(
+                            {{ access_pointer(model, "Input", "input0", ctx["pipeline_input_access"]) }}
+                        ),
+                        {{ ctx["consumer_lhs_layout_name"] }},
+                    ).to(tl.float32)
+                    quantized_input = (
+                        input_value[None, :] / input_scale[:, None]
+                    ).to(tl.float8e4nv).to(tl.float32)
+                    quantized_input = tle.encoding(
+                        quantized_input,
+                        {{ ctx["consumer_weight_layout_name"] }},
+                    )
+                    global_k_start = {{ ctx["global_k_start"] }}
+                    weight_scale_k = global_k_start // {{ ctx["weight_block_k"] }}
+{% for projection in ctx["projections"] %}
+                    {{ projection["lower"] }}_weight_ptr = tle.gpu.local_ptr(
+                        {{ projection["lower"] }}_ready.slot.weight,
+                        (
+{% for index in ctx["shared_weight_indices"] %}
+                            tle.encoding(
+                                {{ index }},
+                                {{ ctx["consumer_weight_layout_name"] }},
+                            ),
+{% endfor %}
+                        ),
+                        shape=({{ ctx["block_n"] }}, {{ ctx["reduction_group"] }}),
+                    )
+                    {{ projection["lower"] }}_weight_ptr = tl.max_contiguous(
+                        {{ projection["lower"] }}_weight_ptr,
+                        [1, 16],
+                    )
+                    {{ projection["lower"] }}_weight_ptr = tl.multiple_of(
+                        {{ projection["lower"] }}_weight_ptr,
+                        [1, 16],
+                    )
+                    {{ projection["lower"] }}_weight_value = tle.encoding(
+                        tl.load({{ projection["lower"] }}_weight_ptr),
+                        {{ ctx["consumer_weight_layout_name"] }},
+                    ).to(tl.float32)
+                    {{ projection["lower"] }}_weight_scale_value = tl.load(
+                        {{ access_pointer(model, projection["prefix"] ~ "WeightScale", projection["lower"] ~ "_weight_scale", projection["weight_scale_access"]) }}
+                    ).to(tl.float32)
+                    {{ projection["lower"] }}_weight_scale_value = tle.encoding(
+                        {{ projection["lower"] }}_weight_scale_value[:, None],
+                        {{ ctx["consumer_weight_layout_name"] }},
+                    )
+                    {{ projection["lower"] }}_partial += (
+                        {{ projection["lower"] }}_weight_value
+                        * quantized_input
+                        * input_scale[:, None]
+                        * {{ projection["lower"] }}_weight_scale_value
+                    )
+{% endfor %}
+{% for projection in ctx["projections"] %}
+                reader.release({{ projection["lower"] }}_sequence)
+{% endfor %}
+{% else %}
         for k_tile in tl.range(0, {{ ctx["num_k_tiles"] }}):
 {% for projection in ctx["projections"] %}
             {{ projection["lower"] }}_sequence = (
@@ -291,6 +401,7 @@ def {{ model["FunctionName"] }}__consumer(reader, {% if ctx["use_complete_consum
 {% for projection in ctx["projections"] %}
             reader.release({{ projection["lower"] }}_sequence)
 {% endfor %}
+{% endif %}
 
 {% for projection in ctx["projections"] %}
         {{ projection["lower"] }}_acc = tl.sum(

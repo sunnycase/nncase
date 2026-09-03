@@ -520,6 +520,15 @@ internal sealed class MemoryEffectAnalyzer
         bool suppressReductionAccumulatorEffects,
         IReadOnlySet<int>? includedArgumentIndices = null)
     {
+        // Heterogeneous channel endpoints implement their own worker-wide
+        // synchronization and system-scope release/acquire protocol. Their
+        // System effects are an external ordering boundary, not a local TIR
+        // buffer dependency that can be satisfied by a block/chip barrier.
+        if (call.Target is TIR.ChannelProduce or TIR.ChannelConsume)
+        {
+            return new EffectSet();
+        }
+
         var effects = new EffectSet();
         MemoryEffectUtility.VisitCallEffects(
             call,

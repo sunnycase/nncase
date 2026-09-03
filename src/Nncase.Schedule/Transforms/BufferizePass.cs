@@ -22,7 +22,11 @@ public sealed class BufferizePass : ModulePass
     {
         var targetMachine = (CompileSession.CompileOptions.TargetOptions as ITargetMachineModelProvider)?.TargetMachineModel;
 
-        foreach (var funcs in input.Functions.OfType<PrimFunction>().GroupBy(x => x.ModuleKind))
+        var functions = input.Functions
+            .OfType<PrimFunction>()
+            .Where(CompileSession.IsFunctionActive);
+
+        foreach (var funcs in functions.GroupBy(x => x.ModuleKind))
         {
             var bufferizeVisitor = new BufferizeVisitor(
                 funcs,

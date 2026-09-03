@@ -52,7 +52,7 @@
 {%- endif %}
 {%- endmacro %}
 # generated from PyNTT algorithm triton.gated_delta_net/recurrent_core
-# {{ model["Comment"] }}; hidden={{ model["HiddenSize"] }}, key_heads={{ model["NumKeyHeads"] }}, value_heads={{ model["NumValueHeads"] }}, key_dim={{ model["KeyHeadDim"] }}, value_dim={{ model["ValueHeadDim"] }}, ctas_per_key_head={{ ctx["ctas_per_key_head"] }}, state_waves={{ ctx["state_waves"] }}
+# {{ model["Comment"] }}; hidden={{ model["HiddenSize"] }}, key_heads={{ model["NumKeyHeads"] }}, value_heads={{ model["NumValueHeads"] }}, key_dim={{ model["KeyHeadDim"] }}, value_dim={{ model["ValueHeadDim"] }}, tasks_per_cta={{ ctx["state_tasks_per_cta"] }}, state_waves={{ ctx["state_waves"] }}
 {{ model["FunctionName"] }}__projection_layout = tl.constexpr(
     tle.gpu.BlockEncoding(
         [1, 8],
@@ -100,60 +100,45 @@
 {{ "@triton.jit(noinline=True)" if model["NoInline"] else "@triton.jit" }}
 def {{ model["FunctionName"] }}__producer(writer, {{ helper_parameters(model) }}):
 {{ common.mesh_coordinates(model["MeshAxes"]) }}
-    global_key_head = shard_index // {{ ctx["ctas_per_key_head"] }}
-    key_head_owner = shard_index % {{ ctx["ctas_per_key_head"] }}
-    projection_task_begin = key_head_owner * {{ ctx["state_tasks_per_cta"] }}
-    projection_first_value_head = projection_task_begin // {{ ctx["value_tiles_per_head"] }}
-    projection_global_head = (
-        global_key_head * {{ repeats }} + projection_first_value_head
+    task_slice_begin = shard_index * {{ ctx["state_tasks_per_cta"] }}
+    projection_first_global_value_head = (
+        task_slice_begin // {{ ctx["value_tiles_per_head"] }}
     ).to(tl.int32)
 {% for weight in ("b", "a") %}
-{% if ctx[weight ~ "_weight_descriptor_owner_indexed"] %}
     {{ weight }}_weight_descriptor_entry = tle.gpu.tensor_map_table_entry(
         {{ ctx[weight ~ "_weight_descriptor_name"] }},
-        shard_index,
+        {{ "shard_index" if ctx[weight ~ "_weight_descriptor_owner_indexed"] else "0" }},
     )
     tle.gpu.tensor_map_fenceproxy_acquire(
         {{ weight }}_weight_descriptor_entry
     )
-{% endif %}
 {% endfor %}
     for projection_k_tile in tl.range(0, {{ ctx["num_k_tiles"] }}):
         sequence = projection_k_tile.to(tl.int32)
         slot = writer.acquire(sequence)
 {% for weight in ("b", "a") %}
-{% if ctx[weight ~ "_weight_descriptor_owner_indexed"] %}
         {{ weight }}_weight_descriptor = tle.gpu.reinterpret_tensor_map(
             {{ weight }}_weight_descriptor_entry,
             slot.{{ weight }}_weight,
         )
-{% endif %}
 {% endfor %}
         tle.gpu.copy(
-{% if ctx["b_weight_descriptor_owner_indexed"] %}
             b_weight_descriptor,
-{% else %}
-            {{ ctx["b_weight_descriptor_name"] }},
-{% endif %}
             slot.b_weight,
             [{{ ctx["projection_tma_block_shape"] | join(", ") }}],
             offsets=[
-                projection_global_head,
+                projection_first_global_value_head,
                 projection_k_tile * {{ ctx["block_k"] // ctx["projection_tma_k_atom"] }},
                 {{ ctx["b_weight_descriptor_origin"] }},
             ],
             eviction_policy="evict_first",
         )
         tle.gpu.copy(
-{% if ctx["a_weight_descriptor_owner_indexed"] %}
             a_weight_descriptor,
-{% else %}
-            {{ ctx["a_weight_descriptor_name"] }},
-{% endif %}
             slot.a_weight,
             [{{ ctx["projection_tma_block_shape"] | join(", ") }}],
             offsets=[
-                projection_global_head,
+                projection_first_global_value_head,
                 projection_k_tile * {{ ctx["block_k"] // ctx["projection_tma_k_atom"] }},
                 {{ ctx["a_weight_descriptor_origin"] }},
             ],
@@ -177,18 +162,22 @@ def {{ model["FunctionName"] }}__consumer(
     norm_weight = {{ ptr(model, "NormWeight") }}
     core_scratch = {{ ptr(model, "CoreScratch") }}
     gated_output = {{ ptr(model, "GatedOutput") }}
-    global_key_head = shard_index // {{ ctx["ctas_per_key_head"] }}
-    key_head_owner = shard_index % {{ ctx["ctas_per_key_head"] }}
-    projection_task_begin = key_head_owner * {{ ctx["state_tasks_per_cta"] }}
-    projection_task_end = tl.minimum(
-        projection_task_begin + {{ ctx["state_tasks_per_cta"] }},
-        {{ ctx["value_tiles_per_key_head"] }},
+    task_slice_begin = shard_index * {{ ctx["state_tasks_per_cta"] }}
+    task_slice_end = tl.minimum(
+        task_slice_begin + {{ ctx["state_tasks_per_cta"] }},
+        {{ ctx["total_value_tasks"] }},
     )
-    projection_first_value_head = projection_task_begin // {{ ctx["value_tiles_per_head"] }}
+    projection_first_global_value_head = (
+        task_slice_begin // {{ ctx["value_tiles_per_head"] }}
+    )
+    projection_task_end = tl.minimum(
+        task_slice_end,
+        {{ ctx["total_value_tasks"] }},
+    )
     projection_value_head_count = (
         (projection_task_end + {{ ctx["value_tiles_per_head"] - 1 }})
         // {{ ctx["value_tiles_per_head"] }}
-        - projection_first_value_head
+        - projection_first_global_value_head
     )
 
     projection_head_slot = tle.encoding(
@@ -225,8 +214,7 @@ def {{ model["FunctionName"] }}__consumer(
         projection_k_offset = projection_k_tile * {{ ctx["block_k"] }} + projection_k_matrix
 {% for projection_group in range(ctx["projection_groups"]) %}
         projection_stage_slot_{{ projection_group }} = tle.encoding(
-            projection_first_value_head
-            + {{ projection_group * ctx["projection_heads_per_group"] }}
+            {{ projection_group * ctx["projection_heads_per_group"] }}
             + projection_head_slot,
             {{ model["FunctionName"] }}__projection_head_layout,
         )
@@ -236,7 +224,11 @@ def {{ model["FunctionName"] }}__consumer(
                 + projection_head_slot[:, None]
                 < projection_value_head_count
             )
-            & (projection_stage_slot_{{ projection_group }}[:, None] < {{ repeats }})
+            & (
+                projection_first_global_value_head
+                + projection_stage_slot_{{ projection_group }}[:, None]
+                < {{ model["NumValueHeads"] }}
+            )
             & (projection_k_offset < {{ model["HiddenSize"] }})
         )
         projection_input_value_{{ projection_group }} = tl.load(
@@ -300,8 +292,7 @@ def {{ model["FunctionName"] }}__consumer(
         reader.release(sequence)
 {% for projection_group in range(ctx["projection_groups"]) %}
     projection_stage_slot_{{ projection_group }} = tle.encoding(
-        projection_first_value_head
-        + {{ projection_group * ctx["projection_heads_per_group"] }}
+        {{ projection_group * ctx["projection_heads_per_group"] }}
         + projection_head_slot,
         {{ model["FunctionName"] }}__projection_head_layout,
     )
@@ -310,7 +301,8 @@ def {{ model["FunctionName"] }}__consumer(
         {{ model["FunctionName"] }}__projection_head_layout,
     )
     projection_head_{{ projection_group }} = (
-        global_key_head * {{ repeats }} + projection_stage_slot_{{ projection_group }}
+        projection_first_global_value_head
+        + projection_stage_slot_{{ projection_group }}
     )
     b_projection_{{ projection_group }} = tle.encoding(
         tl.sum(b_projection_partial_{{ projection_group }}, axis=1),
@@ -324,7 +316,7 @@ def {{ model["FunctionName"] }}__consumer(
         {{ projection_group * ctx["projection_heads_per_group"] }}
         + projection_head_slot
         < projection_value_head_count
-    ) & (projection_stage_slot_{{ projection_group }} < {{ repeats }})
+    ) & (projection_head_{{ projection_group }} < {{ model["NumValueHeads"] }})
     projection_a_log_{{ projection_group }} = tl.load(
         {{ access_pointer(model, "ALog", "a_log", tensor_access(["projection_head_" ~ projection_group], model["ALogStrides"])) }},
         mask=projection_slot_active_{{ projection_group }},
@@ -389,18 +381,22 @@ def {{ model["FunctionName"] }}__consumer(
     norm_weight = {{ ptr(model, "NormWeight") }}
     core_scratch = {{ ptr(model, "CoreScratch") }}
     gated_output = {{ ptr(model, "GatedOutput") }}
-    global_key_head = shard_index // {{ ctx["ctas_per_key_head"] }}
-    key_head_owner = shard_index % {{ ctx["ctas_per_key_head"] }}
-    projection_task_begin = key_head_owner * {{ ctx["state_tasks_per_cta"] }}
-    projection_task_end = tl.minimum(
-        projection_task_begin + {{ ctx["state_tasks_per_cta"] }},
-        {{ ctx["value_tiles_per_key_head"] }},
+    task_slice_begin = shard_index * {{ ctx["state_tasks_per_cta"] }}
+    task_slice_end = tl.minimum(
+        task_slice_begin + {{ ctx["state_tasks_per_cta"] }},
+        {{ ctx["total_value_tasks"] }},
     )
-    projection_first_value_head = projection_task_begin // {{ ctx["value_tiles_per_head"] }}
+    projection_first_global_value_head = (
+        task_slice_begin // {{ ctx["value_tiles_per_head"] }}
+    )
+    projection_task_end = tl.minimum(
+        task_slice_end,
+        {{ ctx["total_value_tasks"] }},
+    )
     projection_value_head_count = (
         (projection_task_end + {{ ctx["value_tiles_per_head"] - 1 }})
         // {{ ctx["value_tiles_per_head"] }}
-        - projection_first_value_head
+        - projection_first_global_value_head
     )
     projection_head_slot = tle.encoding(
         tl.arange(0, {{ ctx["projection_heads_per_group"] }}),
@@ -414,14 +410,12 @@ def {{ model["FunctionName"] }}__consumer(
         tl.zeros((8, {{ ctx["state_value_tile"] }}), tl.int32),
         {{ model["FunctionName"] }}__value_layout,
     )
-    qk_task = tle.encoding(
-        tl.broadcast_to(task_source[:, None], (8, {{ model["KeyBlockSize"] }})),
-        {{ model["FunctionName"] }}__qk_layout,
-    )
     qk_key = tle.encoding(
         tl.broadcast_to(key_source[None, :], (8, {{ model["KeyBlockSize"] }})),
         {{ model["FunctionName"] }}__qk_layout,
     )
+{% if ctx["aligned_key_head_task_slices"] %}
+    global_key_head = task_slice_begin // {{ ctx["value_tasks_per_key_head"] }}
     key_mask = qk_key < {{ model["KeyHeadDim"] }}
     query = tl.load(
         {{ access_pointer(model, "QKV", "qkv", contiguous_vector_axis_access(["0", "0"], model["QKVStrides"], packed_axis=1, logical_index="global_key_head * " ~ model["KeyHeadDim"] ~ " + qk_key", lane_count=model["QKVLaneCount"], global_coordinate_axes=[1])) }},
@@ -435,20 +429,60 @@ def {{ model["FunctionName"] }}__consumer(
     ).to(tl.float32)
     query *= tl.rsqrt(tl.sum(query * query, axis=1)[:, None] + 1.0e-6)
     key *= tl.rsqrt(tl.sum(key * key, axis=1)[:, None] + 1.0e-6)
+{% endif %}
 
     for task_wave in tl.range(0, {{ ctx["state_waves"] }}):
-        key_head_task = (
-            key_head_owner * {{ ctx["state_tasks_per_cta"] }}
+        global_task = (
+            task_slice_begin
             + task_wave * 8
             + task_source
         )
-        value_head_in_key = key_head_task // {{ model["ValueHeadDim"] // ctx["state_value_tile"] }}
-        value_tile = key_head_task % {{ model["ValueHeadDim"] // ctx["state_value_tile"] }}
-        global_value_head_source = global_key_head * {{ repeats }} + value_head_in_key
+        global_value_head_source = global_task // {{ ctx["value_tiles_per_head"] }}
+        value_tile = global_task % {{ ctx["value_tiles_per_head"] }}
+{% if ctx["has_state_tail"] %}
+        task_active_source = (
+            (task_wave * 8 + task_source < {{ ctx["state_tasks_per_cta"] }})
+            & (global_task < {{ ctx["total_value_tasks"] }})
+        )
+{% endif %}
         global_value_head = tle.encoding(
             tl.broadcast_to(global_value_head_source[:, None], (8, {{ ctx["state_value_tile"] }})),
             {{ model["FunctionName"] }}__value_layout,
         )
+{% if not ctx["aligned_key_head_task_slices"] %}
+        global_key_head_source = global_value_head_source // {{ repeats }}
+        global_key_head = tle.encoding(
+            tl.broadcast_to(
+                global_key_head_source[:, None],
+                (8, {{ model["KeyBlockSize"] }}),
+            ),
+            {{ model["FunctionName"] }}__qk_layout,
+        )
+{% if ctx["has_state_tail"] %}
+        qk_task_active = tle.encoding(
+            tl.broadcast_to(
+                task_active_source[:, None],
+                (8, {{ model["KeyBlockSize"] }}),
+            ),
+            {{ model["FunctionName"] }}__qk_layout,
+        )
+        key_mask = (qk_key < {{ model["KeyHeadDim"] }}) & qk_task_active
+{% else %}
+        key_mask = qk_key < {{ model["KeyHeadDim"] }}
+{% endif %}
+        query = tl.load(
+            {{ access_pointer(model, "QKV", "qkv", contiguous_vector_axis_access(["0", "0"], model["QKVStrides"], packed_axis=1, logical_index="global_key_head * " ~ model["KeyHeadDim"] ~ " + qk_key", lane_count=model["QKVLaneCount"], global_coordinate_axes=[1])) }},
+            mask=key_mask,
+            other=0.0,
+        ).to(tl.float32)
+        key = tl.load(
+            {{ access_pointer(model, "QKV", "qkv", contiguous_vector_axis_access(["0", "0"], model["QKVStrides"], packed_axis=1, logical_index=model["NumKeyHeads"] * model["KeyHeadDim"] ~ " + global_key_head * " ~ model["KeyHeadDim"] ~ " + qk_key", lane_count=model["QKVLaneCount"], global_coordinate_axes=[1])) }},
+            mask=key_mask,
+            other=0.0,
+        ).to(tl.float32)
+        query *= tl.rsqrt(tl.sum(query * query, axis=1)[:, None] + 1.0e-6)
+        key *= tl.rsqrt(tl.sum(key * key, axis=1)[:, None] + 1.0e-6)
+{% endif %}
         value_lane = tle.encoding(
             tl.broadcast_to(
                 value_tile[:, None] * {{ ctx["state_value_tile"] }} + value_source[None, :],
@@ -460,8 +494,7 @@ def {{ model["FunctionName"] }}__consumer(
         task_active = tle.encoding(
             tl.broadcast_to(
                 (
-                    (task_wave * 8 + task_source < {{ ctx["state_tasks_per_cta"] }})
-                    & (key_head_task < {{ ctx["value_tiles_per_key_head"] }})
+                    task_active_source
                 )[:, None],
                 (8, {{ ctx["state_value_tile"] }}),
             ),
@@ -474,7 +507,13 @@ def {{ model["FunctionName"] }}__consumer(
             other=0.0{% endif %}
         ).to(tl.float32)
         projection_value_head = tle.encoding(
-            tl.broadcast_to(value_head_in_key[:, None], (8, {{ ctx["state_value_tile"] }})),
+            tl.broadcast_to(
+                (
+                    global_value_head_source
+                    - projection_first_global_value_head
+                )[:, None],
+                (8, {{ ctx["state_value_tile"] }}),
+            ),
             {{ model["FunctionName"] }}__value_layout,
         )
         beta = tl.load(
@@ -515,8 +554,7 @@ def {{ model["FunctionName"] }}__consumer(
         state_task_active = tle.encoding(
             tl.broadcast_to(
                 (
-                    (task_wave * 8 + task_source < {{ ctx["state_tasks_per_cta"] }})
-                    & (key_head_task < {{ ctx["value_tiles_per_key_head"] }})
+                    task_active_source
                 )[:, None, None],
                 (8, {{ ctx["state_value_tile"] }}, {{ model["KeyBlockSize"] }}),
             ),
@@ -580,8 +618,7 @@ def {{ model["FunctionName"] }}__consumer(
     )
 {% for projection_group in range(ctx["projection_groups"]) %}
     norm_stage_slot = tle.encoding(
-        projection_first_value_head
-        + {{ projection_group * ctx["projection_heads_per_group"] }}
+        {{ projection_group * ctx["projection_heads_per_group"] }}
         + projection_head_slot,
         {{ model["FunctionName"] }}__projection_head_layout,
     )
@@ -589,8 +626,11 @@ def {{ model["FunctionName"] }}__consumer(
         {{ projection_group * ctx["projection_heads_per_group"] }}
         + projection_head_slot
         < projection_value_head_count
-    ) & (norm_stage_slot < {{ repeats }})
-    norm_global_head = global_key_head * {{ repeats }} + norm_stage_slot
+    ) & (
+        projection_first_global_value_head + norm_stage_slot
+        < {{ model["NumValueHeads"] }}
+    )
+    norm_global_head = projection_first_global_value_head + norm_stage_slot
     norm_global_head_matrix = tle.encoding(
         tl.broadcast_to(
             norm_global_head[:, None],
@@ -650,14 +690,13 @@ def {{ model["FunctionName"] }}__consumer(
             ),
             {{ model["FunctionName"] }}__gate_layout,
         )
-        key_head_task = (
-            key_head_owner * {{ ctx["state_tasks_per_cta"] }}
+        global_task = (
+            task_slice_begin
             + task_wave * 8
             + task_source
         )
-        value_head_in_key = key_head_task // {{ ctx["value_tiles_per_head"] }}
-        value_tile = key_head_task % {{ ctx["value_tiles_per_head"] }}
-        global_value_head_source = global_key_head * {{ repeats }} + value_head_in_key
+        global_value_head_source = global_task // {{ ctx["value_tiles_per_head"] }}
+        value_tile = global_task % {{ ctx["value_tiles_per_head"] }}
         global_value_head = tle.encoding(
             tl.broadcast_to(
                 global_value_head_source[:, None],
@@ -678,7 +717,7 @@ def {{ model["FunctionName"] }}__consumer(
             tl.broadcast_to(
                 (
                     (task_wave * 8 + task_source < {{ ctx["state_tasks_per_cta"] }})
-                    & (key_head_task < {{ ctx["value_tiles_per_key_head"] }})
+                    & (global_task < {{ ctx["total_value_tasks"] }})
                 )[:, None],
                 (8, {{ ctx["state_value_tile"] }}),
             ),
@@ -692,7 +731,10 @@ def {{ model["FunctionName"] }}__consumer(
         )
         projection_value_head = tle.encoding(
             tl.broadcast_to(
-                value_head_in_key[:, None],
+                (
+                    global_value_head_source
+                    - projection_first_global_value_head
+                )[:, None],
                 (8, {{ ctx["state_value_tile"] }}),
             ),
             {{ model["FunctionName"] }}__gate_layout,

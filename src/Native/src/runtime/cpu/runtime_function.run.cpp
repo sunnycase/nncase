@@ -25,6 +25,7 @@ using namespace nncase::runtime::cpu;
 using namespace nncase::ntt::runtime;
 
 result<void> cpu_runtime_function::run(std::byte *output_data) noexcept {
+    try_var(function_id, module().find_id_by_function(this));
     try_var(enable_profiling,
             module().interp().options().get_scalar_opt<uint8_t>(
                 "enable_profiling"));
@@ -39,6 +40,7 @@ result<void> cpu_runtime_function::run(std::byte *output_data) noexcept {
         auto block_local_rdata = module().block_local_rdata_content().subspan(
             block_local_rdata_offset, block_local_rdata_size);
         cpu_block_entry_params_t block_entry_params{
+            .function_id = static_cast<uint32_t>(function_id),
             .bdim = module().bdim(),
             .cdim = module().cdim(),
             .bid = bid,

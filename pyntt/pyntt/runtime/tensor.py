@@ -13,6 +13,7 @@ _KV_CACHE_STORAGE_CACHE: dict[tuple[Any, ...], Any] = {}
 _TRITON_POINTER_ALIGNMENT_BYTES = 16
 
 
+@lru_cache(maxsize=1)
 def _import_torch():
     try:
         import torch
@@ -118,7 +119,8 @@ def validate_inputs(
 ) -> None:
     """Validate runtime inputs against a function spec."""
     torch = _import_torch()
-    shape_env = shape_env or resolve_shape_env(function, inputs)
+    if shape_env is None:
+        shape_env = resolve_shape_env(function, inputs)
 
     if len(inputs) != len(function.inputs):
         raise PyNTTArgumentError(
@@ -146,7 +148,22 @@ def validate_outputs(
 ) -> None:
     """Validate caller-owned ABI output storage against a function spec."""
     torch = _import_torch()
-    shape_env = shape_env or resolve_shape_env(function, inputs)
+    if shape_env is None:
+        shape_env = resolve_shape_env(function, inputs)
+
+    like_input_spec = next(
+        (
+            spec
+            for spec in function.outputs
+            if not is_object_spec(spec) and spec.device == "like_input"
+        ),
+        None,
+    )
+    like_input_device = (
+        torch.device(_resolve_output_device(like_input_spec, inputs))
+        if like_input_spec is not None
+        else None
+    )
 
     if len(outputs) != len(function.outputs):
         raise PyNTTArgumentError(
@@ -167,7 +184,7 @@ def validate_outputs(
         if (
             not is_object_spec(spec)
             and spec.device == "like_input"
-            and tensor.device != torch.device(_resolve_output_device(spec, inputs))
+            and tensor.device != like_input_device
         ):
             raise PyNTTArgumentError(
                 f"Function {function.name} output {index} ({spec.name}) must be "
@@ -182,7 +199,8 @@ def allocate_outputs(
 ) -> tuple[Any, ...]:
     """Allocate output tensors for a function spec."""
     torch = _import_torch()
-    shape_env = shape_env or resolve_shape_env(function, inputs)
+    if shape_env is None:
+        shape_env = resolve_shape_env(function, inputs)
     outputs = []
     for spec in function.outputs:
         if is_object_spec(spec):
@@ -206,7 +224,8 @@ def materialize_results(
     shape_env: Mapping[str, int] | None = None,
 ) -> tuple[Any, ...]:
     """Create ordered logical result views over ABI input/output storage."""
-    shape_env = shape_env or resolve_shape_env(function, inputs)
+    if shape_env is None:
+        shape_env = resolve_shape_env(function, inputs)
     return tuple(
         _materialize_result(result, inputs, outputs, shape_env)
         for result in function.results
@@ -263,6 +282,42 @@ def view_typed_buffer(storage: Any, offset_bytes: int, size_bytes: int, dtype: s
         )
 
     return byte_storage.narrow(0, offset_bytes, size_bytes).view(torch_dtype)
+
+
+def view_typed_backing_buffer(
+    storage: Any, offset_bytes: int, size_bytes: int, dtype: str
+):
+    """Return a typed view bounded by the tensor's underlying allocation."""
+    torch = _import_torch()
+    if not isinstance(storage, torch.Tensor):
+        raise PyNTTArgumentError(
+            "PyNTT backing buffer view expects torch.Tensor storage, got "
+            f"{type(storage).__name__}."
+        )
+    if not storage.is_contiguous():
+        raise PyNTTArgumentError("PyNTT backing buffer view expects contiguous storage.")
+
+    base_offset_bytes = int(storage.storage_offset()) * int(storage.element_size())
+    backing_size_bytes = int(storage.untyped_storage().nbytes())
+    available_bytes = backing_size_bytes - base_offset_bytes
+    if available_bytes < 0:
+        raise PyNTTArgumentError(
+            "PyNTT tensor storage offset exceeds its underlying allocation."
+        )
+
+    byte_backing = torch.empty(
+        0, dtype=torch.uint8, device=storage.device
+    ).set_(
+        storage.untyped_storage(),
+        base_offset_bytes,
+        (available_bytes,),
+        (1,),
+    )
+    if int(byte_backing.data_ptr()) != int(storage.data_ptr()):
+        raise PyNTTArgumentError(
+            "PyNTT backing buffer view did not preserve the source base address."
+        )
+    return view_typed_buffer(byte_backing, offset_bytes, size_bytes, dtype)
 
 
 def _materialize_result(
@@ -345,7 +400,7 @@ def _validate_tensor(
         )
 
     expected_shape = _resolve_shape(spec.shape, shape_env)
-    actual_shape = tuple(tensor.shape)
+    actual_shape = tensor.shape
     if actual_shape != expected_shape:
         raise PyNTTArgumentError(
             f"Function {function_name} {value_kind} {index} ({spec.name}) expects "
@@ -359,7 +414,14 @@ def _validate_tensor(
             f"strides {expected_strides}, got {tuple(tensor.stride())}."
         )
 
-    if spec.layout == "contiguous" and not tensor.is_contiguous():
+    if (
+        spec.layout == "contiguous"
+        and (
+            expected_strides is None
+            or expected_strides != _contiguous_strides(expected_shape)
+        )
+        and not tensor.is_contiguous()
+    ):
         raise PyNTTArgumentError(
             f"Function {function_name} {value_kind} {index} "
             f"({spec.name}) must be contiguous."
@@ -408,27 +470,69 @@ def _resolve_output_device(spec: TensorSpec, inputs: tuple[Any, ...]):
     return spec.device
 
 
-def require_kv_cache_tensor_field(value: Any, name: str, device=None, dtype: str = "int64"):
-    """Return a vLLM-compatible KV metadata tensor without conversion or copy."""
+def require_kv_cache_tensor_field(
+    value: Any, name: str, device=None, dtype: str = "int64"
+):
+    """Validate and return one KV metadata tensor without conversion or copy."""
+    return require_kv_cache_tensor_fields(
+        value, device, fields=((name, dtype),)
+    )[0]
+
+
+@lru_cache(maxsize=None)
+def _resolve_kv_cache_tensor_field_specs(torch, fields):
+    return tuple((name, _torch_dtype(torch, dtype)) for name, dtype in fields)
+
+
+def require_kv_cache_tensor_fields(
+    value: Any,
+    device=None,
+    *,
+    fields: tuple[tuple[str, str], ...],
+    include_num_seqs: bool = False,
+):
+    """Validate KV metadata tensors once and optionally derive the request count."""
     torch = _import_torch()
-    field = _extract_kv_cache_field(value, name)
-    if not isinstance(field, torch.Tensor):
+    if not isinstance(fields, tuple):
         raise PyNTTArgumentError(
-            f"KV cache field {name!r} must be a torch.Tensor, got {type(field).__name__}."
+            "KV cache field specifications must be an immutable tuple."
         )
-    expected_dtype = _torch_dtype(torch, dtype)
-    if field.dtype != expected_dtype:
+
+    expected_device = torch.device(device) if device is not None else None
+    resolved_fields = _resolve_kv_cache_tensor_field_specs(torch, fields)
+    field_names = tuple(name for name, _ in resolved_fields)
+    if len(set(field_names)) != len(field_names):
         raise PyNTTArgumentError(
-            f"KV cache field {name!r} must have dtype {expected_dtype}, got {field.dtype}."
+            f"KV cache field specifications contain duplicates: {field_names}."
         )
-    if device is not None and field.device != torch.device(device):
-        raise PyNTTArgumentError(
-            f"KV cache field {name!r} must be on {torch.device(device)}, got {field.device}."
-        )
-    if not field.is_contiguous():
-        raise PyNTTArgumentError(f"KV cache field {name!r} must be contiguous.")
-    _validate_triton_pointer_alignment(field, f"KV cache field {name!r}")
-    return field
+    result = []
+    values_by_name = {}
+    for name, expected_dtype in resolved_fields:
+        field = _extract_kv_cache_field(value, name)
+        if not isinstance(field, torch.Tensor):
+            raise PyNTTArgumentError(
+                f"KV cache field {name!r} must be a torch.Tensor, "
+                f"got {type(field).__name__}."
+            )
+        if field.dtype != expected_dtype:
+            raise PyNTTArgumentError(
+                f"KV cache field {name!r} must have dtype {expected_dtype}, "
+                f"got {field.dtype}."
+            )
+        if expected_device is not None and field.device != expected_device:
+            raise PyNTTArgumentError(
+                f"KV cache field {name!r} must be on {expected_device}, "
+                f"got {field.device}."
+            )
+        if not field.is_contiguous():
+            raise PyNTTArgumentError(f"KV cache field {name!r} must be contiguous.")
+        _validate_triton_pointer_alignment(field, f"KV cache field {name!r}")
+        result.append(field)
+        values_by_name[name] = field
+
+    if include_num_seqs:
+        result.append(_derive_kv_cache_num_seqs(value, values_by_name, expected_device))
+    return tuple(result)
 
 
 def require_object_tensor_field(
@@ -441,6 +545,30 @@ def require_object_tensor_field(
     shape: tuple[int, ...],
 ):
     """Validate and return a stable tensor field from an external state object."""
+    return require_object_tensor_fields(
+        value,
+        object_kind,
+        device,
+        fields=((name, dtype, shape),),
+    )[0]
+
+
+@lru_cache(maxsize=None)
+def _resolve_object_tensor_field_specs(torch, fields):
+    return tuple(
+        (name, _torch_dtype(torch, dtype), shape)
+        for name, dtype, shape in fields
+    )
+
+
+def require_object_tensor_fields(
+    value: Any,
+    object_kind: str,
+    device=None,
+    *,
+    fields: tuple[tuple[str, str, tuple[int, ...]], ...],
+):
+    """Validate tensor fields from one external object in one pass."""
     torch = _import_torch()
     actual_kind = (
         value.get("pyntt_object_kind")
@@ -452,38 +580,43 @@ def require_object_tensor_field(
             f"Expected PyNTT object kind {object_kind!r}, got {actual_kind!r}."
         )
 
-    if isinstance(value, Mapping):
-        field = value.get(name)
-    else:
-        field = getattr(value, name, None)
-    if not isinstance(field, torch.Tensor):
+    if not isinstance(fields, tuple):
         raise PyNTTArgumentError(
-            f"{object_kind} field {name!r} must be a torch.Tensor, "
-            f"got {type(field).__name__}."
+            f"{object_kind} field specifications must be an immutable tuple."
         )
-
-    expected_dtype = _torch_dtype(torch, dtype)
-    if field.dtype != expected_dtype:
-        raise PyNTTArgumentError(
-            f"{object_kind} field {name!r} must have dtype {expected_dtype}, "
-            f"got {field.dtype}."
-        )
-    if tuple(field.shape) != tuple(shape):
-        raise PyNTTArgumentError(
-            f"{object_kind} field {name!r} must have shape {tuple(shape)}, "
-            f"got {tuple(field.shape)}."
-        )
-    if device is not None and field.device != torch.device(device):
-        raise PyNTTArgumentError(
-            f"{object_kind} field {name!r} must be on {torch.device(device)}, "
-            f"got {field.device}."
-        )
-    if not field.is_contiguous():
-        raise PyNTTArgumentError(
-            f"{object_kind} field {name!r} must be contiguous."
-        )
-    _validate_triton_pointer_alignment(field, f"{object_kind} field {name!r}")
-    return field
+    expected_device = torch.device(device) if device is not None else None
+    resolved_fields = _resolve_object_tensor_field_specs(torch, fields)
+    is_mapping = isinstance(value, Mapping)
+    result = []
+    for name, expected_dtype, shape in resolved_fields:
+        field = value.get(name) if is_mapping else getattr(value, name, None)
+        if not isinstance(field, torch.Tensor):
+            raise PyNTTArgumentError(
+                f"{object_kind} field {name!r} must be a torch.Tensor, "
+                f"got {type(field).__name__}."
+            )
+        if field.dtype != expected_dtype:
+            raise PyNTTArgumentError(
+                f"{object_kind} field {name!r} must have dtype {expected_dtype}, "
+                f"got {field.dtype}."
+            )
+        if field.shape != shape:
+            raise PyNTTArgumentError(
+                f"{object_kind} field {name!r} must have shape {shape}, "
+                f"got {tuple(field.shape)}."
+            )
+        if expected_device is not None and field.device != expected_device:
+            raise PyNTTArgumentError(
+                f"{object_kind} field {name!r} must be on {expected_device}, "
+                f"got {field.device}."
+            )
+        if not field.is_contiguous():
+            raise PyNTTArgumentError(
+                f"{object_kind} field {name!r} must be contiguous."
+            )
+        _validate_triton_pointer_alignment(field, f"{object_kind} field {name!r}")
+        result.append(field)
+    return tuple(result)
 
 
 def _validate_triton_pointer_alignment(tensor: Any, context: str) -> None:
@@ -498,9 +631,12 @@ def _validate_triton_pointer_alignment(tensor: Any, context: str) -> None:
         )
 
 
-def get_kv_cache_num_seqs(value: Any) -> int:
-    """Derive the request count from vLLM's direct query metadata."""
-    explicit_num_seqs = getattr(value, "num_seqs", None)
+def _derive_kv_cache_num_seqs(value: Any, values_by_name, expected_device) -> int:
+    explicit_num_seqs = (
+        value.get("num_seqs")
+        if isinstance(value, Mapping)
+        else getattr(value, "num_seqs", None)
+    )
     if callable(explicit_num_seqs):
         explicit_num_seqs = explicit_num_seqs()
     if explicit_num_seqs is not None:
@@ -516,10 +652,22 @@ def get_kv_cache_num_seqs(value: Any) -> int:
             )
         return num_seqs
 
-    query_start_loc = require_kv_cache_tensor_field(
-        value, "query_start_loc", dtype="int32"
+    missing_fields = tuple(
+        (name, "int32")
+        for name in ("query_start_loc", "seq_lens")
+        if name not in values_by_name
     )
-    seq_lens = require_kv_cache_tensor_field(value, "seq_lens", dtype="int32")
+    if missing_fields:
+        missing_values = require_kv_cache_tensor_fields(
+            value, expected_device, fields=missing_fields
+        )
+        values_by_name = dict(values_by_name)
+        values_by_name.update(
+            (spec[0], field) for spec, field in zip(missing_fields, missing_values)
+        )
+
+    query_start_loc = values_by_name["query_start_loc"]
+    seq_lens = values_by_name["seq_lens"]
     if query_start_loc.ndim != 1 or seq_lens.ndim != 1:
         raise PyNTTArgumentError(
             "KV cache query_start_loc and seq_lens must both be rank-one tensors."
@@ -533,6 +681,13 @@ def get_kv_cache_num_seqs(value: Any) -> int:
             "KV cache query_start_loc must contain exactly one more element than seq_lens."
         )
     return int(seq_lens.shape[0])
+
+
+def get_kv_cache_num_seqs(value: Any) -> int:
+    """Derive the request count from vLLM's direct query metadata."""
+    return require_kv_cache_tensor_fields(
+        value, fields=(), include_num_seqs=True
+    )[0]
 
 
 def materialize_kv_cache_storage(
@@ -647,11 +802,19 @@ def materialize_kv_cache_blocks_per_shard(
 
 
 def _extract_kv_cache_field(value: Any, name: str):
-    if not hasattr(value, name):
-        raise PyNTTArgumentError(
-            f"KV cache object must expose {name!r}; got {type(value).__name__}."
-        )
-    field = getattr(value, name)
+    if isinstance(value, Mapping):
+        if name not in value:
+            raise PyNTTArgumentError(
+                f"KV cache object must expose {name!r}; got {type(value).__name__}."
+            )
+        field = value[name]
+    else:
+        try:
+            field = getattr(value, name)
+        except AttributeError as ex:
+            raise PyNTTArgumentError(
+                f"KV cache object must expose {name!r}; got {type(value).__name__}."
+            ) from ex
     return field() if callable(field) else field
 
 
@@ -835,6 +998,7 @@ def _matches_flat_kv_storage(tensor: Any, topology_shape: tuple[int, ...], block
     )
 
 
+@lru_cache(maxsize=None)
 def _contiguous_strides(shape: tuple[int, ...]) -> tuple[int, ...]:
     strides = [1] * len(shape)
     for axis in range(len(shape) - 2, -1, -1):
@@ -876,7 +1040,14 @@ def _numpy_bfloat16_to_torch(torch, value: Any, device):
     return tensor.to(device=device) if device is not None else tensor
 
 
+@lru_cache(maxsize=None)
+def _resolve_static_shape(shape: tuple[Any, ...]) -> tuple[int, ...]:
+    return tuple(_resolve_dim(dim, {}) for dim in shape)
+
+
 def _resolve_shape(shape, shape_env: Mapping[str, int]) -> tuple[int, ...]:
+    if not shape_env:
+        return _resolve_static_shape(tuple(shape))
     return tuple(_resolve_dim(dim, shape_env) for dim in shape)
 
 

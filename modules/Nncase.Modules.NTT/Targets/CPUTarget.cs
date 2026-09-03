@@ -1,24 +1,8 @@
 ﻿// Copyright (c) Canaan Inc. All rights reserved.
 // Licensed under the Apache license. See LICENSE file in the project root for full license information.
 
-using System;
-using System.Collections.Generic;
-using System.CommandLine;
-using System.CommandLine.Invocation;
-using System.Linq;
-using System.Runtime.InteropServices;
-using System.Text;
-using System.Threading.Tasks;
-using Microsoft.Extensions.Configuration;
-using Microsoft.Extensions.Options;
-using Nncase.CodeGen;
 using Nncase.CodeGen.NTT;
-using Nncase.IR;
 using Nncase.Passes;
-using Nncase.Passes.Rules.Neutral;
-using Nncase.Passes.Rules.ShapeBucket;
-using Nncase.Passes.Transforms;
-using Nncase.Quantization;
 
 namespace Nncase.Targets;
 
@@ -29,19 +13,28 @@ public class CPUTarget : NTTTarget
 {
     public const string Kind = "cpu";
 
-    public CPUTarget()
-    {
-    }
-
     protected override INTTModuleCompiler NTTModuleCompiler { get; } = new CPUModuleCompiler();
 
-    public override void RegisterTIRSelectionPass(IPassManager passManager, CompileOptions optionsÍ)
+    /// <inheritdoc/>
+    public override void RegisterTargetDependentPass(IPassManager passManager, CompileOptions options)
     {
-        base.RegisterTIRSelectionPass(passManager, optionsÍ);
-        passManager.AddWithName<PrimFuncPass>("ToBlockLocalData").Configure(p =>
+        ValidateOptions(options);
+    }
+
+    internal static NTTTargetOptions ValidateOptions(CompileOptions options)
+    {
+        var targetOptions = options.TargetOptions as NTTTargetOptions
+            ?? throw new InvalidOperationException(
+                $"CPU NTT requires {nameof(NTTTargetOptions)}, got " +
+                $"{options.TargetOptions?.GetType().Name ?? "null"}.");
+        if (targetOptions.HierarchyLevels.Length == 0 ||
+            targetOptions.HierarchyLevels.Any(level => level != 'b'))
         {
-            p.Add<Passes.Mutators.RemoveNop>();
-            p.Add<Nncase.Passes.Mutators.ToBlockLocalData>();
-        });
+            throw new InvalidOperationException(
+                "CPU NTT supports only physical block hierarchy levels. " +
+                $"Logical axes may form a mesh, but HierarchyLevels must contain only 'b'; got '{targetOptions.HierarchyLevels}'.");
+        }
+
+        return targetOptions;
     }
 }

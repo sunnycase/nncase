@@ -39,6 +39,8 @@ public class Compiler : ICompiler
     private IRModule? _module;
     private int _runPassCount;
 
+    private CompileSession CurrentSession => CompileSessionScope.Current ?? _compileSession;
+
     public Compiler(CompileSession compileSession, IModelBuilder modelBuilder)
     {
         _compileSession = compileSession;
@@ -207,7 +209,7 @@ public class Compiler : ICompiler
             p.Add<Passes.Rules.WithMarker.CombineReshapePad>();
             p.Add<Passes.Rules.WithMarker.CombinePadTranspose>();
             p.Add<Passes.Rules.Neutral.CombineUnaryTranspose>();
-            if (_compileSession.CompileOptions.ShapeBucketOptions.Enable)
+            if (CurrentSession.CompileOptions.ShapeBucketOptions.Enable)
             {
                 p.Add<Passes.Rules.WithMarker.CombineTransposePad>();
             }
@@ -254,7 +256,7 @@ public class Compiler : ICompiler
             p.Add<Passes.Rules.Neutral.FoldTwoBinaryMul>();
         });
 
-        _compileSession.Target.RegisterTargetInDependentPass(passManager, _compileSession.CompileOptions);
+        CurrentSession.Target.RegisterTargetInDependentPass(passManager, CurrentSession.CompileOptions);
 
         passManager.AddWithName<DataflowPass>("BroadcastMarker").Configure(p =>
         {
@@ -269,8 +271,8 @@ public class Compiler : ICompiler
 
     public void QuantizePass(IPassManager passManager)
     {
-        var options = _compileSession.CompileOptions;
-        _compileSession.Target.RegisterQuantizePass(passManager, options);
+        var options = CurrentSession.CompileOptions;
+        CurrentSession.Target.RegisterQuantizePass(passManager, options);
         if (options.QuantizeOptions.ModelQuantMode == ModelQuantMode.UsePTQ)
         {
             passManager.AddWithName<DataflowPass>("RemoveMarker").Configure(p =>
@@ -279,27 +281,27 @@ public class Compiler : ICompiler
             });
         }
 
-        _compileSession.Target.RegisterPostQuantizePass(passManager, options);
+        CurrentSession.Target.RegisterPostQuantizePass(passManager, options);
     }
 
-    public void ModulePartitionPass(IPassManager passManager)
+    public void HeterogeneousPipelineFormationPass(IPassManager passManager)
     {
-        foreach (var moduleCompiler in _compileSession.Target.ModuleCompilers)
+        passManager.AddWithName<DataflowPass>("ExposeHeterogeneousPostOps").Configure(p =>
         {
-            passManager.AddWithName<ModulePartitionPass>($"ModulePartition_{moduleCompiler.ModuleKind}", moduleCompiler);
-        }
-
+            p.Add<Passes.Rules.Neutral.ExposePagedAttentionOutputGate>();
+        });
+        passManager.Add<AssignModulePlacementPass>();
+        passManager.Add<Passes.Transforms.HeterogeneousPipelineFormationPass>();
         passManager.Add<RemoveUnusedFunctions>();
         passManager.Add<InferRangePass>();
-        passManager.Add<OptimizeByRangePass>();
     }
 
     public void AutoPackingPass(IPassManager passManager)
     {
-        var target = _compileSession.Target;
+        var target = CurrentSession.Target;
         passManager.AddWithName<DataflowPass>("AutoPacking").Configure(p =>
         {
-            target.RegisterAutoPackingRules(p, _compileSession.CompileOptions);
+            target.RegisterAutoPackingRules(p, CurrentSession.CompileOptions);
 
             p.Add<Passes.Rules.Neutral.FoldConstCall>();
             p.Add<Passes.Rules.Neutral.FoldGetItemTuple>();
@@ -312,8 +314,7 @@ public class Compiler : ICompiler
         passManager.AddWithName<FunctionBoundaryLayoutPropagationPass>("FunctionBoundaryLayoutPropagation");
         passManager.AddWithName<EGraphRulesPass>("PostFunctionBoundaryPackPropagation").Configure(p =>
         {
-            target.RegisterPackPropagationRules(p, _compileSession.CompileOptions);
-            p.Add<Passes.Rules.Neutral.FoldConstCall>();
+            target.RegisterPackPropagationRules(p, CurrentSession.CompileOptions);
             p.Add<Passes.Rules.Neutral.UnpackToBitcast>();
             p.Add<Passes.Rules.Neutral.FoldGetItemTuple>();
             p.Add<Passes.Rules.Neutral.FoldPackTranspose>();
@@ -322,8 +323,10 @@ public class Compiler : ICompiler
             p.Add<Passes.Rules.Neutral.FoldBitcastBitcast>();
         });
 
+        passManager.AddWithName<MaterializeConstantsPass>("MaterializeFunctionBoundaryConstants");
+
         passManager.AddWithName<ThreadNormStatsAcrossFunctionBoundariesPass>("ThreadNormStatsAcrossFunctionBoundaries");
-        target.RegisterPostAutoPackingPass(passManager, _compileSession.CompileOptions);
+        target.RegisterPostAutoPackingPass(passManager, CurrentSession.CompileOptions);
         passManager.Add<RemoveUnusedFunctions>();
         passManager.Add<InferRangePass>();
         passManager.Add<OptimizeByRangePass>();
@@ -331,23 +334,26 @@ public class Compiler : ICompiler
 
     public void AutoVectorizePass(IPassManager passManager)
     {
-        var target = _compileSession.Target;
+        var target = CurrentSession.Target;
         passManager.AddWithName<EGraphRulesPass>("AutoVectorize").Configure(p =>
         {
-            target.RegisterAutoVectorizeRules(p, _compileSession.CompileOptions);
+            target.RegisterAutoVectorizeRules(p, CurrentSession.CompileOptions);
         });
 
         passManager.Add<InferRangePass>();
         passManager.Add<OptimizeByRangePass>();
 
-        target.RegisterPostAutoVectorizePass(passManager, _compileSession.CompileOptions);
+        target.RegisterPostAutoVectorizePass(passManager, CurrentSession.CompileOptions);
     }
 
     public void AutoDistributedPass(IPassManager passManager)
     {
-        foreach (var moduleCompiler in _compileSession.Target.ModuleCompilers)
+        var moduleKinds = CurrentSession.ActiveModuleKind is { } activeModuleKind
+            ? new[] { activeModuleKind }
+            : CurrentSession.Target.ModuleCompilers.Select(moduleCompiler => moduleCompiler.ModuleKind);
+        foreach (var moduleKind in moduleKinds)
         {
-            passManager.AddWithName<AutoDistributedWithShapeBucketPass>($"AutoDistributed_{moduleCompiler.ModuleKind}", false, moduleCompiler.ModuleKind);
+            passManager.AddWithName<AutoDistributedWithShapeBucketPass>($"AutoDistributed_{moduleKind}", false, moduleKind);
         }
 
         passManager.Add<AddFunctionToModule>();
@@ -360,9 +366,9 @@ public class Compiler : ICompiler
             p.Add<FoldBoxingUninitialized>();
         });
 
-        _compileSession.Target.RegisterPostAutoDistributedPass(
+        CurrentSession.Target.RegisterPostAutoDistributedPass(
             passManager,
-            _compileSession.CompileOptions);
+            CurrentSession.CompileOptions);
         passManager.AddWithName<DataflowPass>("FinalizeAutoDistributedBindings").Configure(p =>
         {
             p.Add<Passes.Rules.Neutral.FoldBindNormStats>();
@@ -374,80 +380,133 @@ public class Compiler : ICompiler
 
     public void AutoTilingPass(IPassManager passManager)
     {
-        var target = _compileSession.Target;
-        target.RegisterAutoTilingPass(passManager, _compileSession.CompileOptions);
+        var target = CurrentSession.Target;
+        target.RegisterAutoTilingPass(passManager, CurrentSession.CompileOptions);
     }
 
-    public void TIRPass(IPassManager passManager)
+    public void TIRSelectionPass(IPassManager passManager)
     {
-        var target = _compileSession.Target;
-        target.RegisterTIRSelectionPass(passManager, _compileSession.CompileOptions);
+        var target = CurrentSession.Target;
+        target.RegisterTIRSelectionPass(passManager, CurrentSession.CompileOptions);
         passManager.Add<AddFunctionToModule>();
+    }
 
+    public void FinalizeTIRCallGraphPass(IPassManager passManager)
+    {
         passManager.AddWithName<RemoveFunctionWrapperPass>("RemoveFunctionWrapper");
-
         passManager.Add<PropagatePrimFunctionBufferLayoutsPass>();
-
         passManager.Add<SpecializePrimFunctionBufferLayoutsPass>();
-
         passManager.Add<RemoveUnusedFunctions>();
         passManager.Add<InferRangePass>();
         passManager.Add<OptimizeByRangePass>();
-        target.RegisterTIRPreBufferizePass(passManager, _compileSession.CompileOptions);
-        passManager.Add<CanonicalizeTIRIndexExpressionsPass>();
-        passManager.Add<BufferizePass>();
-        passManager.AddWithName<PrimFuncPass>("PeelTiledLoopTails").Configure(p =>
-        {
-            p.Add<Passes.Mutators.TailLoopPeeling>();
-        });
-        target.RegisterTIRPostBufferizePass(passManager, _compileSession.CompileOptions);
-        passManager.Add<CanonicalizeTIRIndexExpressionsPass>();
+    }
 
-        passManager.AddWithName<PrimFuncPass>("Optimize").Configure(p =>
-        {
-            p.Add<Passes.Mutators.UnFoldBlock>();
-            p.Add<Passes.Mutators.FlattenSequential>();
-            p.Add<Passes.Mutators.FoldConstCall>();
-            p.Add<Passes.Mutators.EliminateEmptyLoops>();
-            p.Add<Passes.Mutators.FlattenBuffer>();
-            p.Add<Passes.Mutators.RemoveNop>();
-        });
+    public void TIRLoweringPass(IPassManager passManager)
+    {
+        var target = CurrentSession.Target;
+        target.RegisterTIRPreBufferizePass(passManager, CurrentSession.CompileOptions);
+        RegisterTIRBufferization(passManager);
+        target.RegisterTIRPostBufferizePass(passManager, CurrentSession.CompileOptions);
+        RegisterTIRCleanup(passManager);
+    }
+
+    public void ModuleDispatchTIRLoweringPass(IPassManager passManager)
+    {
+        RegisterTIRBufferization(passManager);
+        RegisterTIRCleanup(passManager);
+    }
+
+    public void ModuleDispatchTIRSelectionPass(IPassManager passManager)
+    {
+        var target = CurrentSession.Target;
+        target.RegisterTIRSelectionPass(passManager, CurrentSession.CompileOptions);
+        passManager.Add<AddFunctionToModule>();
     }
 
     public async Task CompileAsync(IProgress<int>? progress = null, CancellationToken token = default)
     {
-        Task RunPassAsync(Action<IPassManager> register, string name)
+        Task RunPassAsync(CompileSession session, Action<IPassManager> register, string name)
         {
-            return this.RunPassAsync(register, name, progress, token);
+            return this.RunPassAsync(session, register, name, progress, token);
         }
 
         var target = _compileSession.Target;
         using var scope = new CompileSessionScope(_compileSession);
-        await RunPassAsync(TargetIndependentPass, "TargetIndependentPass");
-        await RunPassAsync(TargetIndependQuantPass, "TargetIndependentQuantPass");
+        await RunPassAsync(_compileSession, TargetIndependentPass, "TargetIndependentPass");
+        await RunPassAsync(_compileSession, TargetIndependQuantPass, "TargetIndependentQuantPass");
 
-        await RunPassAsync(
-            p => target.RegisterTargetDependentPass(p, _compileSession.CompileOptions),
-            "TargetDependentPass");
-        await RunPassAsync(QuantizePass, "QuantizePass");
-
-        await RunPassAsync(AutoVectorizePass, "AutoVectorizePass");
-        await RunPassAsync(AutoPackingPass, "AutoPackingPass");
-        await RunPassAsync(AutoDistributedPass, "AutoDistributedPass");
-
-        if (target.IsAutoTilingEnabled)
+        if (target.ModuleCompilers.Count > 1)
         {
-            await RunPassAsync(AutoTilingPass, "AutoTilingPass");
+            await RunPassAsync(
+                _compileSession,
+                HeterogeneousPipelineFormationPass,
+                "HeterogeneousPipelineFormationPass");
         }
 
-        await RunPassAsync(TIRPass, "TIRPass");
-
-        await RunPassAsync(
-            p =>
+        foreach (var moduleCompiler in target.ModuleCompilers)
+        {
+            var moduleKind = moduleCompiler.ModuleKind;
+            if (!_module!.Functions.Any(function =>
+                    string.Equals(function.ModuleKind, moduleKind, StringComparison.Ordinal)))
             {
-                target.RegisterTargetDependentBeforeCodeGen(p, _compileSession.CompileOptions);
-            },
-            "TargetDependentBeforeCodeGen");
+                continue;
+            }
+
+            var moduleTarget = target.GetModuleTarget(moduleKind);
+            var moduleOptions = target.GetModuleCompileOptions(moduleKind, _compileSession.CompileOptions);
+            using var moduleSession = CompileSession.Create(moduleTarget, moduleOptions, moduleKind);
+
+            await RunPassAsync(
+                moduleSession,
+                p => moduleTarget.RegisterTargetDependentPass(p, moduleOptions),
+                $"{moduleKind}_TargetDependentPass");
+            await RunPassAsync(moduleSession, QuantizePass, $"{moduleKind}_QuantizePass");
+            await RunPassAsync(moduleSession, AutoVectorizePass, $"{moduleKind}_AutoVectorizePass");
+            await RunPassAsync(moduleSession, AutoPackingPass, $"{moduleKind}_AutoPackingPass");
+            await RunPassAsync(moduleSession, AutoDistributedPass, $"{moduleKind}_AutoDistributedPass");
+
+            if (moduleTarget.IsAutoTilingEnabled)
+            {
+                await RunPassAsync(moduleSession, AutoTilingPass, $"{moduleKind}_AutoTilingPass");
+            }
+        }
+
+        foreach (var moduleCompiler in target.ModuleCompilers)
+        {
+            var moduleKind = moduleCompiler.ModuleKind;
+            if (!_module!.Functions.Any(function =>
+                    string.Equals(function.ModuleKind, moduleKind, StringComparison.Ordinal)))
+            {
+                continue;
+            }
+
+            var moduleTarget = target.GetModuleTarget(moduleKind);
+            var moduleOptions = target.GetModuleCompileOptions(moduleKind, _compileSession.CompileOptions);
+            using var moduleSession = CompileSession.Create(moduleTarget, moduleOptions, moduleKind);
+            await RunPassAsync(moduleSession, TIRSelectionPass, $"{moduleKind}_TIRSelectionPass");
+        }
+
+        await RunPassAsync(_compileSession, FinalizeTIRCallGraphPass, "FinalizeTIRCallGraphPass");
+
+        foreach (var moduleCompiler in target.ModuleCompilers)
+        {
+            var moduleKind = moduleCompiler.ModuleKind;
+            if (!_module!.Functions.Any(function =>
+                    string.Equals(function.ModuleKind, moduleKind, StringComparison.Ordinal)))
+            {
+                continue;
+            }
+
+            var moduleTarget = target.GetModuleTarget(moduleKind);
+            var moduleOptions = target.GetModuleCompileOptions(moduleKind, _compileSession.CompileOptions);
+            using var moduleSession = CompileSession.Create(moduleTarget, moduleOptions, moduleKind);
+            await RunPassAsync(moduleSession, TIRLoweringPass, $"{moduleKind}_TIRLoweringPass");
+            await RunPassAsync(
+                moduleSession,
+                p => moduleTarget.RegisterTargetDependentBeforeCodeGen(p, moduleOptions),
+                $"{moduleKind}_TargetDependentBeforeCodeGen");
+        }
+
         if (DumpScope.Current.IsEnabled(DumpFlags.Compile))
         {
             DumpScope.Current.DumpModule(_module!, "ModuleAfterCompile");
@@ -459,6 +518,31 @@ public class Compiler : ICompiler
         using var scope = new CompileSessionScope(_compileSession);
         var linkedModel = _modelBuilder.Build(Module);
         linkedModel.Serialize(output);
+    }
+
+    private static void RegisterTIRBufferization(IPassManager passManager)
+    {
+        passManager.Add<CanonicalizeTIRIndexExpressionsPass>();
+        passManager.Add<BufferizePass>();
+        passManager.AddWithName<PrimFuncPass>("PeelTiledLoopTails").Configure(p =>
+        {
+            p.Add<Passes.Mutators.TailLoopPeeling>();
+        });
+    }
+
+    private static void RegisterTIRCleanup(IPassManager passManager)
+    {
+        passManager.Add<CanonicalizeTIRIndexExpressionsPass>();
+
+        passManager.AddWithName<PrimFuncPass>("Optimize").Configure(p =>
+        {
+            p.Add<Passes.Mutators.UnFoldBlock>();
+            p.Add<Passes.Mutators.FlattenSequential>();
+            p.Add<Passes.Mutators.FoldConstCall>();
+            p.Add<Passes.Mutators.EliminateEmptyLoops>();
+            p.Add<Passes.Mutators.FlattenBuffer>();
+            p.Add<Passes.Mutators.RemoveNop>();
+        });
     }
 
     private async Task<IRModule> InitializeModuleAsync(IRModule module)
@@ -496,12 +580,25 @@ public class Compiler : ICompiler
         }
     }
 
-    private async Task RunPassAsync(Action<IPassManager> register, string name, IProgress<int>? progress = null, CancellationToken token = default)
+    private Task RunPassAsync(
+        Action<IPassManager> register,
+        string name,
+        IProgress<int>? progress = null,
+        CancellationToken token = default)
+        => RunPassAsync(_compileSession, register, name, progress, token);
+
+    private async Task RunPassAsync(
+        CompileSession compileSession,
+        Action<IPassManager> register,
+        string name,
+        IProgress<int>? progress = null,
+        CancellationToken token = default)
     {
         var newName = $"{_runPassCount++:D2}_{name}";
-        var pmgr = _compileSession.CreatePassManager(newName);
+        using var scope = new CompileSessionScope(compileSession);
+        var pmgr = compileSession.CreatePassManager(newName);
         register(pmgr);
-        _ = _compileSession.GetService<ILogger<Compiler>>();
+        _ = compileSession.GetService<ILogger<Compiler>>();
         var stopwatch = System.Diagnostics.Stopwatch.StartNew();
 
         using var animationCts = new CancellationTokenSource();

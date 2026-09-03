@@ -19,7 +19,13 @@ internal static class PyNTTFunctionOutputs
     }
 
     public static IRType[] GetOutputParameterTypes(BaseFunction function)
-        => GetOutputParameters(function).Select(output => output.CheckedType).ToArray();
+        => function switch
+        {
+            PrimFunction => GetOutputParameters(function).Select(output => output.CheckedType).ToArray(),
+            Function => FlattenTensorTypes(((CallableType)function.CheckedType).ReturnType).ToArray(),
+            _ => throw new NotSupportedException(
+                $"PyNTT requires Function or PrimFunction output ABI, got {function.GetType().Name} {function.Name}."),
+        };
 
     public static PrimFunctionResultBinding[] GetResults(BaseFunction function)
     {
@@ -29,5 +35,29 @@ internal static class PyNTTFunctionOutputs
         }
 
         return primFunction.GetAbiView().Results.ToArray();
+    }
+
+    private static IEnumerable<IRType> FlattenTensorTypes(IRType type)
+    {
+        if (type is TupleType tuple)
+        {
+            foreach (var field in tuple.Fields)
+            {
+                foreach (var flattened in FlattenTensorTypes(field))
+                {
+                    yield return flattened;
+                }
+            }
+
+            yield break;
+        }
+
+        if (type is TensorType or DistributedType)
+        {
+            yield return type;
+            yield break;
+        }
+
+        throw new NotSupportedException($"PyNTT function result must be tensor-like, got {type}.");
     }
 }

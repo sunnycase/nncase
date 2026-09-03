@@ -7,53 +7,14 @@
   string qBias = Model.Arguments[4].Symbol.Name;
   string kBias = Model.Arguments[5].Symbol.Name;
   string vBias = Model.Arguments[6].Symbol.Name;
+  string qInputScale = Model.Arguments[7].Symbol.Name;
+  string kInputScale = Model.Arguments[8].Symbol.Name;
+  string vInputScale = Model.Arguments[9].Symbol.Name;
+  string qWeightScale = Model.Arguments[10].Symbol.Name;
+  string kWeightScale = Model.Arguments[11].Symbol.Name;
+  string vWeightScale = Model.Arguments[12].Symbol.Name;
   string qOutput = Model.Arguments[13].Symbol.Name;
   string kOutput = Model.Arguments[14].Symbol.Name;
   string vOutput = Model.Arguments[15].Symbol.Name;
-
-  string MatmulLine(string lhs, string rhs, string output) =>
-      $"{Model.Indent}  matmul<false, false, false>({lhs}, {rhs}, {output}, nullptr, fixed_shape_v<>, fixed_shape_v<>, fixed_shape_v<>, fixed_shape_v<>);\n";
-
-  string BiasLine(string bias, string output) =>
-      bias == "nullptr" ? string.Empty : $"{Model.Indent}  binary<ops::add>({output}, {bias}, {output});\n";
-
-  string AccumulatingMatmulLine(bool accumulate, string rhs, string output) =>
-      $"{Model.Indent}    matmul<{accumulate.ToString().ToLowerInvariant()}, false, false>({input}, {rhs}, {output}, nullptr, fixed_shape_v<>, fixed_shape_v<>, fixed_shape_v<>, fixed_shape_v<>);\n";
-
-  string FinalizeLine(string accumulator, string bias, string output) =>
-      BiasLine(bias, accumulator) + $"{Model.Indent}  cast({accumulator}, {output}, fixed_shape_v<>);\n";
 }
-@if (Model.Reduction is { Phase: Nncase.CodeGen.NTT.ReductionKernelPhase.Accumulate } accumulate)
-{
-@Html.Raw($"{Model.Indent}{{\n")
-@Html.Raw($"{Model.Indent}  if ({accumulate.Initialized}) {{\n")
-@Html.Raw(AccumulatingMatmulLine(true, qWeight, accumulate.Accumulators[0]))
-@Html.Raw(AccumulatingMatmulLine(true, kWeight, accumulate.Accumulators[1]))
-@Html.Raw(AccumulatingMatmulLine(true, vWeight, accumulate.Accumulators[2]))
-@Html.Raw($"{Model.Indent}  }} else {{\n")
-@Html.Raw(AccumulatingMatmulLine(false, qWeight, accumulate.Accumulators[0]))
-@Html.Raw(AccumulatingMatmulLine(false, kWeight, accumulate.Accumulators[1]))
-@Html.Raw(AccumulatingMatmulLine(false, vWeight, accumulate.Accumulators[2]))
-@Html.Raw($"{Model.Indent}    {accumulate.Initialized} = true;\n")
-@Html.Raw($"{Model.Indent}  }}\n")
-@Html.Raw($"{Model.Indent}}}\n")
-}
-else if (Model.Reduction is { Phase: Nncase.CodeGen.NTT.ReductionKernelPhase.Finalize } finalize)
-{
-@Html.Raw($"{Model.Indent}{{\n")
-@Html.Raw(FinalizeLine(finalize.Accumulators[0], qBias, qOutput))
-@Html.Raw(FinalizeLine(finalize.Accumulators[1], kBias, kOutput))
-@Html.Raw(FinalizeLine(finalize.Accumulators[2], vBias, vOutput))
-@Html.Raw($"{Model.Indent}}}\n")
-}
-else
-{
-@Html.Raw($"{Model.Indent}{{\n")
-@Html.Raw(MatmulLine(input, qWeight, qOutput))
-@Html.Raw(BiasLine(qBias, qOutput))
-@Html.Raw(MatmulLine(input, kWeight, kOutput))
-@Html.Raw(BiasLine(kBias, kOutput))
-@Html.Raw(MatmulLine(input, vWeight, vOutput))
-@Html.Raw(BiasLine(vBias, vOutput))
-@Html.Raw($"{Model.Indent}}}\n")
-}
+@Html.Raw($"{Model.Indent}qkv_parallel_linear<{Model.Target.QuantizationMode.ToC()}>({input}, {qWeight}, {kWeight}, {vWeight}, {qBias}, {kBias}, {vBias}, {qInputScale}, {kInputScale}, {vInputScale}, {qWeightScale}, {kWeightScale}, {vWeightScale}, {qOutput}, {kOutput}, {vOutput});\n")

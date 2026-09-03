@@ -33,22 +33,31 @@ public sealed class PyNTTModuleBuilder : IModuleBuilder
     /// <inheritdoc/>
     public ILinkableModule Build(IReadOnlyList<BaseFunction> functions)
     {
-        var primFunctions = functions
-            .Select(RequirePrimFunction)
-            .ToArray();
-        var linkableFunctions = primFunctions
+        foreach (var function in functions)
+        {
+            ValidateFunction(function);
+        }
+
+        var linkableFunctions = functions
             .Select((function, index) => new PyNTTFunctionBuilder((uint)index, CompileOptions).Build(function))
             .ToArray();
         return new PyNTTLinkableModule(ModuleKind, linkableFunctions, CompileOptions);
     }
 
-    private static PrimFunction RequirePrimFunction(BaseFunction function)
+    private static void ValidateFunction(BaseFunction function)
     {
-        if (function is PrimFunction primFunction)
+        if (function is PrimFunction)
         {
-            return primFunction;
+            return;
         }
 
-        throw new NotSupportedException($"PyNTT module builder expects lowered PrimFunction inputs, got {function.GetType().Name} {function.Name}. Run TIR selection and RemoveFunctionWrapperPass before PyNTT codegen.");
+        if (function is Function { Role: FunctionRole.ModuleDispatch, IsEntry: true })
+        {
+            return;
+        }
+
+        throw new NotSupportedException(
+            $"PyNTT module builder expects selected PrimFunctions plus one optional ModuleDispatch entry, " +
+            $"got {function.GetType().Name} {function.Name} ({function.Role}).");
     }
 }

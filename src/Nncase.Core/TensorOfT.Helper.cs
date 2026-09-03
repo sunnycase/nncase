@@ -2,8 +2,10 @@
 // Licensed under the Apache license. See LICENSE file in the project root for full license information.
 
 using System;
+using System.Collections.Concurrent;
 using System.Collections.Generic;
 using System.Linq;
+using System.Runtime.CompilerServices;
 using System.Text;
 using System.Threading.Tasks;
 
@@ -65,43 +67,39 @@ public partial class Tensor<T>
 
     public override Tensor Transpose(ReadOnlySpan<long> perm)
     {
-        if (perm.Length != Rank || perm.ToArray().Any(x => x >= Rank))
+        var permArr = perm.ToInts();
+        if (permArr.Length != Rank || permArr.Any(x => x < 0 || x >= Rank) || permArr.Distinct().Count() != Rank)
         {
-            throw new ArgumentException("Permutation length must match tensor rank", nameof(perm));
+            throw new ArgumentException("Permutation must contain every tensor axis exactly once", nameof(perm));
         }
 
-        var invPerms = perm.ToInts().Zip(Enumerable.Range(0, Rank)).OrderBy(p => p.First).Select(p => p.Second).ToArray();
-        var permArr = perm.ToInts();
         var destDimensions = Enumerable.Range(0, Rank).Select(i => Dimensions[permArr[i]]).ToArray();
         var destStrides = TensorUtilities.GetDefaultStrides(destDimensions);
-        void Apply(int axis, Span<int> index, int i, int j, Span<T> srcSpan, Span<T> destSpan)
+
+        if (permArr.SequenceEqual(Enumerable.Range(0, Rank)) && IsContiguous)
         {
-            if (axis < Rank - 1)
-            {
-                for (index[axis] = 0; index[axis] < Dimensions[axis]; index[axis]++)
-                {
-                    int ni = i + (index[axis] * (int)Strides[axis]);
-                    int nj = j + (index[axis] * (int)destStrides[invPerms[axis]]);
-                    Apply(axis + 1, index, ni, nj, srcSpan, destSpan);
-                }
-            }
-            else
-            {
-                for (index[axis] = 0; index[axis] < Dimensions[axis]; index[axis]++)
-                {
-                    int ni = i + (index[axis] * (int)Strides[axis]);
-                    int nj = j + (index[axis] * (int)destStrides[invPerms[axis]]);
-                    destSpan[nj] = srcSpan[ni];
-                }
-            }
+            return Clone();
         }
 
-        // 0,  4,  8, 12, 16, 20,  1,  5,  9, 13, 17, 21,  2,  6, 10, 14, 18, 22,  3,  7, 11, 15, 19, 23
-        var newBuffer = new T[Buffer.Length];
-        var newBufferMemory = new Memory<T>(newBuffer);
-        var bufferSpan = Buffer.Span;
-        var indices = Enumerable.Repeat(0, Rank).ToArray();
-        Apply(0, indices, 0, 0, bufferSpan, newBufferMemory.Span);
+        var newBuffer = new T[checked((int)TensorUtilities.GetProduct(destDimensions))];
+        if (newBuffer.Length == 0)
+        {
+            return new Tensor<T>(newBuffer, destDimensions, destStrides);
+        }
+
+        var sourceStrides = permArr.Select(axis => Strides[axis]).ToArray();
+        var elementsPerRange = Math.Max(64 * 1024, (4 * 1024 * 1024) / Unsafe.SizeOf<T>());
+        if (newBuffer.Length <= elementsPerRange || Environment.ProcessorCount == 1)
+        {
+            TransposeRange(Buffer, newBuffer, destDimensions, sourceStrides, 0, newBuffer.Length);
+        }
+        else
+        {
+            Parallel.ForEach(
+                Partitioner.Create(0, newBuffer.Length, elementsPerRange),
+                range => TransposeRange(Buffer, newBuffer, destDimensions, sourceStrides, range.Item1, range.Item2));
+        }
+
         return new Tensor<T>(newBuffer, destDimensions, destStrides);
     }
 
@@ -140,6 +138,45 @@ public partial class Tensor<T>
         var dest = Tensor.Zeros(ElementType, Dimensions).Cast<T>();
         CopyTo(dest);
         return dest;
+    }
+
+    private static void TransposeRange(
+        Memory<T> sourceMemory,
+        T[] destinationArray,
+        long[] dimensions,
+        long[] sourceStrides,
+        int start,
+        int end)
+    {
+        var rank = dimensions.Length;
+        var coordinates = new long[rank];
+        var remainder = (long)start;
+        long sourceOffset = 0;
+        for (var axis = rank - 1; axis >= 0; axis--)
+        {
+            coordinates[axis] = remainder % dimensions[axis];
+            remainder /= dimensions[axis];
+            sourceOffset += coordinates[axis] * sourceStrides[axis];
+        }
+
+        var source = sourceMemory.Span;
+        var destination = destinationArray.AsSpan();
+        for (var outputOffset = start; outputOffset < end; outputOffset++)
+        {
+            destination[outputOffset] = source[checked((int)sourceOffset)];
+            for (var axis = rank - 1; axis >= 0; axis--)
+            {
+                coordinates[axis]++;
+                sourceOffset += sourceStrides[axis];
+                if (coordinates[axis] < dimensions[axis])
+                {
+                    break;
+                }
+
+                coordinates[axis] = 0;
+                sourceOffset -= dimensions[axis] * sourceStrides[axis];
+            }
+        }
     }
 
     private static void CopyTo(Tensor<T> src, Tensor<T> dest)

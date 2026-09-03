@@ -25,7 +25,8 @@ public sealed class LowerTransferPipelineRegionsPass : ModulePass
     {
         var functions = input.Functions
             .Select((function, index) => (Function: function as PrimFunction, Index: index))
-            .Where(item => item.Function?.ModuleKind == _moduleKind)
+            .Where(item => item.Function?.ModuleKind == _moduleKind &&
+                CompileSession.IsFunctionActive(item.Function))
             .Select(item => (Function: item.Function!, item.Index))
             .ToArray();
         var pipelineFunctions = FindPipelineFunctions(functions.Select(item => item.Function));

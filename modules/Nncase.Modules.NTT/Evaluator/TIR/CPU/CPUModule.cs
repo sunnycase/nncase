@@ -21,11 +21,13 @@ internal class NTTModule : IApplicationPart
         registrator.RegisterManyInterface<BinaryEvaluator>(reuse: Reuse.Singleton);
         registrator.RegisterManyInterface<GetItemEvaluator>(reuse: Reuse.Singleton);
         registrator.RegisterManyInterface<MatmulEvaluator>(reuse: Reuse.Singleton);
+        registrator.RegisterManyInterface<BlockScaledMatMulEvaluator>(reuse: Reuse.Singleton);
         registrator.RegisterManyInterface<PackedMatMulEvaluator>(reuse: Reuse.Singleton);
         registrator.RegisterManyInterface<PackedScaledMatMulEvaluator>(reuse: Reuse.Singleton);
         registrator.RegisterManyInterface<PackedBlockScaledMatMulEvaluator>(reuse: Reuse.Singleton);
         registrator.RegisterManyInterface<PackedBlockScaledMatMulNormStatsEvaluator>(reuse: Reuse.Singleton);
         registrator.RegisterManyInterface<NVFP4MatMulEvaluator>(reuse: Reuse.Singleton);
+        registrator.RegisterManyInterface<NVFP4MatMulNormStatsEvaluator>(reuse: Reuse.Singleton);
         registrator.RegisterManyInterface<NVFP4MatMulGluEvaluator>(reuse: Reuse.Singleton);
         registrator.RegisterManyInterface<PackedMatMulNormStatsEvaluator>(reuse: Reuse.Singleton);
         registrator.RegisterManyInterface<QKVParallelLinearEvaluator>(reuse: Reuse.Singleton);
@@ -52,6 +54,7 @@ internal class NTTModule : IApplicationPart
         registrator.RegisterManyInterface<GatherReduceAddNormStatsEvaluator>(reuse: Reuse.Singleton);
         registrator.RegisterManyInterface<GatherReduceAddNormApplyEvaluator>(reuse: Reuse.Singleton);
         registrator.RegisterManyInterface<GatherReduceQKVRoPEWithCacheEvaluator>(reuse: Reuse.Singleton);
+        registrator.RegisterManyInterface<GatherReduceNormApplyNVFP4MatMulGluEvaluator>(reuse: Reuse.Singleton);
         registrator.RegisterManyInterface<QKVRoPEWithCacheEvaluator>(reuse: Reuse.Singleton);
         registrator.RegisterManyInterface<GatedDeltaNetConvolutionEvaluator>(reuse: Reuse.Singleton);
         registrator.RegisterManyInterface<GatedDeltaNetRecurrentCoreEvaluator>(reuse: Reuse.Singleton);

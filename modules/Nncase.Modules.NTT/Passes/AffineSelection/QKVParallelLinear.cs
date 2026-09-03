@@ -94,7 +94,9 @@ public partial class NTTAffineSelectionPass
                 vOutputTile,
                 qkv.NumHeads,
                 qkv.NumKvHeads,
-                qkv.RhsLayout))
+                qkv.RhsLayout,
+                qkv.OutputNVectorLaneCount,
+                qkv.QuantizationMode))
             .Build();
     }
 

@@ -21,9 +21,10 @@ public sealed class PagedAttentionEvaluator : ITypeInferencer<PagedAttention>, I
         var extra = context.CheckArgumentType<IRType>(target, PagedAttention.Extra);
         var scale = context.CheckArgumentType<TensorType>(target, PagedAttention.Scale);
         _ = context.CheckArgumentType<DimensionType>(target, PagedAttention.LayerId);
+        var outputGate = context.CheckArgumentType<IRType>(target, PagedAttention.OutputGate);
         var kvcaches = context.CheckArgumentType<TensorType>(target, PagedAttention.KVCaches);
 
-        return InferType(target, q, extra, scale, kvcaches);
+        return InferType(target, q, extra, scale, kvcaches, outputGate);
     }
 
     public static IRType InferType(
@@ -31,14 +32,25 @@ public sealed class PagedAttentionEvaluator : ITypeInferencer<PagedAttention>, I
         IRType q,
         IRType extra,
         TensorType scale,
-        TensorType kvcaches)
+        TensorType kvcaches,
+        IRType outputGate)
     {
-        return (q, extra) switch
+        var output = (q, extra) switch
         {
             (DistributedType dq, DistributedType dextra) => InferDistributedType(target, dq, dextra, scale, kvcaches),
             (TensorType tq, TensorType textra) => InferTensorType(tq, textra, scale, kvcaches, out _),
             _ => new InvalidType("not support type"),
         };
+        if (output is InvalidType || outputGate is NoneType)
+        {
+            return output;
+        }
+
+        return outputGate == output
+            ? output
+            : new InvalidType(
+                $"PagedAttention output gate must have exactly the output type, " +
+                $"got output={output}, gate={outputGate}.");
     }
 
     public Cost Visit(ICostEvaluateContext context, PagedAttention target)
@@ -46,6 +58,7 @@ public sealed class PagedAttentionEvaluator : ITypeInferencer<PagedAttention>, I
         var qType = context.GetArgumentType<IRType>(target, PagedAttention.Q);
         var extraType = context.GetArgumentType<IRType>(target, PagedAttention.Extra);
         var kvCachesType = context.GetArgumentType<TensorType>(target, PagedAttention.KVCaches);
+        var outputGateType = context.GetArgumentType<IRType>(target, PagedAttention.OutputGate);
         var returnType = context.GetReturnType<IRType>();
 
         var executionPlan = PagedAttentionExecutionPlan.Direct;
@@ -147,6 +160,18 @@ public sealed class PagedAttentionEvaluator : ITypeInferencer<PagedAttention>, I
             AddCostFactor(cost, CostFactorNames.BlockLocalMemoryStoreBytes, outputStoreBytes);
         }
 
+        if (outputGateType is not NoneType)
+        {
+            AddCostFactor(
+                cost,
+                CostFactorNames.BlockLocalMemoryLoadBytes,
+                CostUtility.GetMemoryAccess(outputGateType));
+            AddCostFactor(
+                cost,
+                CostFactorNames.CPUCycles,
+                CostUtility.GetMemoryAccess(returnType) / (UInt128)System.Math.Max(1, GetDType(returnType).SizeInBytes) * 3);
+        }
+
         return cost;
     }
 
@@ -156,7 +181,14 @@ public sealed class PagedAttentionEvaluator : ITypeInferencer<PagedAttention>, I
         var kvCaches = context.GetArgumentValueAsTensor<Reference<IPagedAttentionKVCache>>(target, PagedAttention.KVCaches);
         var scale = context.GetOrtArgumentValue(target, PagedAttention.Scale); // must match to prim kv type.
         var layerId = checked((int)context.GetArgumentValue(target, PagedAttention.LayerId).AsTensor().ToScalar<long>());
-        return RefPagedAttn(q, kvCaches, scale, layerId, target.Layout).ToValue(context.GetReturnType());
+        var output = RefPagedAttn(q, kvCaches, scale, layerId, target.Layout);
+        var outputGate = context.GetArgumentValue(target, PagedAttention.OutputGate);
+        if (outputGate is not NoneValue && outputGate.Type is not NoneType)
+        {
+            output *= OrtKI.Sigmoid(outputGate.AsTensor().ToOrtTensor());
+        }
+
+        return output.ToValue(context.GetReturnType());
     }
 
     public static OrtKISharp.Tensor RefPagedAttn(OrtKISharp.Tensor query, Tensor<Reference<IPagedAttentionKVCache>> kvCaches, OrtKISharp.Tensor scale, int layerId, IRArray<AttentionDimKind> qlayout)

@@ -18,6 +18,12 @@ public static class WellknownMarkerNames
     /// attribute. <seealso cref="IR.Math.RangeOf"/>
     /// </summary>
     public const string RangeOf = "RangeOf";
+
+    /// <summary>
+    /// Delimits a model-semantic region until heterogeneous placement has
+    /// assigned its operations to execution modules.
+    /// </summary>
+    public const string SemanticRegion = "SemanticRegion";
 }
 
 public class MixQuantInfo

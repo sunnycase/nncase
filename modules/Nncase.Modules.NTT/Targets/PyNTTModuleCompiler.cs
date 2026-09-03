@@ -67,14 +67,25 @@ public sealed class PyNTTModuleCompiler : INTTModuleCompiler
             IR.Tensors.Concat
                 or IR.Tensors.Expand
                 or IR.Tensors.Gather
+                or IR.Tensors.GetItem
+                or IR.Tensors.Pack
+                or IR.Tensors.Reshape
                 or IR.Tensors.ScatterND
                 or IR.Tensors.Slice
                 or IR.Tensors.Transpose
+                or IR.Tensors.Unpack
                 or IR.Tensors.Where
+                or IR.Buffers.Uninitialized
                 or IR.NN.Pad { PadMode: PadMode.Constant }
                 or IR.NN.Conv2D { PadMode: PadMode.Constant }
                 or IR.NN.Erf
+                or IR.NN.GetPositionIds
+                or IR.NN.NormApply
+                or IR.NN.NormStats
+                or IR.NN.PagedAttention
                 or IR.NN.RoPE
+                or IR.NN.Sampling
+                or IR.NN.Sigmoid
                 or IR.NN.Swish
                 or IR.NN.QKVParallelLinear
                 or IR.NN.QKVRoPEWithCache
@@ -84,19 +95,24 @@ public sealed class PyNTTModuleCompiler : INTTModuleCompiler
                 or IR.NN.SparseExpertsGateUp
                 or IR.NN.SparseExpertsDown
                 or IR.NN.MatMulGlu
+                or IR.NN.NVFP4MatMulGlu
                 or IR.Math.MatMul
+                or IR.Math.NVFP4MatMul
                 or IR.Math.ScaledMatMul
                 or IR.Math.BlockScaledMatMul
                 or IR.NTT.VectorizedMatMul
+                or IR.NTT.VectorizedRoPE
                 or IR.NTT.PackedMatMul
                 or IR.NTT.PackedScaledMatMul
                 or IR.NTT.PackedBlockScaledMatMul
+                or IR.NTT.PackedNVFP4MatMul
                 or IR.NTT.PackedMatMulNormStats
                 or IR.NTT.PackedMatMulNormStatsCombine
                 or IR.NTT.PackedQKVParallelLinear
                 or IR.NTT.PackedQKVParallelLinearCombine
                 or IR.NTT.PackedMatMulGlu
                 or IR.NTT.PackedMatMulGluCombine
+                or IR.NTT.PackedNVFP4MatMulGlu
                 or IR.NTT.PagedAttentionPartial
                 or IR.NTT.PagedAttentionCombine
                 or IR.NTT.SamplingPartial

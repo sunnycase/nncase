@@ -40,6 +40,9 @@
 {% endfor %}
 {% if model["HasDirectOutput"] %}
     direct_output = {{ ptr(model, "Output") }}
+{% if model["HasOutputGate"] %}
+    output_gate = {{ ptr(model, "OutputGate") }}
+{% endif %}
 {% endif %}
     scale_value = tl.load({{ access_pointer(model, "Scale", "scale_ptr") }}).to(tl.float32)
     scale_log2_value = scale_value * 1.4426950408889634
@@ -185,6 +188,10 @@
             inv_sum = tl.where(sum_exp != 0.0, 1.0 / sum_exp, 0.0)
             acc_inv_sum = tle.encoding(inv_sum[:, None], {{ ctx["simt_acc_layout_name"] }})
             direct_result = tl.reshape(acc * acc_inv_sum, {{ ctx["query_structured_shape"] }})
+{% if model["HasOutputGate"] %}
+            gate = tl.load({{ access_pointer(model, "OutputGate", "output_gate", ctx["output_gate_access"]) }}, mask=direct_context & found_seq & {{ ctx["output_mask"] }}, other=0.0)
+            direct_result *= tl.sigmoid(gate)
+{% endif %}
             tl.store({{ access_pointer(model, "Output", "direct_output", ctx["output_access"]) }}, direct_result, mask=direct_context & found_seq & {{ ctx["output_mask"] }})
 {% endif %}
 

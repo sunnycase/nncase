@@ -2155,7 +2155,9 @@ public sealed class UnitTestCUDAKernels : TestClassBase
         }
 
         compiler.AutoTilingPass(pmgr);
-        compiler.TIRPass(pmgr);
+        compiler.TIRSelectionPass(pmgr);
+        compiler.FinalizeTIRCallGraphPass(pmgr);
+        compiler.TIRLoweringPass(pmgr);
         await pmgr.RunAsync(module);
     }
 }

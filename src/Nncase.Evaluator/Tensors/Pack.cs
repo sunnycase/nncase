@@ -4,14 +4,9 @@
 using System;
 using System.Diagnostics;
 using System.Linq;
-using System.Net.Http.Headers;
-using System.Numerics;
-using System.Runtime.InteropServices;
-using CommunityToolkit.HighPerformance;
 using Nncase.CostModel;
 using Nncase.IR;
 using Nncase.IR.Tensors;
-using OrtKISharp;
 
 namespace Nncase.Evaluator.Tensors;
 
@@ -29,23 +24,22 @@ public sealed class PackEvaluator : ITypeInferencer<Pack>, ICostEvaluator<Pack>,
             MaskVectorType => 1,
             _ => 0,
         };
-        if (elementType == DataTypes.Float8E4M3 || elementType == DataTypes.Float8E5M2)
+
+        var physicalShape = input.Dimensions.ToArray().AsEnumerable();
+        if (dt is VectorType vectorType)
         {
-            var inputCasted = input.CastElement<float>();
-            var inputOrt = inputCasted.ToOrtTensor();
-            inputOrt = inputOrt.Pack(oldLanesCount, target.Lanes, target.Axes);
-            var output = inputOrt.ToTensor().CastElementTo(elementType);
-            var outputType = context.CurrentCall.CheckedTensorType;
-            var outputShape = context.Evaluate(context.CurrentCall.CheckedShape).AsTensor().ToArray<long>();
-            output = output.CastTo(outputType.DType, CastMode.Reinterpret, outputShape);
-            return Value.FromTensor(output);
+            physicalShape = physicalShape.Concat(vectorType.Lanes.Select(lane => (long)lane));
         }
-        else
+
+        var output = input.Reinterpret(elementType, physicalShape.ToArray());
+        for (var index = target.Axes.Count - 1; index >= 0; index--)
         {
-            var inputOrt = input.ToOrtTensor();
-            inputOrt = inputOrt.Pack(oldLanesCount, target.Lanes, target.Axes);
-            return inputOrt.ToValue(TypeInference.PackType(input.ElementType, target.Lanes));
+            output = PackTensor(output, oldLanesCount++, target.Lanes[index], target.Axes[index]);
         }
+
+        var outputType = context.CurrentCall.CheckedTensorType;
+        var outputShape = context.Evaluate(context.CurrentCall.CheckedShape).AsTensor().ToArray<long>();
+        return Value.FromTensor(output.Reinterpret(outputType.DType, outputShape));
     }
 
     /// <inheritdoc/>
@@ -82,6 +76,40 @@ public sealed class PackEvaluator : ITypeInferencer<Pack>, ICostEvaluator<Pack>,
         {
             [MetricFactorNames.OffChipMemoryTraffic] = CostUtility.GetMemoryAccess(returnType) * 2,
         };
+    }
+
+    private static Tensor PackTensor(Tensor input, int oldLanesCount, int lanes, int axis)
+    {
+        if (axis < 0)
+        {
+            return input;
+        }
+
+        var shape = input.Dimensions.ToArray();
+        if (axis >= shape.Length - oldLanesCount)
+        {
+            throw new ArgumentOutOfRangeException(nameof(axis), "Pack axis must refer to a logical tensor dimension.");
+        }
+
+        if (shape[axis] % lanes != 0)
+        {
+            throw new InvalidOperationException($"Pack axis extent {shape[axis]} is not divisible by lane count {lanes}.");
+        }
+
+        var dividedShape = shape.Take(axis)
+            .Concat(new[] { shape[axis] / lanes, lanes })
+            .Concat(shape.Skip(axis + 1))
+            .ToArray();
+        var permutation = Enumerable.Range(0, axis + 1)
+            .Concat(Enumerable.Range(axis + 2, dividedShape.Length - (axis + oldLanesCount + 2)))
+            .Append(axis + 1)
+            .Concat(Enumerable.Range(dividedShape.Length - oldLanesCount, oldLanesCount))
+            .Select(index => (long)index)
+            .ToArray();
+        var reshaped = input.Reshape(dividedShape);
+        return permutation.Select(index => (int)index).SequenceEqual(Enumerable.Range(0, dividedShape.Length))
+            ? reshaped
+            : reshaped.Transpose(permutation);
     }
 
     private IRType Visit(ITypeInferenceContext context, Pack target, TensorType input)

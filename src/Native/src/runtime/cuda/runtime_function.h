@@ -76,8 +76,8 @@ class cuda_runtime_function final : public runtime_function {
     std::vector<std::span<std::byte>> datas_;
     std::vector<std::span<std::byte>> block_local_datas_;
     host_buffer_t output_buffer_;
-    std::vector<ntt::runtime::thread_inout_desc> input_descs_;
-    std::vector<ntt::runtime::thread_inout_desc> output_descs_;
+    std::vector<ntt::runtime::block_inout_desc> input_descs_;
+    std::vector<ntt::runtime::block_inout_desc> output_descs_;
     std::vector<dims_t> output_shapes_;
     std::vector<dims_t> output_strides_;
 

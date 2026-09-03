@@ -520,20 +520,31 @@ internal static class ModelUtils
     {
         ArgumentNullException.ThrowIfNull(config);
 
-        string type = "default";
-        if (config.ContainsKey("rope_type"))
+        var effectiveConfig = config;
+        if (config.TryGetValue("rope_parameters", out var ropeParametersValue) &&
+            ropeParametersValue is Dictionary<string, object> ropeParameters)
         {
-            type = config.GetNestedValue<string>("rope_type");
+            effectiveConfig = new Dictionary<string, object>(config, StringComparer.Ordinal);
+            foreach (var pair in ropeParameters)
+            {
+                effectiveConfig[pair.Key] = pair.Value;
+            }
         }
-        else if (config.TryGetValue("rope_scaling", out var ropeScaling) && ropeScaling is not null)
+
+        string type = "default";
+        if (effectiveConfig.ContainsKey("rope_type"))
         {
-            type = config.GetNestedValue<string>("rope_scaling", "rope_type");
+            type = effectiveConfig.GetNestedValue<string>("rope_type");
+        }
+        else if (effectiveConfig.TryGetValue("rope_scaling", out var ropeScaling) && ropeScaling is not null)
+        {
+            type = effectiveConfig.GetNestedValue<string>("rope_scaling", "rope_type");
         }
 
         return type switch
         {
-            "default" => ModelUtils.ComputeDefaultRopeParameters(config),
-            "llama3" => ModelUtils.ComputeLlama3RopeParameters(config),
+            "default" => ModelUtils.ComputeDefaultRopeParameters(effectiveConfig),
+            "llama3" => ModelUtils.ComputeLlama3RopeParameters(effectiveConfig),
             _ => throw new NotImplementedException($"RoPE function {type} need to impl"),
         };
     }

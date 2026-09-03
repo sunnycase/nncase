@@ -10,7 +10,7 @@
 {%- endif %}
 {%- endmacro %}
 # generated from PyNTT algorithm triton.gated_delta_net/convolution
-# {{ model["Comment"] }}; local_channels={{ model["LocalConvDim"] }}, block_n={{ ctx["block_n"] }}
+# {{ model["Comment"] }}; local_channels={{ ctx["local_n"] }}, global_channels={{ ctx["global_n"] }}, block_n={{ ctx["block_n"] }}
 {{ phases.consumer_header(model) }}
 {{ common.mesh_coordinates(model["MeshAxes"]) }}
     qkv = {{ ptr(model, "QKV") }}
@@ -20,7 +20,8 @@
     active_local_n = {{ model["ActiveLocalConvDim"] }}
     for channel_start in tl.range(0, {{ ctx["local_n"] }}, {{ ctx["block_n"] }}):
         channel = channel_start + tl.arange(0, {{ ctx["block_n"] }})
-        channel_mask = channel < active_local_n
+        global_channel = {{ pointer_local_vector_to_global_scalar_coordinate(model["QKVOutput"], 1, "channel", model["ActivationLaneCount"]) }}
+        channel_mask = (channel < active_local_n) & (global_channel < {{ ctx["global_n"] }})
 {% if ctx["qkv_partial"] %}
 {{ partial_io.load(ctx["qkv_partial"], "current", "channel_mask", "        ") }}
 {% else %}
@@ -30,14 +31,16 @@
             other=0.0,
         )
 {% endif %}
-{% set global_packed_channel = pointer_local_to_global_coordinate(model["QKVOutput"], 1, "channel // " ~ model["ActivationLaneCount"]) %}
-{% set global_channel = "(" ~ global_packed_channel ~ ") * " ~ model["ActivationLaneCount"] ~ " + channel % " ~ model["ActivationLaneCount"] %}
         conv_state_base = (
             {{ state_axis_offset(model["LayerId"], model["ConvStateLayerAxis"]) }}
-            + {{ state_axis_offset(global_channel, model["ConvStateChannelAxis"]) }}
+            + {{ state_axis_offset("global_channel", model["ConvStateChannelAxis"]) }}
         )
         convolved = current.to(tl.float32) * tl.load(
-            {{ access_pointer(model, "ConvWeight", "conv_weight", tensor_access(["channel", (model["ConvKernelSize"] - 1)|string], model["ConvWeightStrides"])) }},
+{% if ctx["weight_is_canonical_global"] %}
+            {{ access_pointer(model, "ConvWeight", "conv_weight", tensor_access(["global_channel // " ~ model["ActivationLaneCount"], (model["ConvKernelSize"] - 1)|string], model["ConvWeightStrides"], ["global_channel % " ~ model["ActivationLaneCount"]], [model["ActivationLaneCount"]], global_coordinate_axes=[0])) }},
+{% else %}
+            {{ access_pointer(model, "ConvWeight", "conv_weight", tensor_access(["channel // " ~ model["ActivationLaneCount"], (model["ConvKernelSize"] - 1)|string], model["ConvWeightStrides"], ["channel % " ~ model["ActivationLaneCount"]], [model["ActivationLaneCount"]])) }},
+{% endif %}
             mask=channel_mask,
             other=0.0,
         ).to(tl.float32)
@@ -48,7 +51,11 @@
             other=0.0,
         )
         convolved += history{{ history }}.to(tl.float32) * tl.load(
-            {{ access_pointer(model, "ConvWeight", "conv_weight", tensor_access(["channel", history|string], model["ConvWeightStrides"])) }},
+{% if ctx["weight_is_canonical_global"] %}
+            {{ access_pointer(model, "ConvWeight", "conv_weight", tensor_access(["global_channel // " ~ model["ActivationLaneCount"], history|string], model["ConvWeightStrides"], ["global_channel % " ~ model["ActivationLaneCount"]], [model["ActivationLaneCount"]], global_coordinate_axes=[0])) }},
+{% else %}
+            {{ access_pointer(model, "ConvWeight", "conv_weight", tensor_access(["channel // " ~ model["ActivationLaneCount"], history|string], model["ConvWeightStrides"], ["channel % " ~ model["ActivationLaneCount"]], [model["ActivationLaneCount"]])) }},
+{% endif %}
             mask=channel_mask,
             other=0.0,
         ).to(tl.float32)

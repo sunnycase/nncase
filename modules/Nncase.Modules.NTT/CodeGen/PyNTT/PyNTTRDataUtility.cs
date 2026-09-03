@@ -5,6 +5,7 @@ using System.Text;
 using Nncase.IR;
 using Nncase.IR.Shapes;
 using Nncase.Targets;
+using Nncase.TIR;
 using Nncase.Utilities;
 
 namespace Nncase.CodeGen.PyNTT;

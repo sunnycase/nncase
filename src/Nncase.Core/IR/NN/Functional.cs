@@ -231,9 +231,11 @@ public static class NN
         Expr vWeightScale,
         long numHeads,
         long numKvHeads,
-        DataType outputDataType) =>
+        DataType outputDataType,
+        global::Nncase.IR.Math.MatMulQuantizationMode quantizationMode =
+            global::Nncase.IR.Math.MatMulQuantizationMode.None) =>
         new Call(
-            new QKVParallelLinear(numHeads, numKvHeads, outputDataType),
+            new QKVParallelLinear(numHeads, numKvHeads, outputDataType, quantizationMode),
             input,
             qWeight,
             kWeight,
@@ -366,9 +368,9 @@ public static class NN
 
     public static Expr IdentityPagedAttentionKVCache(Expr input, Expr numSeqs, Expr numTokens, Expr contextLens, Expr seqLens, Expr blockTable, Expr slotMapping, Expr numBlocks, Expr kvCaches) => new Call(new IdentityPagedAttentionKVCache(), input, numSeqs, numTokens, contextLens, seqLens, blockTable, slotMapping, numBlocks, kvCaches);
 
-    public static Expr PagedAttention(Expr q, Expr kvCaches, Expr extra, Expr scale, int layerId, AttentionDimKind[] qlayout, int hiddenSize) => PagedAttention(q, kvCaches, extra, scale, new DimConst(layerId), qlayout, hiddenSize);
+    public static Expr PagedAttention(Expr q, Expr kvCaches, Expr extra, Expr scale, int layerId, Expr outputGate, AttentionDimKind[] qlayout, int hiddenSize) => PagedAttention(q, kvCaches, extra, scale, new DimConst(layerId), outputGate, qlayout, hiddenSize);
 
-    public static Expr PagedAttention(Expr q, Expr kvCaches, Expr extra, Expr scale, Dimension layerId, AttentionDimKind[] qlayout, int hiddenSize) => new Call(new PagedAttention(new IRArray<AttentionDimKind>(qlayout), hiddenSize), q, kvCaches, extra, scale, layerId);
+    public static Expr PagedAttention(Expr q, Expr kvCaches, Expr extra, Expr scale, Dimension layerId, Expr outputGate, AttentionDimKind[] qlayout, int hiddenSize) => new Call(new PagedAttention(new IRArray<AttentionDimKind>(qlayout), hiddenSize), q, kvCaches, extra, scale, layerId, outputGate);
 
     public static Expr Qwen3MoE(Expr q, Expr moeGateW, Expr moeExpertGateInputScale, Expr moeExpertGateProjW, Expr moeExpertGateProjScale, Expr moeExpertDownInputScale, Expr moeExpertDownProjW, Expr moeExpertDownProjScale, Expr moeExpertUpInputScale, Expr moeExpertUpProjW, Expr moeExpertUpProjScale, long layerId, long hiddenSize, long intermediateSize, long moeIntermediateSize, long numExpert, long numTopK, long isNormTopkProb) => new Call(new Qwen3MoE(layerId, hiddenSize, intermediateSize, moeIntermediateSize, numExpert, numTopK, isNormTopkProb), q, moeGateW, moeExpertGateInputScale, moeExpertGateProjW, moeExpertGateProjScale, moeExpertDownInputScale, moeExpertDownProjW, moeExpertDownProjScale, moeExpertUpInputScale, moeExpertUpProjW, moeExpertUpProjScale);
 

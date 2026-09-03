@@ -64,7 +64,10 @@ public abstract class TIRSelectionPass : FunctionPass
                     Role = input.Role,
                 };
                 var primWrapper = new PrimFunctionWrapper(input.Name, primFunc, selection.InputBuffers.Count);
-                RewriteCallersForPrimFunction(primFunc, callers.OfType<Call>());
+                RewriteCallersForPrimFunction(
+                    primFunc,
+                    callers.OfType<Call>(),
+                    selection.InputParameterIndices);
                 return Task.FromResult((BaseFunction)primWrapper);
             }
         }
@@ -93,6 +96,19 @@ public abstract class TIRSelectionPass : FunctionPass
         IReadOnlyList<BaseExpr> arguments,
         TIRSelectionContext context)
         => arguments;
+
+    /// <summary>
+    /// Finalizes a logical result view created over caller-owned PrimFunction
+    /// storage. Targets may use this hook to propagate physical-layout
+    /// provenance that is not part of the generic buffer-view contract.
+    /// </summary>
+    protected virtual BaseExpr FinalizeCallerAllocatedPrimFunctionResult(
+        PrimFunction primFunction,
+        int resultIndex,
+        BaseExpr storage,
+        BaseExpr result,
+        TIRSelectionContext context)
+        => result;
 
     /// <summary>
     /// Creates storage for an intermediate tensor result. Targets may override
@@ -187,16 +203,25 @@ public abstract class TIRSelectionPass : FunctionPass
 
     private void RewriteCallersForPrimFunction(
         PrimFunction primFunction,
-        IEnumerable<Call> callers)
+        IEnumerable<Call> callers,
+        IReadOnlyList<int> inputParameterIndices)
     {
         var outputParameters = primFunction.GetAbiView().OutputParameters.ToArray();
         foreach (var caller in callers)
         {
+            var sourceArguments = caller.Arguments.ToArray();
+            var inputArguments = inputParameterIndices
+                .Select(index => index >= 0 && index < sourceArguments.Length
+                    ? sourceArguments[index]
+                    : throw new InvalidOperationException(
+                        $"Cannot lower call to {primFunction.Name}: source input index {index} is outside " +
+                        $"the caller argument range [0, {sourceArguments.Length})."))
+                .ToArray();
             var outputAllocs = outputParameters
                 .Select(outputParameter =>
                     CreateCallerAllocatedPrimFunctionOutput(primFunction, outputParameter))
                 .ToArray();
-            var newArgs = caller.Arguments.ToArray().Concat(outputAllocs).ToArray();
+            var newArgs = inputArguments.Concat(outputAllocs).ToArray();
             var newCaller = caller.With(arguments: newArgs);
             ReplaceUtility.ReplaceAllUsesWith(caller, newCaller);
         }
@@ -205,6 +230,7 @@ public abstract class TIRSelectionPass : FunctionPass
     private sealed record SelectionResult(
         Sequential Body,
         IReadOnlyList<IVar> InputBuffers,
+        IReadOnlyList<int> InputParameterIndices,
         IReadOnlyList<BufferVar> OutputParameters,
         IReadOnlyList<Expr> Results);
 
@@ -213,7 +239,7 @@ public abstract class TIRSelectionPass : FunctionPass
         private readonly TIRSelectionPass _selectionPass;
         private readonly TIRSelectionContext _selectionContext;
         private readonly bool _isEntry;
-        private readonly List<Expr> _body = new();
+        private readonly List<SelectedStatement> _body = new();
         private int _bufferIndex;
 
         public TIRSelectionVisitor(TIRSelectionPass selectionPass, bool isEntry)
@@ -225,7 +251,7 @@ public abstract class TIRSelectionPass : FunctionPass
 
         public SelectionResult Select(Function function)
         {
-            var inBuffers = LowerInputParameters(function.Parameters).ToArray();
+            var loweredInputs = LowerInputParameters(function.Parameters);
             Visit(function.Body, Unit.Default);
 
             var results = function.Body switch
@@ -233,6 +259,7 @@ public abstract class TIRSelectionPass : FunctionPass
                 IR.Tuple tuple => tuple.Fields.AsValueEnumerable().Select(x => (Expr)ExprMemo[x]).ToArray(),
                 var body => ExprMemo[function.Body] switch
                 {
+                    None => Array.Empty<Expr>(),
                     IR.Tuple bodyTuple => bodyTuple.Fields.AsValueEnumerable().Select(x => (Expr)x).ToArray(),
                     var x => [(Expr)x],
                 },
@@ -258,7 +285,12 @@ public abstract class TIRSelectionPass : FunctionPass
                 }
             }
 
-            return new(new Sequential(_body.ToArray()), inBuffers, outputParameters, results);
+            return new(
+                BuildTraceScopedBody(),
+                loweredInputs.Parameters,
+                loweredInputs.SourceIndices,
+                outputParameters,
+                results);
 
             void AddOutputParameter(BufferVar outputParameter)
             {
@@ -438,7 +470,7 @@ public abstract class TIRSelectionPass : FunctionPass
                 ? (Expr)Visit(expr.Condition, context)
                 : expr.Condition;
             var arguments = expr.Arguments.AsValueEnumerable().Select(x => ExprMemo[x]).ToArray().Concat(FlattenOutputArguments(output)).ToArray();
-            _body.Add(T.If(condition)
+            AddBody(T.If(condition)
                 .Then(new Call(WrapIfBranch(expr.Then), arguments))
                 .Else(new Call(WrapIfBranch(expr.Else), arguments))
                 .Build());
@@ -518,7 +550,8 @@ public abstract class TIRSelectionPass : FunctionPass
                     tensorType = dt.TensorType;
                     distributedType = dt;
                     return true;
-                case TensorType tt when tt.DType is not PointerType:
+                case TensorType tt when tt.DType is not PointerType and
+                    not ReferenceType { ElemType: IR.Heterogeneous.PipelineChannelType }:
                     tensorType = tt;
                     distributedType = null;
                     return true;
@@ -588,13 +621,19 @@ public abstract class TIRSelectionPass : FunctionPass
                 // ABI normalization is local to the callee invocation. Keep the caller-visible
                 // result attached to the prepared logical storage supplied by the caller.
                 var storage = preparedArguments[storageIndex];
-                return result.Value switch
+                var resultValue = result.Value switch
                 {
                     BufferVar => storage,
                     TIR.Buffer resultView => CreateResultView(resultView, storage, primFunction.Name, resultIndex),
                     _ => throw new InvalidOperationException(
                         $"PrimFunction {primFunction.Name} result {resultIndex} has unsupported binding {result.Value.GetType().Name}."),
                 };
+                return _selectionPass.FinalizeCallerAllocatedPrimFunctionResult(
+                    primFunction,
+                    resultIndex,
+                    storage,
+                    resultValue,
+                    context);
             }).ToArray();
             output = resultValues.Length == 1 ? (Expr)resultValues[0] : new IR.Tuple(resultValues.Cast<Expr>().ToArray());
             selectedCall = new Call(primFunction, normalizedArguments);
@@ -696,12 +735,21 @@ public abstract class TIRSelectionPass : FunctionPass
             }
         }
 
-        private IReadOnlyList<IVar> LowerInputParameters(ReadOnlySpan<IVar> parameters)
+        private LoweredInputParameters LowerInputParameters(ReadOnlySpan<IVar> parameters)
         {
-            var lowered = new IVar[parameters.Length];
+            var lowered = new List<IVar>(parameters.Length);
+            var sourceIndices = new List<int>(parameters.Length);
             for (var i = 0; i < parameters.Length; i++)
             {
                 var parameter = parameters[i];
+                if (parameter.CheckedType is NoneType)
+                {
+                    ExprMemo[(BaseExpr)parameter] = None.Default;
+                    _selectionContext.RegisterSelectedValue((BaseExpr)parameter, None.Default);
+                    continue;
+                }
+
+                IVar loweredParameter;
                 if (TryGetTensorType(parameter.CheckedType, out var tensorType, out var distributedType))
                 {
                     var bufferVar = parameter is BufferVar { Role: BufferVarRole.Input or BufferVarRole.InOut } inputBufferVar
@@ -718,22 +766,63 @@ public abstract class TIRSelectionPass : FunctionPass
                     var buffer = T.AttachBuffer(bufferVar, tensorType, MemoryLocation.Input, 0, out _, $"{parameter.Name}_input", distributedType);
                     ExprMemo[(BaseExpr)parameter] = buffer;
                     _selectionContext.RegisterSelectedValue((BaseExpr)parameter, buffer);
-                    lowered[i] = bufferVar;
+                    loweredParameter = bufferVar;
                 }
                 else
                 {
                     ExprMemo[(BaseExpr)parameter] = (BaseExpr)parameter;
                     _selectionContext.RegisterSelectedValue((BaseExpr)parameter, (BaseExpr)parameter);
-                    lowered[i] = parameter;
+                    loweredParameter = parameter;
                 }
+
+                lowered.Add(loweredParameter);
+                sourceIndices.Add(i);
             }
 
-            return lowered;
+            return new(lowered, sourceIndices);
         }
 
         private BaseExpr SelectCall(Call call, IReadOnlyList<BaseExpr> arguments)
         {
-            if (call.Target is IR.Tensors.GetItem && arguments[IR.Tensors.GetItem.Input.Index] is IR.Tuple tuple && call[IR.Tensors.GetItem.Index] is DimConst index)
+            if (call.Target is IR.Heterogeneous.PipelineToken)
+            {
+                return None.Default;
+            }
+            else if (call.Target is IR.Heterogeneous.PipelineYield)
+            {
+                return arguments[IR.Heterogeneous.PipelineYield.Value.Index];
+            }
+            else if (call.Target is IR.Heterogeneous.Produce produce)
+            {
+                AddBody(T.ChannelProduce(
+                    (Expr)arguments[IR.Heterogeneous.Produce.Channel.Index],
+                    (Expr)arguments[IR.Heterogeneous.Produce.Value.Index],
+                    produce.ChannelId,
+                    produce.Phase), call.Metadata.SemanticRegion);
+                return None.Default;
+            }
+            else if (call.Target is IR.Heterogeneous.Consume consume)
+            {
+                var output = CreateOutputBuffer(call);
+                if (output is not Expr outputExpr)
+                {
+                    throw new InvalidOperationException(
+                        $"Pipeline channel {consume.ChannelId} phase {consume.Phase} payload must lower to one expression, got {output.GetType().Name}.");
+                }
+
+                AddBody(T.ChannelConsume(
+                    (Expr)arguments[IR.Heterogeneous.Consume.Channel.Index],
+                    outputExpr,
+                    consume.ChannelId,
+                    consume.Phase), call.Metadata.SemanticRegion);
+                return output;
+            }
+            else if (call.Target is IR.Heterogeneous.CreatePipelineChannel or IR.Heterogeneous.PipelineLaunch)
+            {
+                throw new InvalidOperationException(
+                    $"{call.Target.GetType().Name} is host pipeline orchestration and must not enter a backend worker TIR function.");
+            }
+            else if (call.Target is IR.Tensors.GetItem && arguments[IR.Tensors.GetItem.Input.Index] is IR.Tuple tuple && call[IR.Tensors.GetItem.Index] is DimConst index)
             {
                 return tuple[index.Value];
             }
@@ -744,7 +833,7 @@ public abstract class TIRSelectionPass : FunctionPass
                          out var callerAllocatedCall,
                          out var callerAllocatedOutput))
             {
-                _body.Add(callerAllocatedCall);
+                AddBody(callerAllocatedCall, call.Metadata.SemanticRegion);
                 return callerAllocatedOutput;
             }
             else
@@ -760,9 +849,48 @@ public abstract class TIRSelectionPass : FunctionPass
                         _selectionPass.SelectCall(call, arguments, ref Unsafe.As<BaseExpr, Expr>(ref output), _selectionContext),
                         _selectionContext),
                 };
-                _body.Add(newCall);
+                AddBody(newCall, call.Metadata.SemanticRegion);
                 return output;
             }
+        }
+
+        private Sequential BuildTraceScopedBody()
+        {
+            var fields = new List<Expr>(_body.Count);
+            for (var index = 0; index < _body.Count;)
+            {
+                var statement = _body[index];
+                if (statement.SemanticRegion is null)
+                {
+                    fields.Add(statement.Expression);
+                    index++;
+                    continue;
+                }
+
+                var end = index + 1;
+                while (end < _body.Count &&
+                       _body[end].SemanticRegion == statement.SemanticRegion)
+                {
+                    end++;
+                }
+
+                fields.Add(new Sequential(
+                    _body.GetRange(index, end - index).Select(item => item.Expression).ToArray(),
+                    traceScopeName: SemanticRegionUtility.GetTraceScopeName(statement.SemanticRegion)));
+                index = end;
+            }
+
+            return new Sequential(fields.ToArray());
+        }
+
+        private void AddBody(Expr expression, SemanticRegion? semanticRegion = null)
+        {
+            if (expression is Call { Target: Nop })
+            {
+                return;
+            }
+
+            _body.Add(new SelectedStatement(expression, semanticRegion));
         }
 
         private BaseExpr CreateOutputBuffer(Expr expr)
@@ -871,6 +999,14 @@ public abstract class TIRSelectionPass : FunctionPass
                 memoryLocation,
                 resultPath,
                 $"buffer_{_bufferIndex++}");
+
+        private sealed record LoweredInputParameters(
+            IReadOnlyList<IVar> Parameters,
+            IReadOnlyList<int> SourceIndices);
+
+        private sealed record SelectedStatement(
+            Expr Expression,
+            SemanticRegion? SemanticRegion);
     }
 }
 

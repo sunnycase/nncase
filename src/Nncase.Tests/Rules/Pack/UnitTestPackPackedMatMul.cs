@@ -4,6 +4,7 @@
 using System.Collections.Generic;
 using System.Linq;
 using Nncase.IR;
+using Nncase.IR.Math;
 using Nncase.Passes.Rules.Neutral;
 using Nncase.Passes.Rules.NTT;
 using Nncase.Tests.TestFixture;
@@ -63,6 +64,81 @@ public class UnitTestVectorizeVectorizedMatMul : TransformTestBase
         Assert.Equal(IR.NTT.PackedMatMulRhsLayout.KMajor, packedOp.RhsLayout);
         Assert.Equal(new RankedShape(4, 16), packedRhs.CheckedShape);
         Assert.Equal(new VectorType(DataTypes.BFloat16, [8, 2, 8]), packedRhs.CheckedDataType);
+    }
+
+    [Fact]
+    public void TestPackFp8MatMulRhsKMajorPreservesFp32ResultType()
+    {
+        var lhs = new Var("lhs", new TensorType(DataTypes.Float8E4M3, new RankedShape(1, 64)));
+        var rhs = new Var(
+            "rhs",
+            new TensorType(
+                new VectorType(DataTypes.Float8E4M3, [16]),
+                new RankedShape(64, 8)));
+        var expr = VectorizedMatMul(
+            lhs,
+            rhs,
+            [],
+            new[] { 1 },
+            outDataType: DataTypes.Float32);
+        CompilerServices.InferenceType(expr);
+
+        var context = new Nncase.Passes.RunPassContext();
+        var post = (Expr)CompilerServices.Rewrite(
+            expr,
+            [new PackMatMulRhsKMajor(16, 2)],
+            context);
+        CompilerServices.InferenceType(post);
+        var packedMatMul = Assert.Single(
+            ExprCollector.Collect(post).OfType<Call>().Where(
+                call => call.Target is IR.NTT.PackedMatMul));
+        var packedOp = Assert.IsType<IR.NTT.PackedMatMul>(packedMatMul.Target);
+        var packedRhs = (Expr)packedMatMul.Arguments[IR.NTT.PackedMatMul.Rhs.Index];
+
+        Assert.False(ReferenceEquals(expr, post));
+        Assert.Equal(expr.CheckedType, post.CheckedType);
+        Assert.Equal(IR.NTT.PackedMatMulRhsLayout.KMajor, packedOp.RhsLayout);
+        Assert.Equal(DataTypes.Float32, packedOp.OutputDataType);
+        Assert.Equal(new RankedShape(2, 8), packedRhs.CheckedShape);
+        Assert.Equal(
+            new VectorType(DataTypes.Float8E4M3, [16, 2, 16]),
+            packedRhs.CheckedDataType);
+        Assert.Equal(
+            new TensorType(
+                new VectorType(DataTypes.Float32, [16]),
+                new RankedShape(1, 8)),
+            packedMatMul.CheckedType);
+    }
+
+    [Fact]
+    public void TestPackBlockScaledMatMulPreservesSemanticRegionOnCompute()
+    {
+        var lhs = new Var("lhs", new TensorType(DataTypes.BFloat16, new RankedShape(1, 64)));
+        var rhs = new Var("rhs", new TensorType(DataTypes.Float8E4M3, new RankedShape(64, 128)));
+        var rhsScale = new Var("rhs_scale", new TensorType(DataTypes.BFloat16, new RankedShape(128, 1)));
+        var region = new SemanticRegion(
+            SemanticRegionKinds.Attention,
+            "model.layers.0.linear_attn");
+        var expr = IR.F.Math.BlockScaledMatMul(
+            lhs,
+            rhs,
+            rhsScale,
+            DataTypes.BFloat16,
+            1,
+            64);
+        expr.Metadata.SemanticRegion = region;
+        CompilerServices.InferenceType(expr);
+
+        var post = (Expr)CompilerServices.Rewrite(
+            expr,
+            [new PackBlockScaledMatMulRhsNMajorKPacked(16, 2)],
+            new Nncase.Passes.RunPassContext());
+        CompilerServices.InferenceType(post);
+        var packedCall = Assert.Single(
+            ExprCollector.Collect(post).OfType<Call>().Where(
+                call => call.Target is IR.NTT.PackedBlockScaledMatMul));
+
+        Assert.Same(region, packedCall.Metadata.SemanticRegion);
     }
 
     [Fact]
@@ -139,7 +215,7 @@ public class UnitTestVectorizeVectorizedMatMul : TransformTestBase
         var context = new Nncase.Passes.RunPassContext();
         var post = CompilerServices.Rewrite(
             expr,
-            [new PackQKVParallelLinearRhsKMajor(16, 2)],
+            [new PackQKVParallelLinearRhsForGpu(16, 2)],
             context);
         CompilerServices.InferenceType(post);
         var packedCall = Assert.Single(
@@ -170,6 +246,67 @@ public class UnitTestVectorizeVectorizedMatMul : TransformTestBase
                 new TensorType(expectedOutputType, new RankedShape(1, 4)),
             ]),
             packedCall.CheckedType);
+
+        void AssertPackedBuffer(int index, RankedShape shape, DataType dataType)
+        {
+            var argument = (Expr)packedCall.Arguments[index];
+            Assert.Equal(shape, argument.CheckedShape);
+            Assert.Equal(dataType, argument.CheckedDataType);
+        }
+    }
+
+    [Fact]
+    public void TestPackDynamicTensorQKVParallelLinearUsesNMajorKPackedWeights()
+    {
+        var input = new Var("input", new TensorType(DataTypes.BFloat16, new RankedShape(1, 64)));
+        var qWeight = new Var("q_weight", new TensorType(DataTypes.Float8E4M3, new RankedShape(64, 64)));
+        var kWeight = new Var("k_weight", new TensorType(DataTypes.Float8E4M3, new RankedShape(64, 32)));
+        var vWeight = new Var("v_weight", new TensorType(DataTypes.Float8E4M3, new RankedShape(64, 32)));
+        var qWeightScale = new Var("q_weight_scale", new TensorType(DataTypes.BFloat16, new RankedShape(64)));
+        var kWeightScale = new Var("k_weight_scale", new TensorType(DataTypes.BFloat16, new RankedShape(32)));
+        var vWeightScale = new Var("v_weight_scale", new TensorType(DataTypes.BFloat16, new RankedShape(32)));
+        var expr = QKVParallelLinear(
+            input,
+            qWeight,
+            kWeight,
+            vWeight,
+            None.Default,
+            None.Default,
+            None.Default,
+            None.Default,
+            None.Default,
+            None.Default,
+            qWeightScale,
+            kWeightScale,
+            vWeightScale,
+            4,
+            2,
+            DataTypes.BFloat16,
+            MatMulQuantizationMode.DynamicTensor);
+        CompilerServices.InferenceType(expr);
+
+        var context = new Nncase.Passes.RunPassContext();
+        var post = CompilerServices.Rewrite(
+            expr,
+            [new PackQKVParallelLinearRhsForGpu(16, 2)],
+            context);
+        CompilerServices.InferenceType(post);
+        var packedCall = Assert.Single(
+            ExprCollector.Collect(post).OfType<Call>().Where(
+                call => call.Target is IR.NTT.PackedQKVParallelLinear));
+        var packedOp = Assert.IsType<IR.NTT.PackedQKVParallelLinear>(packedCall.Target);
+        var expectedWeightType = new VectorType(DataTypes.Float8E4M3, [2, 16]);
+        var expectedScaleType = new VectorType(DataTypes.BFloat16, [8]);
+
+        Assert.Equal(MatMulQuantizationMode.DynamicTensor, packedOp.QuantizationMode);
+        Assert.Equal(IR.NTT.PackedMatMulRhsLayout.NMajorKPacked, packedOp.RhsLayout);
+        Assert.Equal(8, packedOp.OutputNVectorLaneCount);
+        AssertPackedBuffer(IR.NTT.PackedQKVParallelLinear.QWeight.Index, new RankedShape(64, 2), expectedWeightType);
+        AssertPackedBuffer(IR.NTT.PackedQKVParallelLinear.KWeight.Index, new RankedShape(32, 2), expectedWeightType);
+        AssertPackedBuffer(IR.NTT.PackedQKVParallelLinear.VWeight.Index, new RankedShape(32, 2), expectedWeightType);
+        AssertPackedBuffer(IR.NTT.PackedQKVParallelLinear.QWeightScale.Index, new RankedShape(8), expectedScaleType);
+        AssertPackedBuffer(IR.NTT.PackedQKVParallelLinear.KWeightScale.Index, new RankedShape(4), expectedScaleType);
+        AssertPackedBuffer(IR.NTT.PackedQKVParallelLinear.VWeightScale.Index, new RankedShape(4), expectedScaleType);
 
         void AssertPackedBuffer(int index, RankedShape shape, DataType dataType)
         {

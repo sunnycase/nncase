@@ -113,7 +113,7 @@ result<void> cpu_runtime_function::initialize_core(
         CHECK_WITH_ERR(rank.has_value(), std::errc::invalid_argument);
         output_shapes_[i].resize(*rank);
         output_strides_[i].resize(*rank);
-        output_descs_[i] = thread_inout_desc{
+        output_descs_[i] = block_inout_desc{
             .data = nullptr,
             .size = 0,
             .shape = output_shapes_[i].data(),
@@ -142,7 +142,7 @@ result<value_t> cpu_runtime_function::invoke_core(
     std::span<value_t> parameters,
     [[maybe_unused]] value_t return_value) noexcept {
     size_t input_id = 0;
-    std::vector<thread_paged_attention_kv_cache_desc *> inout_paged_kvcaches;
+    std::vector<block_paged_attention_kv_cache_desc *> inout_paged_kvcaches;
     for (auto arg : parameters) {
         try_var(t, arg.as<tensor>());
         try_var(hb, t->buffer().as_host());
@@ -156,8 +156,8 @@ result<value_t> cpu_runtime_function::invoke_core(
             if (vt->uuid() == datatype_t::paged_attention_kv_cache->uuid()) {
                 auto refspan =
                     as_span<llm::paged_attention_kv_cache_node *>(m.buffer());
-                thread_paged_attention_kv_cache_desc *descs =
-                    new thread_paged_attention_kv_cache_desc[refspan.size()];
+                block_paged_attention_kv_cache_desc *descs =
+                    new block_paged_attention_kv_cache_desc[refspan.size()];
                 for (size_t i = 0; i < refspan.size(); i++) {
                     auto &node = refspan[i];
                     auto &desc = descs[i];
@@ -234,9 +234,9 @@ result<value_t> cpu_runtime_function::invoke_core(
                     }
                 }
                 inout_paged_kvcaches.push_back(descs);
-                input_descs_[input_id++] = thread_inout_desc{
+                input_descs_[input_id++] = block_inout_desc{
                     .data = (std::byte *)descs,
-                    .size = sizeof(thread_paged_attention_kv_cache_desc) *
+                    .size = sizeof(block_paged_attention_kv_cache_desc) *
                             refspan.size(),
                     .shape = const_cast<size_t *>(t->shape().data()),
                     .strides = const_cast<size_t *>(t->strides().data()),
@@ -245,7 +245,7 @@ result<value_t> cpu_runtime_function::invoke_core(
                 return err(std::errc::not_supported);
             }
         } else {
-            input_descs_[input_id++] = thread_inout_desc{
+            input_descs_[input_id++] = block_inout_desc{
                 .data = m.buffer().data(),
                 .size = m.buffer().size(),
                 .shape = const_cast<size_t *>(t->shape().data()),

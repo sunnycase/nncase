@@ -30,10 +30,15 @@ public sealed record KernelEntryAbiLayout(
     public static KernelEntryAbiLayout Create(PrimFunction function)
     {
         var abi = function.GetAbiView();
-        if (abi.Workspaces.Count != 0)
+        var unsupportedWorkspace = abi.Workspaces.FirstOrDefault(workspace =>
+            workspace.Location is not MemoryLocation.Data and
+                not MemoryLocation.ChipLocalData and
+                not MemoryLocation.BlockLocalData);
+        if (unsupportedWorkspace is not null)
         {
             throw new InvalidOperationException(
-                $"NTT entry PrimFunction {function.Name} must receive workspaces through the runtime ABI, not formal parameters.");
+                $"NTT entry PrimFunction {function.Name} has unsupported runtime workspace " +
+                $"{unsupportedWorkspace.Name} at {unsupportedWorkspace.Location}.");
         }
 
         var outputAlignment = Math.Max(
@@ -95,7 +100,13 @@ public sealed record KernelEntryAbiLayout(
         for (var inputIndex = 0; inputIndex < abi.Inputs.Count; inputIndex++)
         {
             var input = abi.Inputs[inputIndex];
-            if (input.CheckedShape is not RankedShape shape)
+            var shape = input.CheckedType switch
+            {
+                TensorType { Shape: RankedShape rankedShape } => rankedShape,
+                DistributedType { TensorType.Shape: RankedShape rankedShape } => rankedShape,
+                _ => null,
+            };
+            if (shape is null)
             {
                 continue;
             }
@@ -148,7 +159,7 @@ public sealed record KernelEntryAbiLayout(
     }
 }
 
-public record KernelMainModel(TIR.PrimFunction PrimFunction, NTTTargetOptions Options, ulong Alignment, ulong DataSize, ulong BlockLocalDataPoolSize, ulong RDataSize, ulong BlockLocalRdataPoolSize)
+public record KernelMainModel(TIR.PrimFunction PrimFunction, uint FunctionId, string EntryPoint, NTTTargetOptions Options, ulong Alignment, ulong DataSize, ulong BlockLocalDataPoolSize, ulong RDataSize, ulong BlockLocalRdataPoolSize)
 {
     public KernelEntryAbiLayout EntryAbi { get; } = KernelEntryAbiLayout.Create(PrimFunction);
 
@@ -196,7 +207,6 @@ using namespace nncase::ntt::distributed::shard_policy;
     public const string KernelHeader = @"#pragma once
 #include <nncase/ntt/ntt.h>
 #include ""lambda_functions.h""
-#include ""device_functions.h""
 #include ""kernel_functions.h""
 #include ""topo_aware_runtime.h""
 using namespace nncase::ntt;
@@ -205,7 +215,8 @@ using namespace nncase::ntt::distributed::shard_policy;
 
 ";
 
-    public const string ThreadMainHeader = @"#include <nncase/ntt/ntt.h>
+    public const string BlockMainHeader = @"#include <cstdlib>
+#include <nncase/ntt/ntt.h>
 #include ""kernel_functions.h""
 using namespace nncase::ntt;
 using namespace nncase::ntt::distributed;
@@ -232,9 +243,9 @@ using namespace nncase::ntt::distributed::shard_policy;
         return content;
     }
 
-    public static string MakeMain(TIR.PrimFunction primFunction, ulong dataAlign, ulong dataUsage, ulong blockLocalDataPoolSize, ulong rdataPoolSize, ulong blockLocalRdataPoolSize, NTTTargetOptions options)
+    public static string MakeBlockMain(TIR.PrimFunction primFunction, uint functionId, string entryPoint, ulong dataAlign, ulong dataUsage, ulong blockLocalDataPoolSize, ulong rdataPoolSize, ulong blockLocalRdataPoolSize, NTTTargetOptions options)
     {
-        var content = RazorTemplateEngine.RenderAsync("~/CodeGen/CPU/Templates/thread_main.cpp.cshtml", new KernelMainModel(primFunction, options, dataAlign, dataUsage, blockLocalDataPoolSize, rdataPoolSize, blockLocalRdataPoolSize)).Result;
+        var content = RazorTemplateEngine.RenderAsync("~/CodeGen/CPU/Templates/block_main.cpp.cshtml", new KernelMainModel(primFunction, functionId, entryPoint, options, dataAlign, dataUsage, blockLocalDataPoolSize, rdataPoolSize, blockLocalRdataPoolSize)).Result;
         return content;
     }
 

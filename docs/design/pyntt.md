@@ -28,8 +28,8 @@ nncase IR
   -> Triton kernels and Python model
 ```
 
-PyNTT does **not** run the nncase AutoTiling stage. CPU/CUDA NTT targets may
-continue to use AutoTiling; stage registration is target-owned.
+PyNTT and native NTT targets do **not** run the nncase AutoTiling stage. Their
+handwritten backend kernels own block-internal tiling and scheduling.
 
 The compiler is responsible for graph semantics, distribution, storage
 identity, inter-function ABI, and concrete target resource reservations. The
@@ -143,8 +143,8 @@ Triton kernel.
 ## Target Pipeline
 
 `ITarget.IsAutoTilingEnabled` controls whether the compiler creates the
-AutoTiling stage. `NTTTarget` enables it. `PyNTTTarget` disables it and exposes
-no alternative hidden tiling pipeline.
+AutoTiling stage. `NTTTarget` and `PyNTTTarget` disable it and expose no
+alternative hidden tiling pipeline.
 
 For PyNTT the relevant late pipeline is:
 
@@ -539,6 +539,30 @@ A generated package includes:
 Large constants are binary assets, never base64 Python literals. Workspace and
 rdata allocations are cached and reused between runs.
 
+### Readonly-Data Residency
+
+The compiler serializes all module `RData` allocations into one binary asset and
+all module `ChipLocalRdata` allocations into one binary asset, preserving their
+bufferized byte offsets. This rule is identical for homogeneous and
+heterogeneous PyNTT modules. A persistent GPU worker therefore sees one stable,
+complete readonly address space; helper functions and specialized model
+functions never own private weight slices.
+
+Only functions that own runtime top-kernel launches receive entries in
+`RDATA_BUNDLES`. Each entry has a stable identity formed from linked-function id
+and source function name, but entries that use the same module asset carry an
+identical payload specification. The runtime memory-maps each asset without
+copying it into the host heap, materializes the complete payload once on the GPU,
+and returns the cached device tensor for every identical request. Prepared
+launches and host TMA descriptors consequently retain stable pointers across
+runs.
+
+There is no owner-scoped rebasing, staging arena, residency selector, or RData
+streaming protocol. Per-launch weight copies are forbidden. Payload validation
+rejects unknown fields, negative or out-of-file ranges, and byte-count
+mismatches. `BlockLocalRData` remains a separate per-owner table because its
+physical semantics are block-local rather than module-global.
+
 ## Kernel Template Contract
 
 One selected semantic TIR call maps to one Jinja helper model. A top Triton
@@ -716,7 +740,7 @@ only as selected resource reservations.
 
 This architecture is implemented when:
 
-- PyNTT compilation skips AutoTiling while NTT compilation retains it;
+- PyNTT and native NTT compilation skip AutoTiling;
 - PyNTT codegen accepts direct selected/bufferized semantic TIR;
 - scheduled TIR is rejected at the codegen boundary;
 - target microkernel resource reservations are bufferized into one Shared arena

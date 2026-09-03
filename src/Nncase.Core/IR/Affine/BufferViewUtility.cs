@@ -11,6 +11,95 @@ namespace Nncase.IR.Affine;
 public static class BufferViewUtility
 {
     /// <summary>
+    /// Tries to create a canonical-global descriptor over a compact local shard
+    /// whose physical allocation is provably the complete canonical tensor.
+    /// </summary>
+    public static bool TryCreateCanonicalGlobalReadAlias(
+        TIR.Buffer source,
+        string name,
+        out TIR.Buffer alias,
+        out string reason)
+    {
+        alias = source;
+        reason = string.Empty;
+        if (source.DistributedType is not { Partial: null } distributedType)
+        {
+            reason = "the source is not a non-partial distributed buffer";
+            return false;
+        }
+
+        if (source.DistributedStorageKind == TIR.DistributedBufferStorageKind.CanonicalGlobal)
+        {
+            return true;
+        }
+
+        if (source.DistributedStorageKind != TIR.DistributedBufferStorageKind.CompactLocal)
+        {
+            reason = $"the source storage kind is {source.DistributedStorageKind}, not CompactLocal";
+            return false;
+        }
+
+        if (source.MemSpan.Buffer.Location is not (
+            TIR.MemoryLocation.Input or
+            TIR.MemoryLocation.Rdata or
+            TIR.MemoryLocation.ChipLocalRdata))
+        {
+            reason = $"the source backing {source.MemSpan.Buffer.Location} is not a canonical readonly allocation";
+            return false;
+        }
+
+        var shardCoordinates = Enumerable.Range(0, distributedType.Placement.Rank)
+            .Select(axis => (Dimension)new DimVar($"__shard_coord_{axis}"))
+            .ToArray();
+        var descriptor = DistributedUtility.GetLocalShardDescriptor(
+            distributedType,
+            shardCoordinates,
+            DistributedUtility.DivideFlags.MaxShape);
+        if (!descriptor.TryGetContiguousRegion(out _, out _))
+        {
+            reason = "the local shard is not one contiguous canonical tensor region";
+            return false;
+        }
+
+        var localShape = descriptor.LocalCapacityShape.Dimensions.ToArray();
+        if (!source.Dimensions.SequenceEqual(localShape))
+        {
+            reason = $"the source shape [{string.Join(",", source.Dimensions.ToArray().Select(dim => dim.ToString()))}] " +
+                $"does not match local capacity [{string.Join(",", localShape.Select(dim => dim.ToString()))}]";
+            return false;
+        }
+
+        var (globalByteSize, globalStrides) = TensorUtilities.GetTensorMaxSizeAndStridesExpr(
+            distributedType.TensorType,
+            null);
+        var localByteSize = GetByteSpanSize(
+            source.Dimensions,
+            source.Strides,
+            source.ElemType.SizeInBytes).Simplify();
+        if (!source.MemSpan.Size.Simplify().Equals(localByteSize))
+        {
+            reason = $"the local span contains {source.MemSpan.Size.Simplify()} bytes, but its descriptor " +
+                $"requires {localByteSize} bytes";
+            return false;
+        }
+
+        if (!source.MemSpan.Buffer.Size.Simplify().Equals(globalByteSize.Simplify()))
+        {
+            reason = $"the physical backing contains {source.MemSpan.Buffer.Size.Simplify()} bytes, but the " +
+                $"canonical tensor requires {globalByteSize.Simplify()} bytes";
+            return false;
+        }
+
+        alias = source.With(
+            name: name,
+            memSpan: new TIR.MemSpan(source.MemSpan.Buffer, Dimension.Zero, globalByteSize),
+            dimensions: localShape,
+            strides: globalStrides,
+            distributedStorageKind: TIR.DistributedBufferStorageKind.CanonicalGlobal);
+        return true;
+    }
+
+    /// <summary>
     /// Materializes a full logical tensor descriptor over existing physical storage.
     /// </summary>
     public static TIR.Buffer CreateLogicalBufferView(
@@ -219,6 +308,9 @@ public static class BufferViewUtility
             sourceDistributedType is not null
                 ? ((RankedShape)DistributedUtility.GetDividedTensorType(sourceDistributedType).Shape).Dimensions.ToArray()
                 : sourceDimensions.ToArray();
+        var sourceLogicalDimensions = sourceDistributedType?.TensorType.Shape is RankedShape sourceLogicalShape
+            ? sourceLogicalShape.Dimensions.ToArray()
+            : sourceDimensions.ToArray();
         var sourceDefaultStrides = TensorUtilities.GetDefaultStrides(sourceStorageDimensions);
         var sourceDenseStrides = GetDenseStrides(sourceStorageDimensions);
         var resultLogicalDimensions = ((RankedShape)resultType.Shape).Dimensions.ToArray();
@@ -226,12 +318,24 @@ public static class BufferViewUtility
             resultDistributedType is not null
                 ? ((RankedShape)DistributedUtility.GetDividedTensorType(resultDistributedType).Shape).Dimensions.ToArray()
                 : resultLogicalDimensions;
+        var resultStrides = TensorUtilities.GetDefaultStrides(resultStorageDimensions);
+        if (TryCreateProjectedViewStrides(
+                sourceElemType,
+                sourceStrides,
+                resultType.DType,
+                transform,
+                resultStrides,
+                out var projectedStrides))
+        {
+            return projectedStrides;
+        }
+
         var prefixRank = 0;
         var comparableRank = System.Math.Min(
             System.Math.Min(transform.SourceMap.Results.Length, transform.ResultMap.Results.Length),
-            System.Math.Min(sourceDimensions.Length, resultLogicalDimensions.Length));
+            System.Math.Min(sourceLogicalDimensions.Length, resultLogicalDimensions.Length));
         while (prefixRank < comparableRank &&
-               sourceDimensions[prefixRank].Equals(resultLogicalDimensions[prefixRank]) &&
+               sourceLogicalDimensions[prefixRank].Equals(resultLogicalDimensions[prefixRank]) &&
                transform.SourceMap.Results[prefixRank].Equals(transform.ResultMap.Results[prefixRank]))
         {
             prefixRank++;
@@ -249,7 +353,6 @@ public static class BufferViewUtility
             }
         }
 
-        var resultStrides = TensorUtilities.GetDefaultStrides(resultStorageDimensions);
         var sharedPrefixRank = System.Math.Min(prefixRank, System.Math.Min(sourceDimensions.Length, resultLogicalDimensions.Length));
         for (var axis = 0; axis < sharedPrefixRank; axis++)
         {
@@ -264,6 +367,74 @@ public static class BufferViewUtility
         }
 
         return resultStrides;
+    }
+
+    private static bool TryCreateProjectedViewStrides(
+        DataType sourceElemType,
+        ReadOnlySpan<Dimension> sourceStrides,
+        DataType resultElemType,
+        BufferViewTransform transform,
+        ReadOnlySpan<Dimension> defaultResultStrides,
+        out Dimension[] resultStrides)
+    {
+        resultStrides = Array.Empty<Dimension>();
+        if (sourceStrides.Length != transform.SourceMap.Results.Length ||
+            defaultResultStrides.Length != transform.ResultMap.Results.Length ||
+            !TryGetProjectedAxes(transform.SourceMap, out var sourceAxes) ||
+            !TryGetProjectedAxes(transform.ResultMap, out var resultAxes))
+        {
+            return false;
+        }
+
+        resultStrides = defaultResultStrides.ToArray();
+        for (var domain = 0; domain < sourceAxes.Length; domain++)
+        {
+            var sourceByteStride = sourceStrides[sourceAxes[domain]] * sourceElemType.SizeInBytes;
+            if (sourceByteStride is DimConst byteStride && byteStride.Value % resultElemType.SizeInBytes != 0)
+            {
+                throw new NotSupportedException(
+                    $"Buffer view projected byte stride {byteStride.Value} from source axis {sourceAxes[domain]} " +
+                    $"to result axis {resultAxes[domain]} is not aligned to result element size {resultElemType.SizeInBytes}.");
+            }
+
+            resultStrides[resultAxes[domain]] = (sourceByteStride / resultElemType.SizeInBytes).Simplify();
+        }
+
+        return true;
+    }
+
+    private static bool TryGetProjectedAxes(AffineMap map, out int[] axes)
+    {
+        axes = Enumerable.Repeat(-1, map.Domains.Length).ToArray();
+        for (var axis = 0; axis < map.Results.Length; axis++)
+        {
+            switch (map.Results[axis])
+            {
+                case { Offset: AffineDim offset, Extent: AffineExtent extent }
+                    when offset.Position == extent.Position &&
+                         (uint)offset.Position < (uint)axes.Length &&
+                         axes[offset.Position] < 0:
+                    axes[offset.Position] = axis;
+                    break;
+                case
+                {
+                    Offset: AffineConstant { Value: 0 },
+                    Extent: AffineConstant { Value: 1 },
+                }:
+                    break;
+                default:
+                    axes = Array.Empty<int>();
+                    return false;
+            }
+        }
+
+        if (axes.Any(axis => axis < 0))
+        {
+            axes = Array.Empty<int>();
+            return false;
+        }
+
+        return true;
     }
 
     private static bool TryGetFlatToFlatMaps(RankedShape sourceShape, RankedShape resultShape, int prefixRank, int sourceLane, int resultLane, out BufferViewTransform transform)
@@ -570,6 +741,11 @@ public static class BufferViewUtility
             return true;
         }
 
+        if (HaveEquivalentSingletonProjectedStorage(source, result, transform))
+        {
+            return true;
+        }
+
         if (HaveEquivalentInnermostLinearizedStorage(source, result, transform))
         {
             return true;
@@ -759,6 +935,56 @@ public static class BufferViewUtility
                 result.TensorType.DType.SizeInBytes,
                 out var scaledSplit) &&
             DistributedUtility.IsSamePolicy(scaledSplit, resultSplit);
+    }
+
+    private static bool HaveEquivalentSingletonProjectedStorage(
+        DistributedType source,
+        DistributedType result,
+        BufferViewTransform transform)
+    {
+        if (source.TensorType.Shape is not RankedShape sourceShape ||
+            result.TensorType.Shape is not RankedShape resultShape ||
+            source.TensorType.DType.SizeInBytes != result.TensorType.DType.SizeInBytes ||
+            !TryGetSingletonDimensionMaps(sourceShape, resultShape, 1, 1, out var expectedTransform) ||
+            transform != expectedTransform)
+        {
+            return false;
+        }
+
+        var sourceAxis = 0;
+        var resultAxis = 0;
+        while (sourceAxis < sourceShape.Rank || resultAxis < resultShape.Rank)
+        {
+            while (sourceAxis < sourceShape.Rank && IsUnitDimension(sourceShape[sourceAxis]))
+            {
+                if (source.AxisPolicies[sourceAxis++] is not SBPBroadCast)
+                {
+                    return false;
+                }
+            }
+
+            while (resultAxis < resultShape.Rank && IsUnitDimension(resultShape[resultAxis]))
+            {
+                if (result.AxisPolicies[resultAxis++] is not SBPBroadCast)
+                {
+                    return false;
+                }
+            }
+
+            if (sourceAxis == sourceShape.Rank || resultAxis == resultShape.Rank)
+            {
+                return sourceAxis == sourceShape.Rank && resultAxis == resultShape.Rank;
+            }
+
+            if (!DistributedUtility.IsSamePolicy(
+                    source.AxisPolicies[sourceAxis++],
+                    result.AxisPolicies[resultAxis++]))
+            {
+                return false;
+            }
+        }
+
+        return true;
     }
 
     private static bool AreSameRanges(ReadOnlySpan<TIR.Range> lhs, ReadOnlySpan<TIR.Range> rhs)

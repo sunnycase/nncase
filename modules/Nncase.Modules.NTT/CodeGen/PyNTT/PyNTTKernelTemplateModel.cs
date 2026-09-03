@@ -195,6 +195,18 @@ public sealed record PyNTTRegionCopyTemplateModel(
     public string[] RuntimeShapeArgs { get; set; } = Array.Empty<string>();
 }
 
+public sealed record PyNTTPipelineChannelEndpointTemplateModel(
+    string FunctionName,
+    string Channel,
+    int Phase,
+    bool IsProducer,
+    int[] ProducerOwnerHierarchyAxes,
+    PyNTTRegionCopyTemplateModel Copy,
+    string Comment)
+{
+    public string[] RuntimeShapeArgs { get; set; } = Array.Empty<string>();
+}
+
 public sealed record PyNTTElementwiseBinaryTemplateModel(
     string FunctionName,
     PyNTTBufferPointerTemplateModel Lhs,
@@ -461,6 +473,8 @@ public sealed record PyNTTSliceTemplateModel(
     PyNTTDimExpression[] OutputShape,
     PyNTTDimExpression[] InputStrides,
     PyNTTDimExpression[] OutputStrides,
+    int[] InputVectorLaneShape,
+    int[] OutputVectorLaneShape,
     long[] Starts,
     long[] Strides,
     string Comment)
@@ -639,6 +653,30 @@ public sealed record PyNTTGatherReduceAddNormTemplateModel(
 {
     public string[] RuntimeShapeArgs { get; set; } = Array.Empty<string>();
 }
+
+public sealed record PyNTTNVFP4InputNormalizationTemplateModel(
+    PyNTTPooledByteAddressTemplateModel InputAddress,
+    PyNTTPooledByteAddressTemplateModel PartialStatsAddress,
+    PyNTTBufferPointerTemplateModel NormScale,
+    PyNTTBufferPointerTemplateModel NormBias,
+    string StatsDType,
+    string StatsTritonDType,
+    string NormScaleTritonDType,
+    string NormBiasTritonDType,
+    PyNTTDimExpression[] StatsShape,
+    PyNTTDimExpression[] StatsStrides,
+    PyNTTDimExpression[] NormScaleShape,
+    PyNTTDimExpression[] NormScaleStrides,
+    PyNTTDimExpression[] NormBiasShape,
+    PyNTTDimExpression[] NormBiasStrides,
+    int[] NormScaleVectorLanes,
+    int[] NormBiasVectorLanes,
+    int[] Hierarchy,
+    int[] PartialAxes,
+    int Axis,
+    float Epsilon,
+    bool UseMean,
+    bool HasBias);
 
 public sealed record PyNTTQKVRoPENormTemplateModel(
     string FunctionName,
@@ -838,6 +876,12 @@ public sealed record PyNTTPagedAttentionTemplateModel(
     string Comment)
 {
     public string[] RuntimeShapeArgs { get; set; } = Array.Empty<string>();
+
+    public PyNTTBufferPointerTemplateModel? OutputGate { get; set; }
+
+    public bool HasOutputGate { get; set; }
+
+    public PyNTTDimExpression[] OutputGateStrides { get; set; } = Array.Empty<PyNTTDimExpression>();
 }
 
 public sealed record PyNTTPagedAttentionPartialTemplateModel(
@@ -887,6 +931,12 @@ public sealed record PyNTTPagedAttentionPartialTemplateModel(
     string Comment)
 {
     public string[] RuntimeShapeArgs { get; set; } = Array.Empty<string>();
+
+    public PyNTTBufferPointerTemplateModel? OutputGate { get; set; }
+
+    public bool HasOutputGate { get; set; }
+
+    public PyNTTDimExpression[] OutputGateStrides { get; set; } = Array.Empty<PyNTTDimExpression>();
 }
 
 public sealed record PyNTTPagedAttentionMergeTemplateModel(
@@ -924,6 +974,12 @@ public sealed record PyNTTPagedAttentionMergeTemplateModel(
     string Comment)
 {
     public string[] RuntimeShapeArgs { get; set; } = Array.Empty<string>();
+
+    public PyNTTBufferPointerTemplateModel? OutputGate { get; set; }
+
+    public bool HasOutputGate { get; set; }
+
+    public PyNTTDimExpression[] OutputGateStrides { get; set; } = Array.Empty<PyNTTDimExpression>();
 }
 
 public sealed record PyNTTPagedAttentionMergePackedMatMulTemplateModel(
@@ -1109,6 +1165,28 @@ public sealed record PyNTTNVFP4MatmulTemplateModel(
     public string[] RuntimeShapeArgs { get; set; } = Array.Empty<string>();
 
     public string? RhsPackedDescriptorName { get; set; }
+
+    public string? RhsScaleDescriptorName { get; set; }
+
+    public PyNTTBufferPointerTemplateModel? Addend { get; set; }
+
+    public PyNTTDimExpression[] AddendShape { get; set; } = Array.Empty<PyNTTDimExpression>();
+
+    public PyNTTDimExpression[] AddendStrides { get; set; } = Array.Empty<PyNTTDimExpression>();
+
+    public bool HasAddend => Addend is not null;
+
+    public PyNTTBufferPointerTemplateModel? Stats { get; set; }
+
+    public PyNTTDimExpression[] StatsShape { get; set; } = Array.Empty<PyNTTDimExpression>();
+
+    public PyNTTDimExpression[] StatsStrides { get; set; } = Array.Empty<PyNTTDimExpression>();
+
+    public int NormAxis { get; set; } = -1;
+
+    public bool UseMean { get; set; }
+
+    public bool HasNormStats => Stats is not null;
 }
 
 public sealed record PyNTTNVFP4MatMulGluTemplateModel(
@@ -1148,6 +1226,12 @@ public sealed record PyNTTNVFP4MatMulGluTemplateModel(
     public string? GateWeightPackedDescriptorName { get; set; }
 
     public string? UpWeightPackedDescriptorName { get; set; }
+
+    public string? GateWeightScaleDescriptorName { get; set; }
+
+    public string? UpWeightScaleDescriptorName { get; set; }
+
+    public PyNTTNVFP4InputNormalizationTemplateModel? InputNormalization { get; set; }
 }
 
 public sealed record PyNTTQKVParallelLinearTemplateModel(
@@ -1252,6 +1336,7 @@ public sealed record PyNTTPackedQKVParallelLinearTemplateModel(
     string BiasTritonDType,
     string OutputTritonDType,
     PyNTTDimExpression[] InputShape,
+    PyNTTDimExpression[] InputActiveShape,
     PyNTTDimExpression[] WeightShape,
     PyNTTDimExpression[] QBiasShape,
     PyNTTDimExpression[] KBiasShape,
@@ -1289,6 +1374,11 @@ public sealed record PyNTTPackedQKVParallelLinearTemplateModel(
     public bool HasOperandScales =>
         QInputScale is not null && KInputScale is not null && VInputScale is not null &&
         QWeightScale is not null && KWeightScale is not null && VWeightScale is not null;
+
+    public bool HasWeightScales =>
+        QWeightScale is not null && KWeightScale is not null && VWeightScale is not null;
+
+    public string QuantizationMode { get; set; } = "none";
 
     public bool PackedN => true;
 
@@ -1606,12 +1696,14 @@ public sealed record PyNTTGatedDeltaNetConvolutionTemplateModel(
     PyNTTGatedDeltaNetStateAxisTemplateModel ConvStateLayerAxis,
     PyNTTGatedDeltaNetStateAxisTemplateModel ConvStateChannelAxis,
     PyNTTGatedDeltaNetStateAxisTemplateModel ConvStateHistoryAxis,
-    string LayerId,
-    int ConvKernelSize,
-    int LocalConvDim,
-    string ActiveLocalConvDim,
-    int ActivationLaneCount,
-    PyNTTMicroKernelTemplateModel MicroKernel,
+     string LayerId,
+     int ConvKernelSize,
+     int GlobalConvDim,
+     int LocalConvDim,
+     int LocalWeightConvDim,
+     string ActiveLocalConvDim,
+     int ActivationLaneCount,
+     PyNTTMicroKernelTemplateModel MicroKernel,
     string Comment)
 {
     public string[] RuntimeShapeArgs { get; set; } = Array.Empty<string>();

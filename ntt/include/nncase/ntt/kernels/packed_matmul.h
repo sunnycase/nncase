@@ -17,6 +17,7 @@
 #include "../shape_infer/matmul.h"
 #include "../shape_infer/reduce.h"
 #include "../ukernels.h"
+#include "cast.h"
 #include "matmul.h"
 #include "nncase/ntt/compiler_defs.h"
 #include <type_traits>
@@ -173,5 +174,30 @@ NTT_ALWAYS_INLINE constexpr void packed_matmul(const TLhs &lhs, const TRhs &rhs,
         }
     }
 #endif
+}
+
+template <Tensor TLhs, Tensor TRhs, class TOut, class TLoadC, class TScale,
+          class TAddend>
+NTT_ALWAYS_INLINE constexpr void
+packed_matmul_kernel(const TLhs &lhs, const TRhs &rhs, TOut &output,
+                     const TLoadC &load_c, const TScale &scale,
+                     const TAddend &addend) {
+    if constexpr (!detail::has_load_previous_v<TLoadC>) {
+        if constexpr (!std::is_same_v<std::remove_cvref_t<TAddend>,
+                                      std::nullptr_t>) {
+            cast(addend, output, fixed_shape_v<>);
+            packed_matmul<true>(lhs, rhs, output, scale);
+        } else {
+            packed_matmul<false>(lhs, rhs, output, scale);
+        }
+    } else if (detail::load_previous(load_c)) {
+        packed_matmul<true>(lhs, rhs, output, scale);
+    } else if constexpr (!std::is_same_v<std::remove_cvref_t<TAddend>,
+                                         std::nullptr_t>) {
+        cast(addend, output, fixed_shape_v<>);
+        packed_matmul<true>(lhs, rhs, output, scale);
+    } else {
+        packed_matmul<false>(lhs, rhs, output, scale);
+    }
 }
 } // namespace nncase::ntt

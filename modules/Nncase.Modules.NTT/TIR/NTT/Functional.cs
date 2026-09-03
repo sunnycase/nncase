@@ -179,6 +179,23 @@ public partial class NTT
             addend ?? None.Default);
     }
 
+    public static Call BlockScaledMatMul(
+        Expr lhs,
+        Expr rhs,
+        Expr rhsScale,
+        Expr output,
+        DataType outputDataType,
+        long weightBlockN,
+        long weightBlockK)
+    {
+        return KernelCall(
+            new TIR.NTT.BlockScaledMatMul(outputDataType, weightBlockN, weightBlockK),
+            lhs,
+            rhs,
+            rhsScale,
+            output);
+    }
+
     public static Call NVFP4MatMul(
         Expr lhs,
         Expr rhsPacked,
@@ -186,7 +203,8 @@ public partial class NTT
         Expr lhsGlobalScale,
         Expr rhsGlobalScale,
         Expr output,
-        long groupSize)
+        long groupSize,
+        Expr? addend = null)
     {
         return KernelCall(
             new Nncase.TIR.NTT.NVFP4MatMul(groupSize),
@@ -195,7 +213,33 @@ public partial class NTT
             rhsScale,
             lhsGlobalScale,
             rhsGlobalScale,
-            output);
+            output,
+            addend ?? None.Default);
+    }
+
+    public static Call NVFP4MatMulNormStats(
+        Expr lhs,
+        Expr rhsPacked,
+        Expr rhsScale,
+        Expr lhsGlobalScale,
+        Expr rhsGlobalScale,
+        Expr output,
+        Expr stats,
+        Expr addend,
+        long groupSize,
+        int axis,
+        bool useMean)
+    {
+        return KernelCall(
+            new Nncase.TIR.NTT.NVFP4MatMulNormStats(groupSize, axis, useMean),
+            lhs,
+            rhsPacked,
+            rhsScale,
+            lhsGlobalScale,
+            rhsGlobalScale,
+            output,
+            stats,
+            addend);
     }
 
     public static Call PackedBlockScaledMatMulNormStats(
@@ -260,6 +304,10 @@ public partial class NTT
         Expr argMaxState,
         Expr scale,
         Expr addend,
+        Expr lhsScale,
+        Expr rhsScale,
+        DataType accumulatorDataType,
+        DataType outputDataType,
         IR.NTT.PackedMatMulRhsLayout rhsLayout,
         DistributedType packedOutputType,
         DistributedType logitsType,
@@ -267,6 +315,8 @@ public partial class NTT
     {
         return KernelCall(
             new PackedMatMulSamplingPartial(
+                accumulatorDataType,
+                outputDataType,
                 rhsLayout,
                 packedOutputType,
                 logitsType,
@@ -278,7 +328,9 @@ public partial class NTT
             processedLogits,
             argMaxState,
             scale,
-            addend);
+            addend,
+            lhsScale,
+            rhsScale);
     }
 
     public static Call QKVParallelLinear(
@@ -299,10 +351,12 @@ public partial class NTT
         Expr kOutput,
         Expr vOutput,
         long numHeads,
-        long numKvHeads)
+        long numKvHeads,
+        global::Nncase.IR.Math.MatMulQuantizationMode quantizationMode =
+            global::Nncase.IR.Math.MatMulQuantizationMode.None)
     {
         return KernelCall(
-            new QKVParallelLinear(numHeads, numKvHeads),
+            new QKVParallelLinear(numHeads, numKvHeads, quantizationMode),
             input,
             qWeight,
             kWeight,
@@ -340,10 +394,18 @@ public partial class NTT
         Expr vOutput,
         long numHeads,
         long numKvHeads,
-        IR.NTT.PackedMatMulRhsLayout rhsLayout = IR.NTT.PackedMatMulRhsLayout.NMajor)
+        IR.NTT.PackedMatMulRhsLayout rhsLayout = IR.NTT.PackedMatMulRhsLayout.NMajor,
+        int outputNVectorLaneCount = 1,
+        global::Nncase.IR.Math.MatMulQuantizationMode quantizationMode =
+            global::Nncase.IR.Math.MatMulQuantizationMode.None)
     {
         return KernelCall(
-            new PackedQKVParallelLinear(numHeads, numKvHeads, rhsLayout),
+            new PackedQKVParallelLinear(
+                numHeads,
+                numKvHeads,
+                rhsLayout,
+                outputNVectorLaneCount,
+                quantizationMode),
             input,
             qWeight,
             kWeight,
@@ -380,6 +442,8 @@ public partial class NTT
         long numHeads,
         long numKvHeads,
         IR.NTT.PackedMatMulRhsLayout rhsLayout,
+        int outputNVectorLaneCount,
+        global::Nncase.IR.Math.MatMulQuantizationMode quantizationMode,
         IRArray<long> projectionNCapacities)
     {
         return KernelCall(
@@ -387,6 +451,8 @@ public partial class NTT
                 numHeads,
                 numKvHeads,
                 rhsLayout,
+                outputNVectorLaneCount,
+                quantizationMode,
                 projectionNCapacities),
             input,
             weight,
@@ -452,6 +518,56 @@ public partial class NTT
         return KernelCall(
             new NVFP4MatMulGlu(gluType, groupSize),
             input,
+            gateWeightPacked,
+            upWeightPacked,
+            gateWeightScale,
+            upWeightScale,
+            gateInputGlobalScale,
+            upInputGlobalScale,
+            gateWeightGlobalScale,
+            upWeightGlobalScale,
+            output);
+    }
+
+    public static Call GatherReduceNormApplyNVFP4MatMulGlu(
+        Expr partialStats,
+        Expr input,
+        Expr normScale,
+        Expr normBias,
+        Expr gateWeightPacked,
+        Expr upWeightPacked,
+        Expr gateWeightScale,
+        Expr upWeightScale,
+        Expr gateInputGlobalScale,
+        Expr upInputGlobalScale,
+        Expr gateWeightGlobalScale,
+        Expr upWeightGlobalScale,
+        Expr output,
+        DistributedType inStatsType,
+        DistributedType outStatsType,
+        DistributedType normalizedInputType,
+        int axis,
+        float epsilon,
+        bool useMean,
+        bool hasBias,
+        IR.NN.GluType gluType,
+        long groupSize)
+    {
+        return KernelCall(
+            new GatherReduceNormApplyNVFP4MatMulGlu(
+                inStatsType,
+                outStatsType,
+                normalizedInputType,
+                axis,
+                epsilon,
+                useMean,
+                hasBias,
+                gluType,
+                groupSize),
+            partialStats,
+            input,
+            normScale,
+            normBias,
             gateWeightPacked,
             upWeightPacked,
             gateWeightScale,
@@ -716,9 +832,9 @@ public partial class NTT
         return KernelCall(new Concat(axis), inputs.Concat(new[] { ret }).ToArray());
     }
 
-    public static Expr PagedAttention(Expr q, Expr kvcache, Expr extra, Expr scale, Dimension layerId, Expr ret, IRArray<IR.NN.AttentionDimKind> layout, int hiddenSize)
+    public static Expr PagedAttention(Expr q, Expr kvcache, Expr extra, Expr scale, Dimension layerId, Expr outputGate, Expr ret, IRArray<IR.NN.AttentionDimKind> layout, int hiddenSize)
     {
-        return KernelCall(new PagedAttention(layout, hiddenSize), q, kvcache, extra, scale, layerId, ret);
+        return KernelCall(new PagedAttention(layout, hiddenSize), q, kvcache, extra, scale, layerId, outputGate, ret);
     }
 
     public static Call PagedAttentionUseSplitKV(Expr kvcache, long directContextThreshold)
@@ -733,6 +849,7 @@ public partial class NTT
         Expr maxState,
         Expr sumState,
         Expr accState,
+        Expr outputGate,
         Expr output,
         IRArray<IR.NN.AttentionDimKind> layout,
         int hiddenSize,
@@ -755,6 +872,7 @@ public partial class NTT
             maxState,
             sumState,
             accState,
+            outputGate,
             output);
     }
 
@@ -762,6 +880,7 @@ public partial class NTT
         Expr maxState,
         Expr sumState,
         Expr accState,
+        Expr outputGate,
         Expr output,
         IRArray<IR.NN.AttentionDimKind> layout,
         int hiddenSize,
@@ -773,6 +892,7 @@ public partial class NTT
             maxState,
             sumState,
             accState,
+            outputGate,
             output);
     }
 

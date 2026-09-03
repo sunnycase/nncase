@@ -5,6 +5,7 @@ using System;
 using System.CommandLine;
 using System.CommandLine.Invocation;
 using System.Linq;
+using Nncase.IR;
 using Nncase.Passes;
 using Nncase.Passes.Transforms;
 
@@ -21,12 +22,69 @@ public sealed class PyNTTTarget : NTTTarget
     public const string Kind = "pyntt";
 
     private readonly PyNTTModuleCompiler _moduleCompiler = new();
+    private readonly CPUModuleCompiler _cpuModuleCompiler = new();
+    private readonly CPUTarget _cpuTarget = new();
+
+    /// <inheritdoc/>
+    public override IReadOnlyList<IModuleCompiler> ModuleCompilers
+        => [_moduleCompiler, _cpuModuleCompiler];
 
     /// <inheritdoc/>
     public override bool IsAutoTilingEnabled => false;
 
     /// <inheritdoc/>
     protected override INTTModuleCompiler NTTModuleCompiler => _moduleCompiler;
+
+    /// <inheritdoc/>
+    public override ITarget GetModuleTarget(string moduleKind)
+        => moduleKind switch
+        {
+            Kind => this,
+            CPUTarget.Kind => _cpuTarget,
+            _ => throw new NotSupportedException($"PyNTT has no module target for {moduleKind}."),
+        };
+
+    /// <inheritdoc/>
+    public override CompileOptions GetModuleCompileOptions(string moduleKind, CompileOptions options)
+    {
+        if (moduleKind == Kind)
+        {
+            return options;
+        }
+
+        if (moduleKind != CPUTarget.Kind || options.TargetOptions is not PyNTTTargetOptions pynttOptions)
+        {
+            throw new NotSupportedException($"PyNTT cannot create compile options for module {moduleKind}.");
+        }
+
+        var cpuOptions = new NTTTargetOptions
+        {
+            ModelName = pynttOptions.ModelName,
+            Vectorize = true,
+            UnifiedMemoryArch = true,
+            MemoryAccessArch = MemoryAccessArchitecture.UMA,
+            NocArch = NocArchitecture.CrossBar,
+            Hierarchies = [new[] { pynttOptions.CpuCoreCount }],
+            HierarchyNames = "b",
+            HierarchyLevels = "b",
+            TargetMachine = pynttOptions.CpuTargetMachine,
+            DistributedScheme = string.Empty,
+            CustomOpScheme = pynttOptions.CustomOpScheme,
+        };
+        return options with { TargetOptions = cpuOptions };
+    }
+
+    /// <inheritdoc/>
+    public override string GetPreferredModuleKind(BaseFunction owner, Call call, CompileOptions options)
+    {
+        var targetOptions = options.TargetOptions as PyNTTTargetOptions
+            ?? throw new InvalidOperationException(
+                $"PyNTT placement requires {nameof(PyNTTTargetOptions)}, got {options.TargetOptions?.GetType().Name ?? "null"}.");
+        return (call.Metadata.SemanticRegion ?? owner.Metadata.SemanticRegion) is { } region &&
+            targetOptions.IsCpuOffloadRegion(region.Kind)
+            ? CPUTarget.Kind
+            : Kind;
+    }
 
     /// <inheritdoc/>
     public override void RegisterAutoPackingRules(IRulesAddable pass, CompileOptions options)
@@ -39,7 +97,7 @@ public sealed class PyNTTTarget : NTTTarget
         pass.Add<Passes.Rules.NTT.PackBlockScaledMatMulRhsNMajorKPacked>(vectorBytes, kPack);
         pass.Add<Passes.Rules.NTT.PackNVFP4MatMulRhsKMajor>(vectorBytes, kPack);
         pass.Add<Passes.Rules.NTT.PackNVFP4MatMulGluRhsKMajor>(vectorBytes, kPack);
-        pass.Add<Passes.Rules.NTT.PackQKVParallelLinearRhsKMajor>(vectorBytes, kPack);
+        pass.Add<Passes.Rules.NTT.PackQKVParallelLinearRhsForGpu>(vectorBytes, kPack);
         pass.Add<Passes.Rules.NTT.PackBlockScaledMatMulGluRhsNMajorKPacked>(vectorBytes, kPack);
         pass.Add<Passes.Rules.NTT.PackMatMulGluRhsKMajor>(vectorBytes, kPack);
     }
@@ -53,11 +111,14 @@ public sealed class PyNTTTarget : NTTTarget
     /// <inheritdoc/>
     public override void RegisterPostAutoPackingPass(IPassManager passManager, CompileOptions options)
     {
-        var (splitHierarchyAxis, splitCount) = GetPagedAttentionSplitPlan(options);
-        passManager.AddWithName<DataflowPass>("DecomposePagedAttention").Configure(p =>
+        if (TryGetPagedAttentionSplitPlan(options) is { } splitPlan)
         {
-            p.Add<Passes.Rules.NTT.DecomposePagedAttention>(splitHierarchyAxis, splitCount);
-        });
+            passManager.AddWithName<DataflowPass>("DecomposePagedAttention").Configure(p =>
+            {
+                p.Add<Passes.Rules.NTT.DecomposePagedAttention>(splitPlan.Axis, splitPlan.Count);
+            });
+        }
+
         passManager.AddWithName<DataflowPass>("DecomposeSampling").Configure(p =>
         {
             p.Add<Passes.Rules.NTT.DecomposeSampling>();
@@ -66,8 +127,10 @@ public sealed class PyNTTTarget : NTTTarget
         {
             p.Add<Passes.Rules.NTT.FusePackedMatMulAdd>();
             p.Add<Passes.Rules.NTT.FusePackedBlockScaledMatMulAdd>();
+            p.Add<Passes.Rules.NTT.FusePackedNVFP4MatMulAdd>();
         });
         passManager.Add<FormPackedMatMulNormStatsCombinePass>();
+        passManager.Add<FusePackedMatMulNormStatsPass>(false, false, true);
     }
 
     /// <inheritdoc/>
@@ -133,6 +196,7 @@ public sealed class PyNTTTarget : NTTTarget
         passManager.Add<FuseGatherReduceAddNormApplyPass>(Kind);
         passManager.Add<ForwardGatherReduceAddNormValuesPass>(Kind);
         passManager.Add<FuseGatherReduceNormApplyPass>(Kind);
+        passManager.Add<FuseGatherReduceNormApplyNVFP4MatMulGluPass>(Kind);
         passManager.Add<CanonicalizePackedQKVWeightsPass>(Kind);
         passManager.Add<ForwardTerminalStoreDestinationsPass>(Kind);
         base.RegisterTIRPreBufferizePass(passManager, options);
@@ -150,8 +214,23 @@ public sealed class PyNTTTarget : NTTTarget
             name: "--pyntt-output-dir",
             description: "PyNTT generated Python model directory.",
             getDefaultValue: () => string.Empty);
+        var cpuOffloadRegionsOption = new Option<string>(
+            name: "--pyntt-cpu-offload-regions",
+            description: "Comma-separated semantic region kinds assigned to CPU NTT.",
+            getDefaultValue: () => string.Empty);
+        var cpuCoreCountOption = new Option<int>(
+            name: "--pyntt-cpu-core-count",
+            description: "CPU NTT block workers.",
+            getDefaultValue: () => Math.Max(1, Environment.ProcessorCount));
+        var cpuTargetMachineOption = new Option<string>(
+            name: "--pyntt-cpu-target-machine",
+            description: "CPU target machine model.",
+            getDefaultValue: () => NTTTargetMachineCatalog.CpuGeneric);
         cmd.Add(backendOption);
         cmd.Add(outputDirOption);
+        cmd.Add(cpuOffloadRegionsOption);
+        cmd.Add(cpuCoreCountOption);
+        cmd.Add(cpuTargetMachineOption);
 
         ITargetOptions ParseTargetCompileOptions(InvocationContext context, Command command)
         {
@@ -159,13 +238,16 @@ public sealed class PyNTTTarget : NTTTarget
             var pynttOptions = PyNTTTargetOptions.FromNTTTargetOptions(nttOptions);
             pynttOptions.Backend = context.ParseResult.GetValueForOption(backendOption)!;
             pynttOptions.OutputDirectory = context.ParseResult.GetValueForOption(outputDirOption)!;
+            pynttOptions.CpuOffloadRegions = context.ParseResult.GetValueForOption(cpuOffloadRegionsOption)!;
+            pynttOptions.CpuCoreCount = context.ParseResult.GetValueForOption(cpuCoreCountOption);
+            pynttOptions.CpuTargetMachine = context.ParseResult.GetValueForOption(cpuTargetMachineOption)!;
             return pynttOptions;
         }
 
         return (cmd, ParseTargetCompileOptions);
     }
 
-    private static (int Axis, int Count) GetPagedAttentionSplitPlan(CompileOptions options)
+    private static (int Axis, int Count)? TryGetPagedAttentionSplitPlan(CompileOptions options)
     {
         if (options.TargetOptions is not INTTTargetOptions targetOptions ||
             targetOptions.Hierarchies.Length == 0)
@@ -198,8 +280,6 @@ public sealed class PyNTTTarget : NTTTarget
             .FirstOrDefault();
         return candidates is not null
             ? (candidates.Axis, candidates.Extents[0])
-            : throw new InvalidOperationException(
-                "PyNTT split-KV paged attention requires a physical block hierarchy axis " +
-                "with one fixed extent greater than one across all placement candidates.");
+            : null;
     }
 }

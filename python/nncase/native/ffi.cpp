@@ -391,7 +391,23 @@ PYBIND11_MODULE(_nncase, m) {
       .def_property(
         "OutputDirectory",
         []() {},
-        py::overload_cast<std::string_view>(&pyntt_target_options::output_directory)) ;
+        py::overload_cast<std::string_view>(&pyntt_target_options::output_directory))
+      .def_property(
+        "CpuOffloadRegions",
+        []() {},
+        py::overload_cast<std::string_view>(&pyntt_target_options::cpu_offload_regions))
+      .def_property(
+        "CpuCoreCount",
+        []() {},
+        py::overload_cast<int32_t>(&pyntt_target_options::cpu_core_count))
+      .def_property(
+        "CpuTargetMachine",
+        []() {},
+        py::overload_cast<std::string_view>(&pyntt_target_options::cpu_target_machine))
+      .def_property(
+        "BlockCyclicBlockBytes",
+        []() {},
+        py::overload_cast<int64_t>(&pyntt_target_options::block_cyclic_block_bytes)) ;
 
     /* end the auto generated block by tools/stackvm_gen/CApiGen at 12/20/2024 3:41:05 PM +08:00. */
     // clang-format on

@@ -336,7 +336,8 @@ internal sealed class SearchableNode
         SearchableNodeKind kind = SearchableNodeKind.Normal,
         DistributedReshardSourceKind? sourceKind = null,
         DistributedReshardUsageKind? reshardUsageKind = null,
-        IVar? originParameter = null)
+        IVar? originParameter = null,
+        BaseExpr? metadataSource = null)
     {
         Expr = expr;
         IRType = type;
@@ -353,6 +354,7 @@ internal sealed class SearchableNode
             (SourceKind == DistributedReshardSourceKind.FunctionParameter && expr is IVar parameter
                 ? parameter
                 : null);
+        MetadataSource = metadataSource;
     }
 
     public BaseExpr Expr { get; }
@@ -368,6 +370,13 @@ internal sealed class SearchableNode
     public DistributedReshardUsageKind? ReshardUsageKind { get; }
 
     public IVar? OriginParameter { get; }
+
+    /// <summary>
+    /// Gets the source expression whose stable semantic metadata belongs to an
+    /// executable candidate. Search-only operations such as type adapters and
+    /// reshard realizations intentionally leave this null.
+    /// </summary>
+    public BaseExpr? MetadataSource { get; }
 }
 
 internal sealed record CrossEdge : IEdge<SearchableNode>
@@ -444,6 +453,11 @@ internal sealed record ReshardCandidateKey(
 internal sealed record ProviderInputTypeKey(
     DistributedSearchGraph InputCluster,
     IRType TargetType);
+
+internal sealed record ProviderInputChoiceKey(
+    DistributedSearchGraph InputCluster,
+    IRType TargetType,
+    Function OwnerFunction);
 
 internal sealed class AutoDistributedProfiler
 {
@@ -915,6 +929,18 @@ internal sealed class AutoDistributedRewriter : ExprVisitor<Unit, Unit>
         public DistributedSearchGraph? PathCluster { get; set; }
     }
 
+    private sealed class ProviderInputChoiceState
+    {
+        public ProviderInputChoiceState(DistributedSearchGraph choiceBucket)
+        {
+            ChoiceBucket = choiceBucket;
+        }
+
+        public DistributedSearchGraph ChoiceBucket { get; }
+
+        public HashSet<DistributedSearchGraph> SourceBuckets { get; } = new(ReferenceEqualityComparer.Instance);
+    }
+
     private sealed class FunctionBoundarySite
     {
         public FunctionBoundarySite(
@@ -989,6 +1015,8 @@ internal sealed class AutoDistributedRewriter : ExprVisitor<Unit, Unit>
     private readonly Dictionary<ReshardCandidateKey, (DistributedSearchGraph Bucket, SearchableNode Node)> _reshardCandidateMemo = new();
 
     private readonly Dictionary<ProviderInputTypeKey, IReadOnlyList<DistributedSearchGraph>> _providerInputTypeMemo = new();
+
+    private readonly Dictionary<ProviderInputChoiceKey, ProviderInputChoiceState> _providerInputChoiceMemo = new();
 
     private readonly Dictionary<TensorConst, DistributedSearchGraph> _constantStorageBuckets = new(ReferenceEqualityComparer.Instance);
 
@@ -1935,7 +1963,8 @@ internal sealed class AutoDistributedRewriter : ExprVisitor<Unit, Unit>
 
                 var node = new SearchableNode(
                     site.IsSupported && newExpr is Call newCall ? newCall.Target : newExpr,
-                    checkType);
+                    checkType,
+                    metadataSource: site.SourceCall);
                 outputBucket.AddVertex(node);
                 RegisterNodeOwner(node, site.Function);
                 foreach (var ((argument, _), index) in bucketArray.Zip(used).Where(pair => pair.Second).Select((pair, index) => (pair, index)))
@@ -2097,7 +2126,10 @@ internal sealed class AutoDistributedRewriter : ExprVisitor<Unit, Unit>
         if (_typeInferenceMemo.TryGetValue(key, out var cached))
         {
             _profiler.Count("type_inference_cache_hit");
-            call.CheckedType = cached.CheckedType;
+
+            // Candidate calls are ephemeral search values. Restoring a cached
+            // type must not invalidate users of a structurally reused call.
+            IRHelpers.SetRawCheckedType(call, cached.CheckedType);
             return cached.Success;
         }
 
@@ -2264,7 +2296,7 @@ internal sealed class AutoDistributedRewriter : ExprVisitor<Unit, Unit>
             return;
         }
 
-        var bucketChoices = new DistributedSearchGraph[tuple.InputTypes.Count][];
+        var selectedBuckets = new DistributedSearchGraph[tuple.InputTypes.Count];
         for (int i = 0; i < tuple.InputTypes.Count; i++)
         {
             if (propagateInputDemands)
@@ -2290,17 +2322,70 @@ internal sealed class AutoDistributedRewriter : ExprVisitor<Unit, Unit>
                 return;
             }
 
-            bucketChoices[i] = buckets;
+            selectedBuckets[i] = GetOrCreateProviderInputChoiceBucket(
+                inputExpressions[i],
+                inputClusters[i],
+                tuple.InputTypes[i],
+                buckets,
+                ownerFunction);
         }
 
-        foreach (var combBuckets in bucketChoices.CartesianProduct())
+        result.Add(new CandidateInvocation(
+            selectedBuckets,
+            candidateTarget,
+            expectedReturnType,
+            allowsPartialInputs));
+    }
+
+    private DistributedSearchGraph GetOrCreateProviderInputChoiceBucket(
+        BaseExpr inputExpression,
+        DistributedSearchGraph inputCluster,
+        IRType targetType,
+        IReadOnlyList<DistributedSearchGraph> sourceBuckets,
+        Function ownerFunction)
+    {
+        if (sourceBuckets.Count == 1)
         {
-            result.Add(new CandidateInvocation(
-                combBuckets.ToArray(),
-                candidateTarget,
-                expectedReturnType,
-                allowsPartialInputs));
+            return sourceBuckets[0];
         }
+
+        var key = new ProviderInputChoiceKey(inputCluster, targetType, ownerFunction);
+        if (!_providerInputChoiceMemo.TryGetValue(key, out var state))
+        {
+            var choiceCluster = _rootSearchGraph.CreateCluster<DistributedSearchGraph>(SearchGraphKind.DistributedCluster);
+            var choiceBucket = choiceCluster.CreateCluster<DistributedSearchGraph>(SearchGraphKind.Bucket);
+            state = new ProviderInputChoiceState(choiceBucket);
+            _providerInputChoiceMemo.Add(key, state);
+        }
+
+        foreach (var sourceBucket in sourceBuckets)
+        {
+            if (!state.SourceBuckets.Add(sourceBucket))
+            {
+                continue;
+            }
+
+            var sourceNode = sourceBucket.Vertices.FirstOrDefault()
+                ?? throw new InvalidOperationException("A provider input realization bucket cannot be empty.");
+            if (!EqualityComparer<IRType>.Default.Equals(sourceNode.IRType, targetType))
+            {
+                throw new InvalidOperationException(
+                    $"Provider input realization type {sourceNode.IRType} does not match requested type {targetType}.");
+            }
+
+            var choiceNode = new SearchableNode(
+                inputExpression,
+                targetType,
+                kind: SearchableNodeKind.TypeAdapter,
+                sourceKind: sourceNode.SourceKind,
+                originParameter: sourceNode.OriginParameter);
+            state.ChoiceBucket.AddVertex(choiceNode);
+            RegisterNodeOwner(choiceNode, ownerFunction);
+            _rootSearchGraph.AddEdge(new(choiceNode, sourceNode, 0, sourceBucket));
+            _profiler.Count("candidate_provider_factored_input_realizations");
+        }
+
+        return state.ChoiceBucket;
     }
 
     private static bool HaveSameLogicalTensorType(IRType sourceType, IRType demandedType)
@@ -2976,7 +3061,8 @@ internal sealed class AutoDistributedRewriter : ExprVisitor<Unit, Unit>
             var callNode = new SearchableNode(
                 site.Callee,
                 returnNode.IRType,
-                kind: SearchableNodeKind.FunctionCall);
+                kind: SearchableNodeKind.FunctionCall,
+                metadataSource: site.SourceCall);
             outputBucket.AddVertex(callNode);
             RegisterNodeOwner(callNode, site.Function);
             _rootSearchGraph.AddEdge(new(
@@ -4893,7 +4979,7 @@ internal sealed class AutoDistributedRewriter : ExprVisitor<Unit, Unit>
 
     private void PruneDominatedCandidates(Dictionary<SearchableNode, UInt128> costScoreMemo, Dictionary<SearchableNode, CostModel.Cost> costMemo)
     {
-        var removed = new HashSet<SearchableNode>();
+        var replacements = new Dictionary<SearchableNode, SearchableNode>(ReferenceEqualityComparer.Instance);
         var buckets = _rootSearchGraph.Clusters
             .OfType<DistributedSearchGraph>()
             .SelectMany(cluster => cluster.Clusters.OfType<DistributedSearchGraph>())
@@ -4926,39 +5012,47 @@ internal sealed class AutoDistributedRewriter : ExprVisitor<Unit, Unit>
                         continue;
                     }
 
-                    RedirectIncomingEdges(node, keep);
-                    removed.Add(node);
+                    replacements.Add(node, keep);
                 }
-            }
-
-            if (removed.Count > 0)
-            {
-                bucket.RemoveVertexIf(removed.Contains);
             }
         }
 
-        foreach (var node in removed)
+        if (replacements.Count == 0)
+        {
+            _profiler.Count("pruned_dominated_candidates", 0);
+            return;
+        }
+
+        var redirectedEdges = _rootSearchGraph.Edges
+            .Where(edge => replacements.ContainsKey(edge.Target))
+            .Select(edge => new CrossEdge(
+                edge.Root,
+                replacements[edge.Target],
+                edge.InputIndex,
+                edge.InputGraph))
+            .ToArray();
+        _rootSearchGraph.AddEdgeRange(redirectedEdges);
+        var removedCount = _rootSearchGraph.RemoveVertexRange(replacements.Keys);
+        if (removedCount != replacements.Count)
+        {
+            throw new InvalidOperationException(
+                $"Dominated-candidate pruning planned {replacements.Count} removals, " +
+                $"but the search graph removed {removedCount} vertices.");
+        }
+
+        foreach (var node in replacements.Keys)
         {
             costMemo.Remove(node);
             costScoreMemo.Remove(node);
         }
 
-        _profiler.Count("pruned_dominated_candidates", removed.Count);
+        _profiler.Count("pruned_dominated_candidates", removedCount);
     }
 
     private IReadOnlyList<CrossEdge> GetOrderedOutEdges(SearchableNode node)
         => _rootSearchGraph.TryGetOutEdges(node, out var edges)
             ? edges.OrderBy(edge => edge.InputIndex).ToArray()
             : Array.Empty<CrossEdge>();
-
-    private void RedirectIncomingEdges(SearchableNode removed, SearchableNode replacement)
-    {
-        var incomingEdges = _rootSearchGraph.Edges.Where(edge => ReferenceEquals(edge.Target, removed)).ToArray();
-        foreach (var edge in incomingEdges)
-        {
-            _rootSearchGraph.AddEdge(new CrossEdge(edge.Root, replacement, edge.InputIndex, edge.InputGraph));
-        }
-    }
 
     private Dictionary<SearchableNode, bool> Solve(DistributedSearchGraph rootCluster)
     {
@@ -5519,7 +5613,7 @@ internal sealed class ExprBuildVisitor
                 case (_, Call call):
                     if (children.Length == call.Arguments.Length)
                     {
-                        expr = call.With(arguments: children);
+                        expr = InheritSelectedMetadata(call.With(arguments: children), root);
                     }
                     else if (children.Length == 1 && EqualityComparer<IRType>.Default.Equals(children[0].CheckedType, root.IRType))
                     {
@@ -5537,12 +5631,14 @@ internal sealed class ExprBuildVisitor
                 case (SearchableNodeKind.FunctionCall, Function func):
                     {
                         var target = _functionMap.TryGetValue(func, out var rewritten) ? rewritten : func;
-                        expr = new Call(target: target, arguments: BuildFunctionCallArguments(target, children));
+                        expr = InheritSelectedMetadata(
+                            new Call(target: target, arguments: BuildFunctionCallArguments(target, children)),
+                            root);
                     }
 
                     break;
                 case (_, BaseFunction func):
-                    expr = new Call(target: func, arguments: children);
+                    expr = InheritSelectedMetadata(new Call(target: func, arguments: children), root);
                     break;
                 case (_, Boxing boxing):
                     if (children.Length != 1)
@@ -5561,7 +5657,7 @@ internal sealed class ExprBuildVisitor
                     expr = MaterializeReshard(children[0], shardedView, shardedView.NewType, "selected sharded view op");
                     break;
                 case (_, Op op):
-                    expr = new Call(target: op, arguments: children);
+                    expr = InheritSelectedMetadata(new Call(target: op, arguments: children), root);
                     break;
                 case (_, IR.Tuple tp):
                     expr = (BaseExpr)tp.With(fields: children);
@@ -5579,6 +5675,11 @@ internal sealed class ExprBuildVisitor
 
         return expr;
     }
+
+    private static BaseExpr InheritSelectedMetadata(BaseExpr expression, SearchableNode node)
+        => node.MetadataSource is { } source
+            ? expression.InheritMetaData(source)
+            : expression;
 
     private BaseExpr[] BuildFunctionCallArguments(Function target, BaseExpr[] children)
     {

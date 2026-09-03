@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+from collections.abc import Mapping
 from pathlib import Path
 from typing import Any
 
@@ -76,54 +77,79 @@ class RDataCache:
     """Readonly data cache with separate host-load and device-materialize stages."""
 
     def __init__(self):
-        self._host_payloads: dict[tuple[str, int], bytearray] = {}
-        self._host_tables: dict[tuple[tuple[str, ...], int], bytearray] = {}
-        self._device_payloads: dict[tuple[str, int, str], Any] = {}
-        self._device_tables: dict[tuple[tuple[str, ...], int, str], Any] = {}
+        self._host_files: dict[tuple[str, int], Any] = {}
+        self._host_payloads: dict[tuple[Any, ...], Any] = {}
+        self._host_tables: dict[tuple[tuple[tuple[Any, ...], ...], int], Any] = {}
+        self._device_payloads: dict[tuple[tuple[Any, ...], str], Any] = {}
+        self._device_tables: dict[tuple[tuple[tuple[Any, ...], ...], int, str], Any] = {}
+        self._materialized_bundles: dict[
+            tuple[int, str], tuple[Mapping[str, Any], tuple[Any, Any, Any]]
+        ] = {}
 
     def prepare_bundle(self, bundle: dict[str, Any]) -> None:
         self.prepare_payload(bundle["rdata"], bundle["rdata_bytes"])
-        self.prepare_payload(bundle.get("chip_local_rdata", ""), bundle.get("chip_local_rdata_bytes", 0))
+        self.prepare_payload(bundle.get("chip_local_rdata"), bundle.get("chip_local_rdata_bytes", 0))
         self.prepare_table(bundle["block_local_rdata"], bundle["block_local_rdata_bytes"])
 
     def materialize_bundle(
         self,
         inputs: tuple[Any, ...],
-        bundle: dict[str, Any],
+        bundle: Mapping[str, Any],
         device: Any | None = None,
     ):
-        return (
+        resolved_device = _normalize_device(inputs, device)
+        cache_key = (id(bundle), _device_key(resolved_device))
+        cached = self._materialized_bundles.get(cache_key)
+        if cached is not None and cached[0] is bundle:
+            return cached[1]
+
+        result = (
             self.materialize_payload(inputs, bundle["rdata"], bundle["rdata_bytes"], device),
-            self.materialize_payload(inputs, bundle.get("chip_local_rdata", ""), bundle.get("chip_local_rdata_bytes", 0), device),
+            self.materialize_payload(inputs, bundle.get("chip_local_rdata"), bundle.get("chip_local_rdata_bytes", 0), device),
             self.materialize_table(inputs, bundle["block_local_rdata"], bundle["block_local_rdata_bytes"], device),
         )
+        self._materialized_bundles[cache_key] = (bundle, result)
+        return result
 
-    def prepare_payload(self, payload: str, byte_count: int) -> bytearray:
-        key = (payload, int(byte_count))
+    def prepare_payload(self, payload: Mapping[str, Any] | None, byte_count: int):
+        spec = _normalize_payload_spec(payload, byte_count)
+        if spec is None:
+            return _empty_host_payload()
+
+        key = _payload_identity(spec)
         raw = self._host_payloads.get(key)
         if raw is None:
-            raw = _decode_payload(payload, byte_count)
+            raw = self._map_payload(spec)
             self._host_payloads[key] = raw
         return raw
 
-    def prepare_table(self, payloads: tuple[str, ...], bytes_per_entry: int) -> bytearray:
+    def prepare_table(self, payloads: tuple[Mapping[str, Any], ...], bytes_per_entry: int):
         payload_tuple = tuple(payloads)
-        key = (payload_tuple, int(bytes_per_entry))
+        specs = tuple(
+            _require_payload_spec(payload, bytes_per_entry) for payload in payload_tuple
+        )
+        identities = tuple(_payload_identity(spec) for spec in specs)
+        key = (identities, int(bytes_per_entry))
         raw = self._host_tables.get(key)
         if raw is None:
-            raw = _decode_payload_table(payload_tuple, bytes_per_entry)
+            raw = self._prepare_payload_table(specs, bytes_per_entry)
             self._host_tables[key] = raw
         return raw
 
     def materialize_payload(
         self,
         inputs: tuple[Any, ...],
-        payload: str,
+        payload: Mapping[str, Any] | None,
         byte_count: int,
         device: Any | None = None,
     ):
         resolved_device = _normalize_device(inputs, device)
-        cache_key = (payload, int(byte_count), _device_key(resolved_device))
+        spec = _normalize_payload_spec(payload, byte_count)
+        if spec is None:
+            return _empty_device_payload(resolved_device)
+
+        identity = _payload_identity(spec)
+        cache_key = (identity, _device_key(resolved_device))
         tensor = self._device_payloads.get(cache_key)
         if tensor is None:
             raw = self.prepare_payload(payload, byte_count)
@@ -134,13 +160,17 @@ class RDataCache:
     def materialize_table(
         self,
         inputs: tuple[Any, ...],
-        payloads: tuple[str, ...],
+        payloads: tuple[Mapping[str, Any], ...],
         bytes_per_entry: int,
         device: Any | None = None,
     ):
         resolved_device = _normalize_device(inputs, device)
         payload_tuple = tuple(payloads)
-        cache_key = (payload_tuple, int(bytes_per_entry), _device_key(resolved_device))
+        identities = tuple(
+            _payload_identity(_require_payload_spec(payload, bytes_per_entry))
+            for payload in payload_tuple
+        )
+        cache_key = (identities, int(bytes_per_entry), _device_key(resolved_device))
         tensor = self._device_tables.get(cache_key)
         if tensor is None:
             raw = self.prepare_table(payload_tuple, bytes_per_entry)
@@ -148,6 +178,49 @@ class RDataCache:
             self._device_tables[cache_key] = tensor
         return tensor
 
+    def _map_payload(self, spec: dict[str, Any]):
+        torch = _import_torch()
+        source = spec["source"]
+        if not source.startswith("file:"):
+            raise PyNTTSpecError("PyNTT rdata payload sources must be binary files.")
+
+        path = Path(source[5:])
+        file_bytes = path.stat().st_size
+        source_offset = spec["source_offset_bytes"]
+        payload_bytes = spec["bytes"]
+        if source_offset + payload_bytes > file_bytes:
+            raise PyNTTSpecError(
+                "PyNTT rdata payload slice exceeds its source file: "
+                f"offset {source_offset}, bytes {payload_bytes}, file bytes {file_bytes}."
+            )
+
+        file_key = (str(path.resolve()), file_bytes)
+        mapped = self._host_files.get(file_key)
+        if mapped is None:
+            mapped = torch.from_file(
+                str(path), shared=False, size=file_bytes, dtype=torch.uint8
+            )
+            self._host_files[file_key] = mapped
+        return mapped.narrow(0, source_offset, payload_bytes)
+
+    def _prepare_payload_table(
+        self, specs: tuple[dict[str, Any], ...], bytes_per_entry: int
+    ):
+        torch = _import_torch()
+        entry_bytes = int(bytes_per_entry)
+        if entry_bytes == 0:
+            if specs:
+                raise PyNTTSpecError(
+                    "PyNTT rdata table has payloads for a zero-sized section."
+                )
+            return torch.empty((0,), dtype=torch.uint8)
+
+        raw = torch.empty((checked_len(len(specs), entry_bytes),), dtype=torch.uint8)
+        for index, spec in enumerate(specs):
+            raw.narrow(0, index * entry_bytes, entry_bytes).copy_(
+                self._map_payload(spec)
+            )
+        return raw
 
 _GLOBAL_WORKSPACE_POOL = WorkspacePool()
 _GLOBAL_RDATA_CACHE = RDataCache()
@@ -158,61 +231,101 @@ def allocate_workspace(inputs: tuple[Any, ...], elements: int, dtype: str):
     return _GLOBAL_WORKSPACE_POOL.allocate(inputs, "global", elements, dtype)
 
 
-def materialize_rdata(inputs: tuple[Any, ...], payload: str, byte_count: int):
+def materialize_rdata(
+    inputs: tuple[Any, ...], payload: Mapping[str, Any] | None, byte_count: int
+):
     """Materialize one readonly data payload as a CUDA uint8 tensor."""
     return _GLOBAL_RDATA_CACHE.materialize_payload(inputs, payload, byte_count)
 
 
-def materialize_rdata_table(inputs: tuple[Any, ...], payloads: tuple[str, ...], bytes_per_entry: int):
+def materialize_rdata_table(
+    inputs: tuple[Any, ...],
+    payloads: tuple[Mapping[str, Any], ...],
+    bytes_per_entry: int,
+):
     """Materialize per-shard readonly data payloads as one flat uint8 tensor."""
     return _GLOBAL_RDATA_CACHE.materialize_table(inputs, tuple(payloads), bytes_per_entry)
 
 
-def _decode_payload(payload: str, byte_count: int) -> bytearray:
-    if byte_count == 0:
-        if payload:
-            raise PyNTTSpecError("PyNTT rdata payload is non-empty for a zero-sized section.")
-        return bytearray()
+_PAYLOAD_SPEC_KEYS = {
+    "source",
+    "source_offset_bytes",
+    "bytes",
+}
 
-    if payload.startswith("file:"):
-        raw = bytearray(Path(payload[5:]).read_bytes())
-    else:
-        raise PyNTTSpecError("PyNTT rdata payloads must be binary files.")
-    if len(raw) != int(byte_count):
+
+def _normalize_payload_spec(
+    payload: Mapping[str, Any] | None, byte_count: int
+) -> dict[str, Any] | None:
+    expected_bytes = int(byte_count)
+    if expected_bytes < 0:
         raise PyNTTSpecError(
-            f"PyNTT rdata payload size mismatch: expected {byte_count} bytes, got {len(raw)}."
+            f"PyNTT rdata byte count must be non-negative, got {expected_bytes}."
         )
-    return raw
+    if expected_bytes == 0:
+        if payload is not None:
+            raise PyNTTSpecError(
+                "PyNTT rdata payload must be None for a zero-sized section."
+            )
+        return None
+    return _require_payload_spec(payload, expected_bytes)
 
 
-def _decode_payload_table(payloads: tuple[str, ...], bytes_per_entry: int) -> bytearray:
-    entry_bytes = int(bytes_per_entry)
-    if entry_bytes == 0:
-        if payloads:
-            raise PyNTTSpecError("PyNTT rdata table has payloads for a zero-sized section.")
-        return bytearray()
+def _require_payload_spec(
+    payload: Mapping[str, Any] | None, expected_bytes: int
+) -> dict[str, Any]:
+    if not isinstance(payload, Mapping):
+        raise PyNTTSpecError(
+            "PyNTT non-empty rdata payload must be a structured payload spec."
+        )
+    unknown = set(payload) - _PAYLOAD_SPEC_KEYS
+    missing = _PAYLOAD_SPEC_KEYS - set(payload)
+    if unknown or missing:
+        raise PyNTTSpecError(
+            "PyNTT rdata payload spec fields mismatch: "
+            f"missing={sorted(missing)}, unknown={sorted(unknown)}."
+        )
 
-    raw = bytearray(checked_total := checked_len(len(payloads), entry_bytes))
-    offset = 0
-    for payload in payloads:
-        entry = _decode_payload(payload, entry_bytes)
-        raw[offset:offset + entry_bytes] = entry
-        offset += entry_bytes
-    if len(raw) != checked_total:
-        raise PyNTTSpecError("PyNTT rdata table payload size mismatch.")
-    return raw
+    source = payload["source"]
+    source_offset = int(payload["source_offset_bytes"])
+    payload_bytes = int(payload["bytes"])
+    if not isinstance(source, str) or not source:
+        raise PyNTTSpecError("PyNTT rdata payload source must be a non-empty string.")
+    if source_offset < 0:
+        raise PyNTTSpecError("PyNTT rdata payload source offset must be non-negative.")
+    if payload_bytes != int(expected_bytes):
+        raise PyNTTSpecError(
+            f"PyNTT rdata payload size mismatch: expected {expected_bytes} bytes, "
+            f"got {payload_bytes}."
+        )
+    return {
+        "source": source,
+        "source_offset_bytes": source_offset,
+        "bytes": payload_bytes,
+    }
+
+
+def _payload_identity(spec: Mapping[str, Any]) -> tuple[Any, ...]:
+    return tuple(spec[key] for key in sorted(_PAYLOAD_SPEC_KEYS))
+
+
+def _empty_host_payload():
+    torch = _import_torch()
+    return torch.empty((0,), dtype=torch.uint8)
+
+
+def _empty_device_payload(device: Any):
+    torch = _import_torch()
+    return torch.empty((0,), dtype=torch.uint8, device=device)
 
 
 def checked_len(count: int, size: int) -> int:
     return int(count) * int(size)
 
 
-def _bytes_to_tensor(raw: bytearray, device: Any):
-    torch = _import_torch()
-    if not raw:
-        return torch.empty((0,), dtype=torch.uint8, device=device)
-
-    host = torch.frombuffer(raw, dtype=torch.uint8)
-    if torch.device(device).type == "cpu":
+def _bytes_to_tensor(host: Any, device: Any):
+    if host.numel() == 0:
+        return _empty_device_payload(device)
+    if _import_torch().device(device).type == "cpu":
         return host
     return host.to(device=device)

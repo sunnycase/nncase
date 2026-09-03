@@ -5,6 +5,7 @@ using System.Collections.Generic;
 using Microsoft.Extensions.DependencyInjection;
 using Nncase.Evaluator;
 using Nncase.IR;
+using Nncase.IR.Distributed;
 using Nncase.TIR;
 using Xunit;
 
@@ -65,6 +66,36 @@ public class UnitTestTBuffer
         // var aptr2 = Ab.AccessPtr(AccessMode.ReadWrite, offset: 100 + 100 + v);
 
         // Testing.AssertExprEqual(aptr2.Arguments[1], v + 200);
+    }
+
+    [Fact]
+    public void TestTensorViewDropsDistributedStorageKind()
+    {
+        var tensorType = new TensorType(DataTypes.Float32, new[] { 8 });
+        var distributedType = new DistributedType(
+            tensorType,
+            new SBP[] { SBP.B },
+            new Placement(new[] { 4 }, "b", "b"));
+        var physicalBuffer = new PhysicalBuffer(4, 32, MemoryLocation.Data);
+        var source = new Buffer(
+            "source",
+            DataTypes.Float32,
+            new MemSpan(physicalBuffer),
+            new Dimension[] { 8 },
+            new Dimension[] { 1 },
+            distributedType,
+            distributedStorageKind: DistributedBufferStorageKind.CanonicalGlobal);
+        Assert.True(IR.Affine.BufferViewUtility.TryCreate(distributedType, tensorType, out var transform));
+
+        var view = IR.Affine.BufferViewUtility.CreateLogicalBufferView(
+            source,
+            tensorType,
+            transform,
+            "tensor_view");
+
+        Assert.Null(view.DistributedType);
+        Assert.Equal(DistributedBufferStorageKind.CompactLocal, view.DistributedStorageKind);
+        Assert.Same(source.MemSpan.Buffer, view.MemSpan.Buffer);
     }
 
     // [Fact]

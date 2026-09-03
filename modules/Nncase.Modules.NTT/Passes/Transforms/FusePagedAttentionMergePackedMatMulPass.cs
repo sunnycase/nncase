@@ -117,11 +117,12 @@ public sealed class FusePagedAttentionMergePackedMatMulPass : ModulePass
         }
 
         var mergeArguments = mergeCall.Arguments.ToArray();
-        if (mergeArguments.Length < 4 ||
+        if (mergeArguments.Length < 5 ||
             mergeArguments[0] is not TIR.Buffer maxState ||
             mergeArguments[1] is not TIR.Buffer sumState ||
             mergeArguments[2] is not TIR.Buffer accState ||
-            mergeArguments[3] is not TIR.Buffer mergedOutput ||
+            mergeArguments[3] is not None ||
+            mergeArguments[4] is not TIR.Buffer mergedOutput ||
             !ExactBufferRegionComparer.Instance.Equals(mergedOutput, lhs) ||
             lhs.Rank != 2 ||
             output.Rank != 2 ||

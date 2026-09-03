@@ -3,6 +3,7 @@
 
 using DryIoc;
 using Nncase.Hosting;
+using Nncase.IR.Heterogeneous;
 using Nncase.IR.NN;
 
 namespace Nncase;
@@ -42,6 +43,7 @@ internal partial class CoreModule : IApplicationPart
         registrator.Register<ValueType, PagedAttentionKVCacheType>(reuse: Reuse.Singleton);
         registrator.Register<ValueType, SamplerStateType>(reuse: Reuse.Singleton);
         registrator.Register<ValueType, GatedDeltaNetStateType>(reuse: Reuse.Singleton);
+        registrator.Register<ValueType, PipelineChannelType>(reuse: Reuse.Singleton);
 
         // Mask types
         RegisterMaskTypes(registrator);

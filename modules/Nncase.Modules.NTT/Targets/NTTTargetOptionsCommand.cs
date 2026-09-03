@@ -90,7 +90,7 @@ public sealed class NTTTargetOptionsCommand : Command
         Add(HierarchyBandWidthsOption);
         TargetMachineOption = new Option<string>(
             name: "--target-machine",
-            description: "the canonical target machine model used by cost evaluation and AutoTiling.",
+            description: "the canonical target machine model used by cost evaluation and kernel selection.",
             getDefaultValue: () => defaultTargetMachine);
         Add(TargetMachineOption);
         DistributedSchemeOption = new Option<string>(

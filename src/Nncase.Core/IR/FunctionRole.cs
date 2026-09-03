@@ -19,6 +19,25 @@ public enum FunctionRole
     Dispatch,
 
     /// <summary>
+    /// Host-side dispatcher whose callees belong to different backend modules.
+    /// It is preserved through target lowering and interpreted by the owning
+    /// host runtime.
+    /// </summary>
+    ModuleDispatch,
+
+    /// <summary>
+    /// One persistent execution worker for a module in a heterogeneous pipeline.
+    /// Calls within the worker are backend-local device or block functions.
+    /// </summary>
+    PipelineWorker,
+
+    /// <summary>
+    /// Backend-local projection of one semantic function in a heterogeneous
+    /// pipeline. The call boundary is part of the persistent pipeline structure.
+    /// </summary>
+    PipelineProjection,
+
+    /// <summary>
     /// A schedule-selected compute region owned by the backend below the block hierarchy.
     /// </summary>
     ScheduledRegion,

@@ -69,6 +69,11 @@ public class ExprGraphConvertor<TVertex, TEdge> : ExprVisitor<TVertex, Unit, IMu
     {
         var target = (TVertex)TVertex.Create(expr);
         graph.AddVertex(target);
+        if (expr is BaseFunction function && !CanVisitFunctionBody(function))
+        {
+            return target;
+        }
+
         int count = 0;
         foreach (var item in expr.Operands)
         {

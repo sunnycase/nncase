@@ -19,12 +19,15 @@ namespace Nncase.Passes.Transforms;
 
 public sealed class ModulePartitionPass : ModulePass
 {
-    public ModulePartitionPass(IModuleCompiler moduleCompiler)
+    public ModulePartitionPass(IModuleCompiler moduleCompiler, bool requireAssignedPlacement = false)
     {
         ModuleCompiler = moduleCompiler;
+        RequireAssignedPlacement = requireAssignedPlacement;
     }
 
     public IModuleCompiler ModuleCompiler { get; }
+
+    public bool RequireAssignedPlacement { get; }
 
     protected override Task<IRModule> RunCoreAsync(IRModule module, RunPassContext context)
     {
@@ -37,15 +40,33 @@ public sealed class ModulePartitionPass : ModulePass
             }
 
             Function pre = function;
+            if (RequireAssignedPlacement &&
+                pre.Role != FunctionRole.ModuleDispatch &&
+                string.Equals(pre.ModuleKind, ModuleCompiler.ModuleKind, StringComparison.Ordinal))
+            {
+                var owned = pre.With(
+                    pre.Name,
+                    ModuleCompiler.ModuleKind,
+                    pre.Body,
+                    pre.Parameters.ToArray(),
+                    pre.Role);
+                module.Replace(i, owned);
+                continue;
+            }
+
+            var functionCountBeforePartition = module.Functions.Count;
             var postBody = PerformPartition(module, pre.Name, pre.Body);
-            var post = pre.With(pre.Name, pre.ModuleKind, postBody, pre.Parameters.ToArray());
+            var role = module.Functions.Count > functionCountBeforePartition
+                ? FunctionRole.ModuleDispatch
+                : pre.Role;
+            var post = pre.With(pre.Name, pre.ModuleKind, postBody, pre.Parameters.ToArray(), role);
             module.Replace(i, post);
         }
 
         return Task.FromResult(module);
     }
 
-    private Expr PerformPartition(IRModule module, string funcName, BaseExpr pre)
+    private BaseExpr PerformPartition(IRModule module, string funcName, BaseExpr pre)
     {
         var dynamicVars = IRHelpers.GetDynamicDimVars();
 
@@ -65,10 +86,17 @@ public sealed class ModulePartitionPass : ModulePass
                 return expr switch
                 {
                     Const => true,
-                    Call call => ModuleCompiler.IsSupportedCall(call, CompileSession.CompileOptions),
+                    Call call => IsSelectedCall(call),
                     _ => false,
                 };
             }
+
+            bool IsSelectedCall(Call call)
+                => IsCallOwnedByModule(
+                    call,
+                    ModuleCompiler,
+                    CompileSession.CompileOptions,
+                    RequireAssignedPlacement);
 
             bool isSupport = false;
             switch (arg.Edge.Source.Expr, arg.Edge.Target.Expr)
@@ -109,29 +137,60 @@ public sealed class ModulePartitionPass : ModulePass
                         Var var => $"%{var.Name}#{var.GlobalVarIndex})",
                         Op op => $"op({op.GetType().Name})",
                         BaseFunction f => $"func({f.Name})",
-                        Expr e => $"{e.GetType().Name}",
-                        _ => throw new NotImplementedException(),
+                        BaseExpr expr => expr.GetType().Name,
                     };
                 };
             });
         }
 
         // 3. reconstruction
-        var constructor = new DistributedReconstructor(module, funcName, ModuleCompiler, CompileSession.CompileOptions, condenseAlgo);
-        var post = constructor.Construct();
-        return (Expr)post;
+        var constructor = new DistributedReconstructor(
+            module,
+            funcName,
+            ModuleCompiler,
+            CompileSession.CompileOptions,
+            RequireAssignedPlacement,
+            condenseAlgo);
+        return constructor.Construct();
+    }
+
+    internal static bool IsCallOwnedByModule(
+        Call call,
+        IModuleCompiler moduleCompiler,
+        CompileOptions compileOptions,
+        bool requireAssignedPlacement)
+    {
+        if (call.Target is BaseFunction callee)
+        {
+            return callee.Role != FunctionRole.ModuleDispatch &&
+                string.Equals(callee.ModuleKind, moduleCompiler.ModuleKind, StringComparison.Ordinal);
+        }
+
+        return moduleCompiler.IsSupportedCall(call, compileOptions) &&
+            (!requireAssignedPlacement ||
+             string.Equals(
+                 call.Metadata.ExecutionModuleKind,
+                 moduleCompiler.ModuleKind,
+                 StringComparison.Ordinal));
     }
 }
 
 internal sealed class DistributedReconstructor : ExprReconstructor<ExprVertex, ExprEdge>
 {
-    public DistributedReconstructor(IRModule module, string funcName, IModuleCompiler moduleCompiler, CompileOptions compileOptions, CondensationGraphAlgorithm<ExprVertex, ExprEdge> algo)
+    public DistributedReconstructor(
+        IRModule module,
+        string funcName,
+        IModuleCompiler moduleCompiler,
+        CompileOptions compileOptions,
+        bool requireAssignedPlacement,
+        CondensationGraphAlgorithm<ExprVertex, ExprEdge> algo)
         : base(algo)
     {
         Module = module;
         FuncName = funcName;
         ModuleCompiler = moduleCompiler;
         CompileOptions = compileOptions;
+        RequireAssignedPlacement = requireAssignedPlacement;
     }
 
     public IRModule Module { get; }
@@ -142,15 +201,24 @@ internal sealed class DistributedReconstructor : ExprReconstructor<ExprVertex, E
 
     public CompileOptions CompileOptions { get; }
 
+    public bool RequireAssignedPlacement { get; }
+
     protected override BaseExpr OnAtomCluster(ClusteredBidirectionalGraph<ExprVertex, ExprEdge> cluster, int sortIndex)
     {
-        if (cluster.Vertices.First().Expr is Call call && ModuleCompiler.IsSupportedCall(call, CompileOptions))
+        if (cluster.Vertices.First().Expr is Call call && IsSelectedCall(call))
         {
             return OnComplexCluster(cluster, sortIndex);
         }
 
         return base.OnAtomCluster(cluster, sortIndex);
     }
+
+    private bool IsSelectedCall(Call call)
+        => ModulePartitionPass.IsCallOwnedByModule(
+            call,
+            ModuleCompiler,
+            CompileOptions,
+            RequireAssignedPlacement);
 
     protected override Expr OnComplexCluster(ClusteredBidirectionalGraph<ExprVertex, ExprEdge> cluster, int sortIndex)
     {
@@ -173,6 +241,18 @@ internal sealed class DistributedReconstructor : ExprReconstructor<ExprVertex, E
 
         foreach (var (pre, post) in pairs)
         {
+            if (pre is DimVar dimension)
+            {
+                if (processedParams.Add(dimension))
+                {
+                    extractDict.Add(dimension, dimension);
+                    @params.Add(dimension);
+                    arguments.Add(post);
+                }
+
+                continue;
+            }
+
             if (pre is not (Call or Var or If or IR.Tuple))
             {
                 continue;

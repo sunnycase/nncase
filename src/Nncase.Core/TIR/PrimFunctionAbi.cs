@@ -115,7 +115,7 @@ public static class PrimFunctionAbi
         for (var resultIndex = 0; resultIndex < results.Length; resultIndex++)
         {
             var value = function.Results.Values[resultIndex];
-            var storage = ResolveResultStorage(function, resultIndex, value);
+            var storage = GetResultStorage(function, resultIndex, value);
             if (!storages.Contains(storage))
             {
                 throw new InvalidOperationException(
@@ -128,7 +128,10 @@ public static class PrimFunctionAbi
         return new PrimFunctionAbiView(inputs, outputs, results, workspaces);
     }
 
-    private static IVar ResolveResultStorage(PrimFunction function, int resultIndex, Expr value)
+    /// <summary>
+    /// Resolves the ABI parameter that owns one logical result's storage.
+    /// </summary>
+    public static IVar GetResultStorage(PrimFunction function, int resultIndex, Expr value)
     {
         if (value is IVar variable)
         {

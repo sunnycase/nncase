@@ -36,7 +36,7 @@ public abstract class NTTTarget : Target
 
     public override IReadOnlyList<IModuleCompiler> ModuleCompilers { get; }
 
-    public override bool IsAutoTilingEnabled => true;
+    public override bool IsAutoTilingEnabled => false;
 
     protected abstract INTTModuleCompiler NTTModuleCompiler { get; }
 
@@ -55,18 +55,9 @@ public abstract class NTTTarget : Target
         return (cmd, ParseTargetCompileOptions);
     }
 
-    public override void RegisterAffineSelectionPass(IPassManager passManager, CompileOptions options)
-    {
-        passManager.Add<NTTAffineSelectionPass>(NTTModuleCompiler.ModuleKind);
-    }
-
     public override void RegisterAutoTilingPass(IPassManager passManager, CompileOptions options)
     {
-        RegisterAffineSelectionPass(passManager, options);
-        passManager.AddWithName<AutoTilePass>($"AutoTiling_{NTTModuleCompiler.ModuleKind}", NTTModuleCompiler.ModuleKind);
-        passManager.Add<AddFunctionToModule>();
-        passManager.Add<InferRangePass>();
-        passManager.Add<OptimizeByRangePass>();
+        // NTT kernels own all block-local cache tiling and SIMD scheduling.
     }
 
     public override void RegisterAutoPackingRules(IRulesAddable pass, CompileOptions options)
@@ -168,6 +159,6 @@ public abstract class NTTTarget : Target
             p.Add<Passes.Rules.NTT.FusePackedMatMulAdd>();
             p.Add<Passes.Rules.NTT.FusePackedMatMulAddThroughShardedView>();
         });
-        passManager.Add<FusePackedMatMulNormStatsPass>(true, false);
+        passManager.Add<FusePackedMatMulNormStatsPass>(true, false, false);
     }
 }

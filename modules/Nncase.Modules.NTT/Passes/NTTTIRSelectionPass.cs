@@ -193,6 +193,15 @@ public sealed class NTTTIRSelectionPass : TIRSelectionPass
                     blockScaledMatmul.WeightBlockN,
                     blockScaledMatmul.WeightBlockK,
                     (Expr)arguments[IR.NTT.PackedBlockScaledMatMul.Addend.Index]);
+            case IR.Math.BlockScaledMatMul blockScaledMatmul:
+                return TIR.F.NTT.BlockScaledMatMul(
+                    (Expr)arguments[IR.Math.BlockScaledMatMul.Lhs.Index],
+                    (Expr)arguments[IR.Math.BlockScaledMatMul.Rhs.Index],
+                    (Expr)arguments[IR.Math.BlockScaledMatMul.RhsScale.Index],
+                    output,
+                    blockScaledMatmul.OutputDataType,
+                    blockScaledMatmul.WeightBlockN,
+                    blockScaledMatmul.WeightBlockK);
             case IR.NTT.PackedNVFP4MatMul nvfp4MatMul:
                 return TIR.F.NTT.NVFP4MatMul(
                     (Expr)arguments[IR.NTT.PackedNVFP4MatMul.Lhs.Index],
@@ -201,7 +210,30 @@ public sealed class NTTTIRSelectionPass : TIRSelectionPass
                     (Expr)arguments[IR.NTT.PackedNVFP4MatMul.LhsGlobalScale.Index],
                     (Expr)arguments[IR.NTT.PackedNVFP4MatMul.RhsGlobalScale.Index],
                     output,
-                    nvfp4MatMul.GroupSize);
+                    nvfp4MatMul.GroupSize,
+                    (Expr)arguments[IR.NTT.PackedNVFP4MatMul.Addend.Index]);
+            case IR.NTT.PackedNVFP4MatMulNormStats nvfp4MatMulNormStats:
+                {
+                    var outputBase = Unsafe.As<Expr, BaseExpr>(ref output);
+                    if (outputBase is not IR.Tuple outputs || outputs.Count != 2)
+                    {
+                        throw new NotSupportedException(
+                            "PackedNVFP4MatMulNormStats TIR selection expects value and local-statistics outputs.");
+                    }
+
+                    return TIR.F.NTT.NVFP4MatMulNormStats(
+                        (Expr)arguments[IR.NTT.PackedNVFP4MatMulNormStats.Lhs.Index],
+                        (Expr)arguments[IR.NTT.PackedNVFP4MatMulNormStats.RhsPacked.Index],
+                        (Expr)arguments[IR.NTT.PackedNVFP4MatMulNormStats.RhsScale.Index],
+                        (Expr)arguments[IR.NTT.PackedNVFP4MatMulNormStats.LhsGlobalScale.Index],
+                        (Expr)arguments[IR.NTT.PackedNVFP4MatMulNormStats.RhsGlobalScale.Index],
+                        (Expr)outputs[0],
+                        (Expr)outputs[1],
+                        (Expr)arguments[IR.NTT.PackedNVFP4MatMulNormStats.Addend.Index],
+                        nvfp4MatMulNormStats.GroupSize,
+                        nvfp4MatMulNormStats.Axis,
+                        nvfp4MatMulNormStats.UseMean);
+                }
             case IR.NTT.PackedBlockScaledMatMulNormStats blockScaledMatmulNormStats:
                 {
                     var outputBase = Unsafe.As<Expr, BaseExpr>(ref output);
@@ -361,7 +393,9 @@ public sealed class NTTTIRSelectionPass : TIRSelectionPass
                         (Expr)outputs[2],
                         qkv.NumHeads,
                         qkv.NumKvHeads,
-                        qkv.RhsLayout);
+                        qkv.RhsLayout,
+                        qkv.OutputNVectorLaneCount,
+                        qkv.QuantizationMode);
                 }
 
             case IR.NN.QKVParallelLinear qkv:
@@ -390,7 +424,8 @@ public sealed class NTTTIRSelectionPass : TIRSelectionPass
                         (Expr)outputs[1],
                         (Expr)outputs[2],
                         qkv.NumHeads,
-                        qkv.NumKvHeads);
+                        qkv.NumKvHeads,
+                        qkv.QuantizationMode);
                 }
 
             case IR.NN.QKVRoPEWithCache fused:
@@ -611,6 +646,7 @@ public sealed class NTTTIRSelectionPass : TIRSelectionPass
                     (Expr)arguments[IR.NTT.PagedAttentionCombine.MaxState.Index],
                     (Expr)arguments[IR.NTT.PagedAttentionCombine.SumState.Index],
                     (Expr)arguments[IR.NTT.PagedAttentionCombine.AccState.Index],
+                    (Expr)arguments[IR.NTT.PagedAttentionCombine.OutputGate.Index],
                     output,
                     combineAttention.Layout,
                     combineAttention.HiddenSize,
@@ -696,17 +732,24 @@ public sealed class NTTTIRSelectionPass : TIRSelectionPass
                         "requires a caller-allocated TIR.Buffer.");
                 }
 
-                if (compactActualBuffer is not
+                var compactOutput = compactActualBuffer;
+                if (compactOutput is not
                     {
                         DistributedStorageKind: DistributedBufferStorageKind.CompactPerOwner,
                         MemSpan.Buffer.Location: MemoryLocation.ChipLocalData,
                     })
                 {
-                    prepared[index] = CreateCompactCallerOutputBacking(
+                    compactOutput = CreateCompactCallerOutputBacking(
                         compactActualBuffer,
                         primFunction.Name,
                         compactOutputParameter,
                         context);
+                    prepared[index] = compactOutput;
+                }
+
+                if (TryGetCanonicalCompactComponentBase(compactOutput, out var componentBase, out _))
+                {
+                    _shardedComponentBases.TryAdd(compactOutput, componentBase);
                 }
 
                 continue;
@@ -781,6 +824,98 @@ public sealed class NTTTIRSelectionPass : TIRSelectionPass
         return compact;
     }
 
+    protected override BaseExpr FinalizeCallerAllocatedPrimFunctionResult(
+        TIR.PrimFunction primFunction,
+        int resultIndex,
+        BaseExpr storage,
+        BaseExpr result,
+        TIRSelectionContext context)
+    {
+        if (storage is TIR.Buffer storageBuffer &&
+            result is TIR.Buffer resultBuffer &&
+            _shardedComponentBases.TryGetValue(storageBuffer, out var componentBase))
+        {
+            if (!ReferenceEquals(storageBuffer.MemSpan.Buffer, resultBuffer.MemSpan.Buffer))
+            {
+                throw new InvalidOperationException(
+                    $"PrimFunction {primFunction.Name} result {resultIndex} changed its caller-owned physical backing.");
+            }
+
+            _shardedComponentBases.TryAdd(resultBuffer, componentBase);
+        }
+
+        return result;
+    }
+
+    private bool TryGetCanonicalCompactComponentBase(
+        TIR.Buffer buffer,
+        out Dimension componentBase,
+        out string reason)
+    {
+        componentBase = Dimension.Zero;
+        reason = string.Empty;
+        if (buffer.DistributedType is not { Partial: null } distributedType ||
+            buffer.DistributedStorageKind != DistributedBufferStorageKind.CompactPerOwner)
+        {
+            reason = "the buffer is not a non-partial CompactPerOwner distributed value";
+            return false;
+        }
+
+        if (!DistributedUtility.IsFullyShardedAcrossPlacement(distributedType))
+        {
+            reason = "not every placement axis participates in a tensor split";
+            return false;
+        }
+
+        if (distributedType.AxisPolicies.OfType<SBPSplit>().Any(split => !split.IsContiguous))
+        {
+            reason = "at least one split stage is non-contiguous";
+            return false;
+        }
+
+        var (globalSize, globalStrides) = TensorUtilities.GetTensorMaxSizeAndStridesExpr(
+            distributedType.TensorType,
+            null);
+        var ownerCount = distributedType.Placement.Hierarchy.Aggregate(
+            1L,
+            (product, extent) => checked(product * extent));
+        if (!(buffer.MemSpan.Size * ownerCount).Simplify().Equals(globalSize.Simplify()) ||
+            ownerCount > int.MaxValue)
+        {
+            reason = $"owner components span {(buffer.MemSpan.Size * ownerCount).Simplify()} bytes, " +
+                $"but the canonical tensor spans {globalSize.Simplify()} bytes";
+            return false;
+        }
+
+        for (var ownerIndex = 0; ownerIndex < ownerCount; ownerIndex++)
+        {
+            var shardCoordinates = DistributedUtility.GetUnraveledIndex(
+                checked((int)ownerIndex),
+                distributedType.Placement.Hierarchy.ToArray());
+            var descriptor = DistributedUtility.GetLocalShardDescriptor(
+                distributedType,
+                shardCoordinates,
+                DistributedUtility.DivideFlags.MaxShape);
+            if (!descriptor.TryGetContiguousRegion(out var localOffset, out _))
+            {
+                reason = $"owner {ownerIndex} does not describe one contiguous tensor region";
+                return false;
+            }
+
+            var canonicalByteOffset = (TensorUtilities.GetLinearOffset(globalStrides, localOffset) *
+                distributedType.TensorType.DType.SizeInBytes).Simplify();
+            var compactByteOffset = (ownerIndex * buffer.MemSpan.Size).Simplify();
+            if (!canonicalByteOffset.Equals(compactByteOffset))
+            {
+                reason = $"owner {ownerIndex} starts at canonical byte offset {canonicalByteOffset}, " +
+                    $"but compact owner order places it at {compactByteOffset}";
+                return false;
+            }
+        }
+
+        return true;
+    }
+
     private Expr GeneratePagedAttention(
         Call sourceCall,
         IR.NN.PagedAttention pagedAttention,
@@ -794,6 +929,7 @@ public sealed class NTTTIRSelectionPass : TIRSelectionPass
             (Expr)arguments[2],
             (Expr)arguments[3],
             (Dimension)arguments[4],
+            (Expr)arguments[5],
             output,
             pagedAttention.Layout,
             pagedAttention.HiddenSize);
@@ -877,6 +1013,7 @@ public sealed class NTTTIRSelectionPass : TIRSelectionPass
             partialMax,
             partialSum,
             partialAcc,
+            (Expr)arguments[5],
             mergeOutput,
             pagedAttention.Layout,
             pagedAttention.HiddenSize,
@@ -887,6 +1024,7 @@ public sealed class NTTTIRSelectionPass : TIRSelectionPass
             partialMax,
             partialSum,
             partialAcc,
+            (Expr)arguments[5],
             mergeOutput,
             pagedAttention.Layout,
             pagedAttention.HiddenSize,
@@ -928,6 +1066,7 @@ public sealed class NTTTIRSelectionPass : TIRSelectionPass
         Expr maxState,
         Expr sumState,
         Expr accState,
+        Expr outputGate,
         Expr output,
         IRArray<IR.NN.AttentionDimKind> layout,
         int hiddenSize,
@@ -941,6 +1080,7 @@ public sealed class NTTTIRSelectionPass : TIRSelectionPass
                 maxState,
                 sumState,
                 accState,
+                outputGate,
                 output,
                 layout,
                 hiddenSize,
@@ -968,6 +1108,7 @@ public sealed class NTTTIRSelectionPass : TIRSelectionPass
             (Expr)states[0],
             (Expr)states[1],
             (Expr)states[2],
+            None.Default,
             None.Default,
             partial.Layout,
             partial.HiddenSize,
@@ -1121,8 +1262,13 @@ public sealed class NTTTIRSelectionPass : TIRSelectionPass
         {
             if (!_shardedComponentBases.TryGetValue(source, out var componentBase))
             {
-                throw new InvalidOperationException(
-                    $"ChipLocalData buffer {source.Name} reached ShardedView without a canonical component-base binding.");
+                if (TryGetCanonicalCompactComponentBase(source, out componentBase, out _))
+                {
+                    _shardedComponentBases.Add(source, componentBase);
+                    return (source, componentBase);
+                }
+
+                return PromoteCompactPerOwnerBackingToCanonical(source, context);
             }
 
             return (source, componentBase);
@@ -1197,6 +1343,75 @@ public sealed class NTTTIRSelectionPass : TIRSelectionPass
 
         var canonicalSource = rewrittenBuffers[source];
         return (canonicalSource, _shardedComponentBases[canonicalSource]);
+    }
+
+    private (TIR.Buffer Buffer, Dimension ComponentBase) PromoteCompactPerOwnerBackingToCanonical(
+        TIR.Buffer source,
+        TIRSelectionContext context)
+    {
+        var oldPhysicalBuffer = source.MemSpan.Buffer;
+        if (source.DistributedStorageKind != DistributedBufferStorageKind.CompactPerOwner ||
+            oldPhysicalBuffer.Location != MemoryLocation.ChipLocalData ||
+            oldPhysicalBuffer.Start is not None)
+        {
+            throw new InvalidOperationException(
+                $"Cannot promote {source.Name} from {source.DistributedStorageKind}/" +
+                $"{oldPhysicalBuffer.Location}/{oldPhysicalBuffer.Start.GetType().Name} to canonical storage.");
+        }
+
+        var userBuffers = oldPhysicalBuffer.Users
+            .OfType<TIR.MemSpan>()
+            .SelectMany(memSpan => memSpan.Users.OfType<TIR.Buffer>())
+            .Distinct((IEqualityComparer<TIR.Buffer>)ReferenceEqualityComparer.Instance)
+            .ToArray();
+        if (!userBuffers.Contains(source, (IEqualityComparer<TIR.Buffer>)ReferenceEqualityComparer.Instance))
+        {
+            throw new InvalidOperationException(
+                $"Compact-per-owner source {source.Name} is not attached to its physical buffer.");
+        }
+
+        var alignment = oldPhysicalBuffer.Alignment;
+        Dimension physicalSize = Dimension.Zero;
+        foreach (var buffer in userBuffers)
+        {
+            if (buffer.DistributedType is not { Partial: null } distributedType ||
+                buffer.DistributedStorageKind != DistributedBufferStorageKind.CompactPerOwner ||
+                !buffer.MemSpan.Start.Simplify().Equals(Dimension.Zero))
+            {
+                throw new InvalidOperationException(
+                    $"Cannot promote compact-per-owner backing shared with {buffer.Name}: every alias must " +
+                    "be a non-partial distributed component rooted at byte offset zero.");
+            }
+
+            var (_, _, byteSpanSize) = GetShardedBufferLayout(distributedType);
+            alignment = Math.Max(alignment, distributedType.TensorType.DType.SizeInBytes);
+            physicalSize = Dimension.Max(physicalSize, byteSpanSize).Simplify();
+        }
+
+        var canonicalPhysicalBuffer = new TIR.PhysicalBuffer(
+            alignment,
+            physicalSize,
+            MemoryLocation.ChipLocalData);
+        var rewrittenBuffers = new Dictionary<TIR.Buffer, TIR.Buffer>(
+            ReferenceEqualityComparer.Instance);
+        foreach (var buffer in userBuffers)
+        {
+            var rewritten = CreateCanonicalShardedBuffer(
+                buffer,
+                canonicalPhysicalBuffer,
+                buffer.DistributedType!,
+                Dimension.Zero);
+            rewrittenBuffers.Add(buffer, rewritten);
+            _shardedComponentBases.Add(rewritten, Dimension.Zero);
+        }
+
+        foreach (var (buffer, rewritten) in rewrittenBuffers)
+        {
+            ReplaceUtility.ReplaceAllUsesWith(buffer, rewritten);
+            context.ReplaceSelectedValue(buffer, rewritten);
+        }
+
+        return (rewrittenBuffers[source], Dimension.Zero);
     }
 
     private TIR.Buffer CanonicalizeCallerOutputBacking(
@@ -1435,7 +1650,20 @@ public sealed class NTTTIRSelectionPass : TIRSelectionPass
                 $"{opName} cannot create a storage-preserving buffer view from {inputType} to {outputType}.");
         }
 
-        return BufferViewUtility.CreateLogicalBufferView(input, outputType, transform, output.Name);
+        try
+        {
+            return BufferViewUtility.CreateLogicalBufferView(input, outputType, transform, output.Name);
+        }
+        catch (NotSupportedException ex)
+        {
+            throw new NotSupportedException(
+                $"{opName} cannot materialize a storage-preserving view from buffer {input.Name}: " +
+                $"shape=[{StringUtility.Join(',', input.Dimensions)}], " +
+                $"strides=[{StringUtility.Join(',', input.Strides)}], " +
+                $"storage={input.DistributedStorageKind}, sourceType={inputType}, resultType={outputType}. " +
+                ex.Message,
+                ex);
+        }
     }
 
     private TIR.Buffer CreateMetadataBuffer(Expr expr, MemoryLocation location, string namePrefix)
@@ -1511,7 +1739,7 @@ public sealed class NTTTIRSelectionPass : TIRSelectionPass
 
         var packedOutput = Evaluator.IR.NTT.PackedMatMulEvaluator.InferType(
             new IR.NTT.PackedMatMul(
-                sampling.OutputDataType,
+                sampling.AccumulatorDataType,
                 false,
                 sampling.RhsLayout),
             call[IR.NTT.PackedMatMulSamplingPartial.Lhs].CheckedType,
@@ -1543,6 +1771,10 @@ public sealed class NTTTIRSelectionPass : TIRSelectionPass
             (Expr)outputs[2],
             (Expr)arguments[IR.NTT.PackedMatMulSamplingPartial.Scale.Index],
             (Expr)arguments[IR.NTT.PackedMatMulSamplingPartial.Addend.Index],
+            (Expr)arguments[IR.NTT.PackedMatMulSamplingPartial.LhsScale.Index],
+            (Expr)arguments[IR.NTT.PackedMatMulSamplingPartial.RhsScale.Index],
+            sampling.AccumulatorDataType,
+            sampling.OutputDataType,
             sampling.RhsLayout,
             packedOutputType,
             logitsType,

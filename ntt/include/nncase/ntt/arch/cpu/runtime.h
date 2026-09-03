@@ -23,13 +23,14 @@
 
 namespace nncase::ntt::runtime {
 struct cpu_block_entry_params_t {
+    uint32_t function_id;
     size_t bdim;
     size_t cdim;
     size_t bid;
     size_t cid;
     uint8_t enable_profiling;
-    const thread_inout_desc *input_descs;
-    thread_inout_desc *const output_descs;
+    const block_inout_desc *input_descs;
+    block_inout_desc *const output_descs;
     std::span<const std::byte> rdata;
     std::byte *output;
     std::span<const std::byte> block_local_rdata;
@@ -53,6 +54,40 @@ struct cpu_thread_context_t {
 };
 } // namespace nncase::ntt::runtime
 
+/// Stable C tensor descriptor used by the direct host runtime ABI.
+struct ntt_cpu_tensor_desc_t {
+    void *data;
+    size_t size;
+    const size_t *shape;
+    const size_t *strides;
+    size_t rank;
+};
+
+/// Stable C invocation descriptor used by Python and other host schedulers.
+struct ntt_cpu_run_params_t {
+    uint32_t function_id;
+    size_t bdim;
+    size_t cdim;
+    const ntt_cpu_tensor_desc_t *inputs;
+    size_t input_count;
+    ntt_cpu_tensor_desc_t *outputs;
+    size_t output_count;
+    const void *rdata;
+    size_t rdata_size;
+    const void *block_local_rdata;
+    size_t block_local_rdata_size;
+    void *data;
+    size_t data_bytes_per_block;
+    void *block_local_data;
+    size_t block_local_data_bytes_per_block;
+    void *output;
+    size_t output_size;
+};
+
 extern "C" NTT_RUNTIME_API void
 block_entry(const nncase::ntt::runtime::cpu_block_entry_params_t &params);
 using block_entry_t = decltype(block_entry) *;
+
+extern "C" NTT_RUNTIME_API int32_t
+nncase_ntt_cpu_run(const ntt_cpu_run_params_t *params);
+extern "C" NTT_RUNTIME_API const char *nncase_ntt_cpu_last_error();

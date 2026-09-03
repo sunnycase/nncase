@@ -13,7 +13,7 @@ namespace Nncase.Passes.Transforms;
 
 /// <summary>
 /// Canonicalizes PyNTT packed QKV projection weights to one fixed-capacity,
-/// block-local K-major RHS before block microkernel selection.
+/// block-local target layout before block microkernel selection.
 /// </summary>
 public sealed class CanonicalizePackedQKVWeightsPass : ModulePass
 {
@@ -26,14 +26,15 @@ public sealed class CanonicalizePackedQKVWeightsPass : ModulePass
 
     protected override Task<IRModule> RunCoreAsync(IRModule input, RunPassContext context)
     {
-        if (input.Entry is not PrimFunction entry || entry.ModuleKind != _moduleKind)
+        var roots = TIRCallGraphRootUtility.Collect(input, _moduleKind);
+        if (roots.Length == 0)
         {
             throw new InvalidOperationException(
-                $"{nameof(CanonicalizePackedQKVWeightsPass)} expects a {_moduleKind} PrimFunction entry.");
+                $"{nameof(CanonicalizePackedQKVWeightsPass)} found no executable {_moduleKind} TIR root.");
         }
 
         var canonicalizer = new ModuleCanonicalizer(input, _moduleKind);
-        return Task.FromResult(canonicalizer.Run(entry));
+        return Task.FromResult(canonicalizer.Run(input.Entry!, roots));
     }
 
     private sealed class ModuleCanonicalizer
@@ -51,14 +52,17 @@ public sealed class CanonicalizePackedQKVWeightsPass : ModulePass
             _moduleKind = moduleKind;
         }
 
-        public IRModule Run(PrimFunction entry)
+        public IRModule Run(BaseFunction entry, IReadOnlyList<PrimFunction> roots)
         {
-            Discover(entry);
-            if (_plans[entry].ParameterGroups.Count != 0)
+            foreach (var root in roots)
             {
-                throw new InvalidOperationException(
-                    "PyNTT entry ABI cannot expose unfused Q/K/V weight parameters. " +
-                    "Packed QKV weights must resolve to compiler-owned constants before TIR microkernel selection.");
+                Discover(root);
+                if (_plans[root].ParameterGroups.Count != 0)
+                {
+                    throw new InvalidOperationException(
+                        $"PyNTT root {root.Name} ABI cannot expose unfused Q/K/V weight parameters. " +
+                        "Packed QKV weights must resolve to compiler-owned constants before TIR microkernel selection.");
+                }
             }
 
             foreach (var function in _postOrder)
@@ -72,15 +76,25 @@ public sealed class CanonicalizePackedQKVWeightsPass : ModulePass
                 _replacements.Add(function, replacement);
             }
 
+            var rootReplacements = roots.ToDictionary(
+                root => root,
+                root => _replacements[root],
+                new ReferenceEqualityComparer<PrimFunction>());
+            var wrapperReplacements = TIRCallGraphRootUtility.RebindWrappers(_module, rootReplacements);
             var result = new IRModule();
             foreach (var function in _module.Functions)
             {
-                result.Add(function is PrimFunction prim && _replacements.TryGetValue(prim, out var replacement)
-                    ? replacement
-                    : function);
+                result.Add(function switch
+                {
+                    PrimFunction prim when _replacements.TryGetValue(prim, out var replacement) => replacement,
+                    PrimFunctionWrapper wrapper when wrapperReplacements.TryGetValue(wrapper, out var replacement) => replacement,
+                    _ => function,
+                });
             }
 
-            result.Entry = _replacements[entry];
+            result.Entry = entry is PrimFunction primEntry
+                ? _replacements[primEntry]
+                : entry;
             return result;
         }
 
@@ -158,10 +172,12 @@ public sealed class CanonicalizePackedQKVWeightsPass : ModulePass
         public void AddQKVCall(Call call)
         {
             var op = (TIR.NTT.PackedQKVParallelLinear)call.Target;
-            if (op.RhsLayout != IR.NTT.PackedMatMulRhsLayout.KMajor)
+            if (op.RhsLayout is not (
+                IR.NTT.PackedMatMulRhsLayout.KMajor or
+                IR.NTT.PackedMatMulRhsLayout.NMajorKPacked))
             {
                 throw new InvalidOperationException(
-                    "PyNTT packed QKV weight canonicalization requires K-major packed weights.");
+                    $"PyNTT packed QKV weight canonicalization does not support {op.RhsLayout} weights.");
             }
 
             var arguments = call.Arguments.ToArray();
@@ -172,7 +188,11 @@ public sealed class CanonicalizePackedQKVWeightsPass : ModulePass
                 RequireBuffer(arguments[14], "K output", call),
                 RequireBuffer(arguments[15], "V output", call),
             };
-            var layout = FusedWeightLayout.Create(weights, outputs);
+            var layout = FusedWeightLayout.Create(
+                weights,
+                outputs,
+                op.RhsLayout,
+                op.OutputNVectorLaneCount);
             QKVLayouts.Add(call, layout);
 
             if (TryGetParameterTriple(weights, out var triple))
@@ -408,6 +428,8 @@ public sealed class CanonicalizePackedQKVWeightsPass : ModulePass
                     op.NumHeads,
                     op.NumKvHeads,
                     op.RhsLayout,
+                    op.OutputNVectorLaneCount,
+                    op.QuantizationMode,
                     _plan.QKVLayouts[expr].ProjectionNCapacities);
                 return true;
             }
@@ -476,7 +498,7 @@ public sealed class CanonicalizePackedQKVWeightsPass : ModulePass
             var materialization = new ConcatenatedDistributedTensorRDataMaterialization(
                 layout.LocalTensorType,
                 sources,
-                axis: 1);
+                layout.ConcatenationAxis);
             var physical = new PhysicalBuffer(
                 layout.AlignmentBytes,
                 IR.F.Buffer.AddressOf(placeholder),
@@ -522,6 +544,7 @@ public sealed class CanonicalizePackedQKVWeightsPass : ModulePass
         Dimension[] Strides,
         Dimension SizeBytes,
         int AlignmentBytes,
+        int ConcatenationAxis,
         IRArray<DistributedType> SourceDistributedTypes,
         IRArray<long> ProjectionNCapacities)
     {
@@ -531,12 +554,15 @@ public sealed class CanonicalizePackedQKVWeightsPass : ModulePass
                 Strides.SequenceEqual(other.Strides) &&
                 SizeBytes.Equals(other.SizeBytes) &&
                 AlignmentBytes == other.AlignmentBytes &&
+                ConcatenationAxis == other.ConcatenationAxis &&
                 SourceDistributedTypes.SequenceEqual(other.SourceDistributedTypes) &&
                 ProjectionNCapacities.SequenceEqual(other.ProjectionNCapacities);
 
         public static FusedWeightLayout Create(
             IReadOnlyList<TIR.Buffer> weights,
-            IReadOnlyList<TIR.Buffer> outputs)
+            IReadOnlyList<TIR.Buffer> outputs,
+            IR.NTT.PackedMatMulRhsLayout rhsLayout,
+            int outputNVectorLaneCount)
         {
             var localShapes = weights.Select(GetLocalCapacityShape).ToArray();
             if (localShapes.Any(shape => shape.Length != 2) || outputs.Any(output => GetLocalCapacityShape(output).Length != 2))
@@ -545,11 +571,21 @@ public sealed class CanonicalizePackedQKVWeightsPass : ModulePass
                     "PyNTT canonical packed QKV weights require rank-2 local weights and outputs.");
             }
 
-            if (weights.Skip(1).Any(weight => weight.ElemType != weights[0].ElemType) ||
-                localShapes.Skip(1).Any(shape => shape[0] != localShapes[0][0]))
+            var concatenationAxis = rhsLayout switch
+            {
+                IR.NTT.PackedMatMulRhsLayout.KMajor => 1,
+                IR.NTT.PackedMatMulRhsLayout.NMajorKPacked => 0,
+                _ => throw new InvalidOperationException(
+                    $"PyNTT cannot canonicalize packed QKV layout {rhsLayout}."),
+            };
+            var reductionAxis = 1 - concatenationAxis;
+            if (outputNVectorLaneCount <= 0 ||
+                weights.Skip(1).Any(weight => weight.ElemType != weights[0].ElemType) ||
+                localShapes.Skip(1).Any(shape => shape[reductionAxis] != localShapes[0][reductionAxis]))
             {
                 throw new InvalidOperationException(
-                    "PyNTT canonical packed QKV weights require one dtype and one physical K capacity.");
+                    "PyNTT canonical packed QKV weights require a positive output N lane count, " +
+                    "one dtype, and one physical K capacity.");
             }
 
             var sourceDistributedTypes = weights
@@ -557,23 +593,30 @@ public sealed class CanonicalizePackedQKVWeightsPass : ModulePass
                     "PyNTT canonical packed QKV weights require distributed source descriptors."))
                 .ToArray();
 
-            var dimensions = new Dimension[]
-            {
-                localShapes[0][0],
-                checked(localShapes.Sum(shape => shape[1])),
-            };
+            var dimensions = localShapes[0]
+                .Select(extent => (Dimension)extent)
+                .ToArray();
+            dimensions[concatenationAxis] = checked(
+                localShapes.Sum(shape => shape[concatenationAxis]));
             var localType = new TensorType(weights[0].ElemType, new RankedShape(dimensions));
             (var size, var strides) = TensorUtilities.GetTensorMaxSizeAndStridesExpr(localType, distributedType: null);
             var projectionNCapacities = outputs
                 .Select(output => checked(
                     GetLocalCapacityShape(output)[^1] * GetVectorLaneCount(output.ElemType)))
                 .ToArray();
+            if (outputs.Any(output => GetVectorLaneCount(output.ElemType) != outputNVectorLaneCount))
+            {
+                throw new InvalidOperationException(
+                    $"PyNTT canonical packed QKV outputs must use {outputNVectorLaneCount} N lanes.");
+            }
+
             return new(
                 localType,
                 dimensions,
                 strides,
                 size,
                 weights[0].ElemType.SizeInBytes,
+                concatenationAxis,
                 sourceDistributedTypes,
                 projectionNCapacities);
         }

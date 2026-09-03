@@ -8,6 +8,7 @@ using System.Text;
 using System.Threading.Tasks;
 using NetFabric.Hyperlinq;
 using Nncase.IR;
+using Nncase.IR.Shapes;
 
 namespace Nncase.Passes;
 
@@ -22,10 +23,12 @@ public static class PassUtility
 
         return op is IR.Distributed.Boxing
             or IR.Distributed.ForceBoxing
+            or IR.Buffers.Uninitialized
             or IR.Math.Unary
             or IR.Math.Binary { BinaryOp: BinaryOp.Add or BinaryOp.Sub or BinaryOp.Mul or BinaryOp.Div or BinaryOp.Mod or BinaryOp.Min or BinaryOp.Max or BinaryOp.Pow }
             or IR.Math.Clamp
             or IR.Math.Compare
+            or IR.Math.BlockScaledMatMul
             or IR.Math.MatMul
             or IR.Math.Reduce
             or IR.Math.ReduceArg
@@ -34,6 +37,8 @@ public static class PassUtility
             or IR.NN.Erf
             or IR.NN.InstanceNormalization
             or IR.NN.LayerNorm
+            or IR.NN.NormApply
+            or IR.NN.NormStats
             or IR.NN.Pad { PadMode: PadMode.Constant }
             or IR.NN.Softmax
             or IR.NN.Swish
@@ -42,6 +47,8 @@ public static class PassUtility
             or IR.NN.CreatePagedAttentionKVCache
             or IR.NN.IdentityPagedAttentionKVCache
             or IR.NN.PagedAttention
+            or IR.NN.QKVRoPEWithCache
+            or IR.NN.Sigmoid
             or IR.NN.Qwen3MoE
             or IR.NN.QKVParallelLinear
             or IR.NN.MatMulGlu
@@ -51,6 +58,7 @@ public static class PassUtility
             or IR.Tensors.Expand
             or IR.Tensors.Gather
             or IR.Tensors.GetItem
+            or IR.Tensors.Pack
             or IR.Tensors.Range
             or IR.Tensors.Reshape
             or IR.Tensors.ScatterND
@@ -58,6 +66,7 @@ public static class PassUtility
             or IR.Tensors.Slice
             or IR.Tensors.Stack
             or IR.Tensors.Transpose
+            or IR.Tensors.Unpack
             or IR.Tensors.Unsqueeze
             or IR.Tensors.Where
             or IR.CustomNTT.MatMul;
@@ -91,7 +100,8 @@ public static class PassUtility
 
                 break;
             case IR.Tensors.Slice slice:
-                if (((TensorConst)call[IR.Tensors.Slice.Strides]).Value.Cast<long>().Any(s => s < 0))
+                if (call[IR.Tensors.Slice.Strides] is not RankedShape { IsFixed: true } strides ||
+                    strides.Dimensions.ToArray().Any(stride => stride.FixedValue < 0))
                 {
                     return false;
                 }
@@ -112,14 +122,19 @@ public static class PassUtility
 
                 break;
             case IR.NN.Pad pad:
-                if (call[IR.NN.Pad.Pads] is not TensorConst)
+                if (call[IR.NN.Pad.Pads] is not Paddings { IsFixed: true })
                 {
                     return false;
                 }
 
                 break;
             case IR.Math.Reduce reduce:
-                var axis = ((TensorConst)arguments.ToArray()[1]).Value.ToArray<int>().OrderBy(x => x).ToArray();
+                if (call[IR.Math.Reduce.Axes] is not RankedShape { IsFixed: true } axes)
+                {
+                    return false;
+                }
+
+                var axis = axes.ToValueArray().OrderBy(x => x).ToArray();
                 bool consecutiveAixs = axis.Length <= 1 || axis.Zip(axis.Skip(1)).All(p => p.First == p.Second - 1);
                 if (reduce.ReduceOp == ReduceOp.Prod ||
                  arguments.ToArray()[0].CheckedDataType == DataTypes.Float16 ||

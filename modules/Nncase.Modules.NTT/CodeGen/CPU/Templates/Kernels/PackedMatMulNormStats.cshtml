@@ -7,41 +7,5 @@
   string loadC = Model.Arguments[4].Symbol.Name;
   string scale = Model.Arguments[5].Symbol.Name;
   string addend = Model.Arguments[6].Symbol.Name;
-  bool hasAddend = addend != "nullptr";
-
-  string MatmulLine(bool accumulate, string indent) =>
-      $"{Model.Indent}{indent}packed_matmul<{accumulate.ToString().ToLowerInvariant()}>({lhs}, {rhs}, {output}, {scale});\n";
-  string InitialMatmulLines(string indent) => hasAddend
-      ? $"{Model.Indent}{indent}cast({addend}, {output}, fixed_shape_v<>);\n{MatmulLine(true, indent)}"
-      : MatmulLine(false, indent);
 }
-@if (Model.Reduction is not null)
-{
-  throw new NotSupportedException("PackedMatMulNormStats does not support an outer tiled reduction.");
-}
-@Html.Raw($"{Model.Indent}{{\n")
-@if (loadC != "nullptr")
-{
-@Html.Raw($"{Model.Indent}  if ({loadC}) {{\n")
-@Html.Raw(MatmulLine(true, "    "))
-@Html.Raw($"{Model.Indent}  }} else {{\n")
-@Html.Raw(InitialMatmulLines("    "))
-@Html.Raw($"{Model.Indent}  }}\n")
-}
-else
-{
-@Html.Raw(InitialMatmulLines("  "))
-}
-@Html.Raw($"{Model.Indent}  using output_f32_element_t = replace_element_t<typename std::decay_t<decltype({output})>::element_type, float>;\n")
-@Html.Raw($"{Model.Indent}  auto output_f32 = make_tensor<output_f32_element_t>({output}.shape());\n")
-@Html.Raw($"{Model.Indent}  auto output_square = make_tensor<output_f32_element_t>({output}.shape());\n")
-@Html.Raw($"{Model.Indent}  cast({output}, output_f32, fixed_shape_v<>);\n")
-@if (Model.Target.UseMean)
-{
-@Html.Raw($"{Model.Indent}  auto stats_sum = {stats}.view(0_dim);\n")
-@Html.Raw($"{Model.Indent}  reduce_sum<false>(output_f32, stats_sum, fixed_shape_v<{Model.Target.Axis}>, fixed_shape_v<{Model.Target.Axis}>);\n")
-}
-@Html.Raw($"{Model.Indent}  binary<ops::mul>(output_f32, output_f32, output_square);\n")
-@Html.Raw($"{Model.Indent}  auto stats_square = {stats}.view({(Model.Target.UseMean ? 1 : 0)}_dim);\n")
-@Html.Raw($"{Model.Indent}  reduce_sum<false>(output_square, stats_square, fixed_shape_v<{Model.Target.Axis}>, fixed_shape_v<{Model.Target.Axis}>);\n")
-@Html.Raw($"{Model.Indent}}}\n")
+@Html.Raw($"{Model.Indent}packed_matmul_norm_stats<{Model.Target.UseMean.ToString().ToLowerInvariant()}, {Model.Target.Axis}>({lhs}, {rhs}, {output}, {stats}, {loadC}, {scale}, {addend});\n")

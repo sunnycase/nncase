@@ -204,6 +204,7 @@ internal sealed class DataTypeJsonConverterImpl : JsonConverter<DataType>
                     element.GetProperty(nameof(IR.NN.GatedDeltaNetStateType.Config)).GetRawText(),
                     options) ?? throw new JsonException("Failed to deserialize GatedDeltaNetStateConfig"),
             },
+            nameof(IR.Heterogeneous.PipelineChannelType) => new IR.Heterogeneous.PipelineChannelType(),
             _ => throw new JsonException($"Unknown ValueType discriminator: {typeName}"),
         };
     }

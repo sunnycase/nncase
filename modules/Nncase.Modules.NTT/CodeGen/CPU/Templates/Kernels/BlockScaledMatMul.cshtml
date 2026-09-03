@@ -1,0 +1,8 @@
+@model Nncase.CodeGen.NTT.TypedKernelTemplateModel<Nncase.TIR.NTT.BlockScaledMatMul>
+@{
+  string lhs = Model.Arguments[0].Symbol.Name;
+  string rhs = Model.Arguments[1].Symbol.Name;
+  string rhsScale = Model.Arguments[2].Symbol.Name;
+  string output = Model.Arguments[3].Symbol.Name;
+}
+@Html.Raw($"{Model.Indent}block_scaled_matmul<{Model.Target.WeightBlockN}, {Model.Target.WeightBlockK}>({lhs}, {rhs}, {rhsScale}, {output});\n")

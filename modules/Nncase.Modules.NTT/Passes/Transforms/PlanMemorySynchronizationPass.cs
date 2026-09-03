@@ -36,7 +36,9 @@ public sealed class PlanMemorySynchronizationPass : ModulePass
     {
         var functions = input.Functions
             .Select((function, index) => (Function: function as PrimFunction, Index: index))
-            .Where(item => item.Function is { ModuleKind: var moduleKind } && moduleKind == _moduleKind)
+            .Where(item => item.Function is { ModuleKind: var moduleKind } &&
+                moduleKind == _moduleKind &&
+                CompileSession.IsFunctionActive(item.Function))
             .Select(item => (Function: item.Function!, item.Index))
             .ToArray();
         var analyzer = new MemoryEffectAnalyzer(functions.Select(item => item.Function));

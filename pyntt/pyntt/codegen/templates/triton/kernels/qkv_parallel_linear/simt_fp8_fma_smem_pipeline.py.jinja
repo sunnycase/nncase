@@ -180,7 +180,9 @@ def {{ model["FunctionName"] }}__consumer(reader, {{ helper_parameters(model) }}
                 )
                 input_value = tle.encoding(
                     tl.load(
-                        {{ access_pointer(model, "Input", "input0", ctx["pipeline_input_access"]) }}
+                        {{ access_pointer(model, "Input", "input0", ctx["pipeline_input_access"]) }},
+                        mask=pipeline_offs_k < {{ ctx["active_k"] }},
+                        other=0.0,
                     ),
                     {{ ctx["consumer_lhs_layout_name"] }},
                 )

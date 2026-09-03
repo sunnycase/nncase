@@ -43,7 +43,10 @@ class PyNTTTargetOptions(NTTTargetOptions):
     def __init__(self) -> None: ...
     Backend: str
     OutputDirectory: str
-    Strict: bool
+    CpuOffloadRegions: str
+    CpuCoreCount: int
+    CpuTargetMachine: str
+    BlockCyclicBlockBytes: int
 
 
 """ end the auto generated block by tools/stackvm_gen/CApiGen at 12/20/2024 5:27:07 PM +08:00. """

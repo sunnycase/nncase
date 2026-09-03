@@ -6,6 +6,7 @@ from typing import Any, Mapping
 
 from pyntt.ir import ModuleSpec
 from pyntt.runtime.errors import PyNTTSpecError
+from pyntt.runtime.pipeline import PipelineChannel
 from pyntt.runtime.tensor import (
     allocate_outputs,
     materialize_results,
@@ -33,14 +34,17 @@ class PyNTTInterpreter:
         self.triton_tensor_descriptor_cache = TritonTensorDescriptorCache()
         self._prepared_triton_kernels: dict[tuple[str, str], Any] = {}
         self._launch_resources: dict[tuple[str, str], tuple[Any, ...]] = {}
+        self._pipeline_channels: dict[str, PipelineChannel] = {}
+        self._last_pipeline_channel_specs: Any | None = None
+        self._last_pipeline_channels: tuple[PipelineChannel, ...] = ()
         self.loaded = False
 
     def load(self, device: Any | None = None):
         """Load package-level state and optionally materialize rdata on a device."""
         for bundle in self.rdata_bundles.values():
-            self.rdata_cache.prepare_bundle(dict(bundle))
+            self.rdata_cache.prepare_bundle(bundle)
             if device is not None:
-                self.rdata_cache.materialize_bundle((), dict(bundle), device=device)
+                self.rdata_cache.materialize_bundle((), bundle, device=device)
         self.loaded = True
         return self
 
@@ -99,7 +103,7 @@ class PyNTTInterpreter:
             bundle = self.rdata_bundles[name]
         except KeyError as ex:
             raise PyNTTSpecError(f"PyNTT rdata bundle {name!r} was not found.") from ex
-        return self.rdata_cache.materialize_bundle(inputs, dict(bundle))
+        return self.rdata_cache.materialize_bundle(inputs, bundle)
 
     def materialize_triton_tensor_descriptors(
         self,
@@ -110,6 +114,47 @@ class PyNTTInterpreter:
         return self.triton_tensor_descriptor_cache.materialize_many(
             kernel_name, specs, sources
         )
+
+    def prepare_pipeline_channels(self, specs):
+        """Return and reset persistent pinned/UVA storage for compiled channels."""
+        if specs is self._last_pipeline_channel_specs:
+            for channel in self._last_pipeline_channels:
+                channel.reset()
+            return self._last_pipeline_channels
+
+        canonical_specs = (
+            isinstance(specs, tuple)
+            and all(
+                isinstance(spec, tuple)
+                and len(spec) == 2
+                and isinstance(spec[0], str)
+                and isinstance(spec[1], int)
+                for spec in specs
+            )
+        )
+        channels = []
+        for channel_id, payload_bytes in specs:
+            key = str(channel_id)
+            payload_bytes = int(payload_bytes)
+            channel = self._pipeline_channels.get(key)
+            if channel is None:
+                channel = PipelineChannel.allocate(payload_bytes)
+                self._pipeline_channels[key] = channel
+            elif channel.payload_bytes != payload_bytes:
+                raise PyNTTSpecError(
+                    f"Pipeline channel {key!r} was prepared for {channel.payload_bytes} "
+                    f"payload bytes, requested {payload_bytes}."
+                )
+            channel.reset()
+            channels.append(channel)
+        result = tuple(channels)
+        if canonical_specs:
+            self._last_pipeline_channel_specs = specs
+            self._last_pipeline_channels = result
+        else:
+            self._last_pipeline_channel_specs = None
+            self._last_pipeline_channels = ()
+        return result
 
     @staticmethod
     def _launch_cache_key(kernel_name: str, device: Any) -> tuple[str, str]:

@@ -21,6 +21,79 @@ namespace Nncase.Tests.TransformTest;
 public sealed class UnitTestFunctionBoundaryLayoutPropagation : TestClassBase
 {
     [Fact]
+    public async Task TestSpecializationPreservesPipelineProjectionRole()
+    {
+        var layerInput = new Var("layer_input", new TensorType(DataTypes.Float32, new RankedShape(4, 16)));
+        var layer = MakePackUnpackLayer("layer", layerInput);
+        layer.Role = FunctionRole.PipelineProjection;
+        Assert.True(layer.InferenceType());
+
+        var input = new Var("input", new TensorType(DataTypes.Float32, new RankedShape(4, 16)));
+        var main = new Function("main", new Call(layer, input), input);
+        Assert.True(main.InferenceType());
+
+        var module = new IRModule(main);
+        module.Add(layer);
+        await new FunctionBoundaryLayoutPropagationPass().RunAsync(module, new());
+
+        var specialized = GetFunction(module, "layer");
+        Assert.Equal(FunctionRole.PipelineProjection, specialized.Role);
+        Assert.DoesNotContain("Pack(", CompilerServices.Print(specialized.Body), StringComparison.Ordinal);
+        Assert.DoesNotContain("Unpack(", CompilerServices.Print(specialized.Body), StringComparison.Ordinal);
+    }
+
+    [Fact]
+    public async Task TestActiveModuleDoesNotPropagateLayoutsAcrossDeviceBoundary()
+    {
+        static Function MakeLayer(string name, string moduleKind)
+        {
+            var input = new Var($"{name}_input", new TensorType(DataTypes.Float32, new RankedShape(4, 16)));
+            return new Function(name, moduleKind, Unpack(Pack(input, [4], [1]), [4], [1]), new IVar[] { input });
+        }
+
+        static Function MakeCaller(string name, string moduleKind, Function callee)
+        {
+            var input = new Var($"{name}_input", new TensorType(DataTypes.Float32, new RankedShape(4, 16)));
+            return new Function(name, moduleKind, new Call(callee, input), new IVar[] { input });
+        }
+
+        var cpuLayer = MakeLayer("cpu_layer", Nncase.Targets.CPUTarget.Kind);
+        var cpuCaller = MakeCaller("cpu_caller", Nncase.Targets.CPUTarget.Kind, cpuLayer);
+        var pynttLayer = MakeLayer("pyntt_layer", Nncase.Targets.PyNTTTarget.Kind);
+        var pynttCaller = MakeCaller("pyntt_caller", Nncase.Targets.PyNTTTarget.Kind, pynttLayer);
+        var input = new Var("input", new TensorType(DataTypes.Float32, new RankedShape(4, 16)));
+        var main = new Function(
+            "main",
+            Nncase.Targets.PyNTTTarget.Kind,
+            new IR.Tuple(new Call(cpuCaller, input), new Call(pynttCaller, input)),
+            new IVar[] { input })
+        {
+            IsEntry = true,
+            Role = FunctionRole.ModuleDispatch,
+        };
+        Assert.True(main.InferenceType());
+
+        var module = new IRModule(main);
+        module.Add(cpuCaller);
+        module.Add(cpuLayer);
+        module.Add(pynttCaller);
+        module.Add(pynttLayer);
+        using var moduleSession = CompileSession.Create(
+            new Nncase.Targets.CPUTarget(),
+            CompileOptions,
+            Nncase.Targets.CPUTarget.Kind);
+        using var scope = new CompileSessionScope(moduleSession);
+
+        await new FunctionBoundaryLayoutPropagationPass().RunAsync(module, new());
+
+        Assert.DoesNotContain("Pack(", CompilerServices.Print(GetFunction(module, "cpu_layer").Body), StringComparison.Ordinal);
+        Assert.DoesNotContain("Unpack(", CompilerServices.Print(GetFunction(module, "cpu_layer").Body), StringComparison.Ordinal);
+        Assert.Contains("Pack(", CompilerServices.Print(GetFunction(module, "pyntt_layer").Body), StringComparison.Ordinal);
+        Assert.Contains("Unpack(", CompilerServices.Print(GetFunction(module, "pyntt_layer").Body), StringComparison.Ordinal);
+        Assert.IsType<IR.Tuple>(Assert.IsType<Function>(module.Entry).Body);
+    }
+
+    [Fact]
     public async Task TestReuseSingleSpecializationForRepeatedInternalFunction()
     {
         var layerInput = new Var("layer_input", new TensorType(DataTypes.Float32, new RankedShape(4, 16)));
@@ -1292,18 +1365,20 @@ public sealed class UnitTestFunctionBoundaryLayoutPropagation : TestClassBase
 
         var passManager = CompileSession.CreatePassManager("BoundaryTransposeConstFold");
         passManager.Add<FunctionBoundaryLayoutPropagationPass>();
-        passManager.AddWithName<DataflowPass>("PostBoundaryFoldConst").Configure(p =>
+        passManager.AddWithName<EGraphRulesPass>("PostFunctionBoundaryPackPropagation").Configure(p =>
         {
-            p.Add<Passes.Rules.Neutral.FoldConstCall>();
+            new Nncase.Targets.CPUTarget().RegisterPackPropagationRules(p, CompileOptions);
         });
+        passManager.AddWithName<MaterializeConstantsPass>("PostBoundaryMaterializeConstants");
 
         await passManager.RunAsync(module);
 
         AssertNoLayoutFunctions(module);
         var specialized = GetFunction(module, "layer");
+        var entry = Assert.IsType<Function>(module.Entry);
         Assert.DoesNotContain("Transpose(", CompilerServices.Print(specialized.Body), StringComparison.Ordinal);
-        Assert.DoesNotContain("Transpose(", CompilerServices.Print(main.Body), StringComparison.Ordinal);
-        Assert.Contains("f32[3,2]", CompilerServices.Print(main.Body), StringComparison.Ordinal);
+        Assert.DoesNotContain("Transpose(", CompilerServices.Print(entry.Body), StringComparison.Ordinal);
+        Assert.Contains("f32[3,2]", CompilerServices.Print(entry.Body), StringComparison.Ordinal);
     }
 
     [Fact]

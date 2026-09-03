@@ -122,6 +122,34 @@ void dump_mem(const std::string &info, const float *p, size_t num) {
     }
 }
 
+TEST(CpuTest, sharded_view_from_global_buffer_uses_local_offset_and_span) {
+    cpu_thread_context_t::current() = {
+        .bid = 7,
+        .cid = 1,
+    };
+
+    constexpr size_t M = 4;
+    constexpr size_t N = 320;
+    auto global = ntt::make_tensor<float>(ntt::fixed_shape_v<M, N>);
+    ntt::apply(global.shape(),
+               [&](auto index) { global(index) = (float)ntt::linear_offset(index, global.shape()); });
+
+    using mesh_type =
+        ntt::distributed::mesh<ntt::distributed::topology::block, 2, 32>;
+    const auto sharding = ntt::distributed::make_sharding<mesh_type>(
+        ntt::distributed::shard_policy::B,
+        ntt::distributed::shard_policy::S<1>());
+    auto view = ntt::distributed::make_sharded_tensor_view_from_global_buffer(
+        global.elements(), global.shape(), sharding,
+        ntt::fixed_strides_v<N, 1>);
+
+    EXPECT_EQ(view.local().shape()[0_dim], M);
+    EXPECT_EQ(view.local().shape()[1_dim], N / 32);
+    EXPECT_EQ(view.local().elements().data(), global.elements().data() + 70);
+    EXPECT_EQ(view.local().elements().size(), ((M - 1) * N) + (N / 32));
+    EXPECT_EQ(view.local()(3_dim, 9_dim), global(3_dim, 79_dim));
+}
+
 TEST(CpuTest, reshard_2D_same_sharding_spec_broadcast) {
     // init
     constexpr size_t M = 512;

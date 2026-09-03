@@ -39,7 +39,15 @@ public abstract class HuggingFaceModel
 
     protected CompileSession CompileSession => Context?.CompileSession ?? throw new InvalidOperationException("Model not initialized - CompileSession is null");
 
+    protected virtual bool RequiresRotaryEmbedding => true;
+
+    protected virtual bool DecoderLayerUsesRotaryEmbedding(int layerIndex)
+        => RequiresRotaryEmbedding;
+
     protected virtual bool SupportsDecoderLayerFunctionReuse => true;
+
+    protected virtual string? GetDecoderLayerStructureKey(int layerIndex)
+        => SupportsDecoderLayerFunctionReuse ? "default" : null;
 
     protected virtual bool RequiresPagedAttentionKVCache => true;
 
@@ -47,25 +55,50 @@ public abstract class HuggingFaceModel
 
     private sealed class LayerFunctionBuildContext
     {
-        private readonly Dictionary<string, Expr> _parametersByWeight = new();
+        private readonly Dictionary<string, Expr> _parametersByKey = new();
+
+        public LayerFunctionBuildContext(string functionName, int templateLayerStart)
+        {
+            FunctionName = functionName;
+            TemplateLayerStart = templateLayerStart;
+        }
+
+        public string FunctionName { get; }
+
+        public int TemplateLayerStart { get; }
 
         public List<IVar> Parameters { get; } = new();
 
         public List<LayerParameterSpec> ParameterSpecs { get; } = new();
 
-        public Expr GetOrAddParameter(string weightName, Expr templateValue, Func<int, Expr> argumentFactory)
+        public Expr GetOrAddParameter(
+            string key,
+            string parameterName,
+            Expr templateValue,
+            Func<int, Expr> argumentFactory)
         {
-            if (_parametersByWeight.TryGetValue(weightName, out var parameter))
+            if (_parametersByKey.TryGetValue(key, out var parameter))
             {
                 return parameter;
             }
 
-            var varName = $"layer_{SanitizeParameterName(GetLayerWeightSuffix(weightName))}";
-            var var = new Var(varName, templateValue.CheckedType);
+            var var = new Var(SanitizeParameterName(parameterName), templateValue.CheckedType);
             Parameters.Add(var);
-            ParameterSpecs.Add(new LayerParameterSpec(var, argumentFactory));
-            _parametersByWeight.Add(weightName, var);
+            ParameterSpecs.Add(new LayerParameterSpec(key, var, argumentFactory));
+            _parametersByKey.Add(key, var);
             return var;
+        }
+
+        public int GetLayerOffset(int templateLayerIndex)
+        {
+            var offset = checked(templateLayerIndex - TemplateLayerStart);
+            if (offset < 0)
+            {
+                throw new InvalidOperationException(
+                    $"Layer {templateLayerIndex} precedes decoder block template start {TemplateLayerStart}.");
+            }
+
+            return offset;
         }
 
         private static string SanitizeParameterName(string name)
@@ -75,9 +108,24 @@ public abstract class HuggingFaceModel
         }
     }
 
-    private sealed record LayerParameterSpec(IVar Parameter, Func<int, Expr> ArgumentFactory);
+    private sealed record LayerParameterSpec(string Key, IVar Parameter, Func<int, Expr> ArgumentFactory);
 
-    private sealed record DecoderLayerFunction(Function Function, IReadOnlyList<LayerParameterSpec> ParameterSpecs);
+    private sealed record DecoderLayerFunction(
+        Function Function,
+        IReadOnlyList<LayerParameterSpec> ParameterSpecs,
+        bool UsesRotaryEmbedding,
+        int LayerCount);
+
+    private sealed record AttentionBlockResult(
+        Expr MlpInput,
+        Expr Residual,
+        Expr PastKeyValues);
+
+    protected sealed record QKVProjection(
+        Expr Query,
+        Expr Key,
+        Expr Value,
+        Expr? OutputGate = null);
 
     public void Initialize(ModelInitContext context, string dir)
     {
@@ -145,6 +193,25 @@ public abstract class HuggingFaceModel
         return $"{prefix}{layerIndex}{templateWeightName[suffixStart..]}";
     }
 
+    private static int GetLayerWeightIndex(string weightName)
+    {
+        const string prefix = "model.layers.";
+        if (!weightName.StartsWith(prefix, StringComparison.Ordinal))
+        {
+            throw new InvalidOperationException(
+                $"Layer function parameter must be a per-layer weight, but got {weightName}.");
+        }
+
+        var suffixStart = weightName.IndexOf('.', prefix.Length);
+        if (suffixStart < 0 ||
+            !int.TryParse(weightName.AsSpan(prefix.Length, suffixStart - prefix.Length), out var layerIndex))
+        {
+            throw new InvalidOperationException($"Invalid per-layer weight name: {weightName}.");
+        }
+
+        return layerIndex;
+    }
+
     private static string GetLayerWeightSuffix(string weightName)
     {
         const string prefix = "model.layers.";
@@ -157,7 +224,7 @@ public abstract class HuggingFaceModel
         return suffixStart < 0 ? weightName : weightName[(suffixStart + 1)..];
     }
 
-    private Expr GetLayerWeightExpr(string weightName, Func<Tensor, Expr> prepare)
+    protected Expr GetLayerWeightExpr(string weightName, Func<Tensor, Expr> prepare)
     {
         var tensor = GetWeight(weightName) ?? throw new InvalidOperationException($"Required weight {weightName} is missing.");
         var templateValue = prepare(tensor);
@@ -166,18 +233,22 @@ public abstract class HuggingFaceModel
             return templateValue;
         }
 
+        var templateLayerIndex = GetLayerWeightIndex(weightName);
+        var layerOffset = _layerFunctionBuildContext.GetLayerOffset(templateLayerIndex);
         return _layerFunctionBuildContext.GetOrAddParameter(
-            weightName,
+            $"weight:{weightName}",
+            $"layer_{layerOffset}_{GetLayerWeightSuffix(weightName)}",
             templateValue,
-            layerIndex =>
+            blockLayerIndex =>
             {
+                var layerIndex = checked(blockLayerIndex + layerOffset);
                 var layerWeightName = GetLayerWeightName(weightName, layerIndex);
                 var layerTensor = GetWeight(layerWeightName) ?? throw new InvalidOperationException($"Required weight {layerWeightName} is missing.");
                 return prepare(layerTensor);
             });
     }
 
-    private Expr GetOptionalLayerWeightExpr(string weightName, Func<Tensor, Expr> prepare)
+    protected Expr GetOptionalLayerWeightExpr(string weightName, Func<Tensor, Expr> prepare)
     {
         var tensor = GetWeight(weightName);
         if (tensor is null)
@@ -191,15 +262,37 @@ public abstract class HuggingFaceModel
             return templateValue;
         }
 
+        var templateLayerIndex = GetLayerWeightIndex(weightName);
+        var layerOffset = _layerFunctionBuildContext.GetLayerOffset(templateLayerIndex);
         return _layerFunctionBuildContext.GetOrAddParameter(
-            weightName,
+            $"weight:{weightName}",
+            $"layer_{layerOffset}_{GetLayerWeightSuffix(weightName)}",
             templateValue,
-            layerIndex =>
+            blockLayerIndex =>
             {
+                var layerIndex = checked(blockLayerIndex + layerOffset);
                 var layerWeightName = GetLayerWeightName(weightName, layerIndex);
                 var layerTensor = GetWeight(layerWeightName);
                 return layerTensor is null ? None.Default : prepare(layerTensor);
             });
+    }
+
+    /// <summary>
+    /// Captures a model-level mutable resource as an explicit decoder-layer
+    /// function parameter when decoder functions are reused.
+    /// </summary>
+    /// <param name="name">Stable parameter name within a decoder-layer variant.</param>
+    /// <param name="value">The model-level resource expression.</param>
+    /// <returns>The formal parameter while building a reusable function; otherwise <paramref name="value"/>.</returns>
+    protected Expr GetDecoderLayerResource(string name, Expr value)
+    {
+        ArgumentException.ThrowIfNullOrWhiteSpace(name);
+        ArgumentNullException.ThrowIfNull(value);
+        return _layerFunctionBuildContext?.GetOrAddParameter(
+            $"resource:{name}",
+            name,
+            value,
+            _ => value) ?? value;
     }
 
     public virtual (IEnumerable<IVar> Inputs, Dictionary<IVar, Dimension[]> VarMap) CreateInputs()
@@ -691,34 +784,15 @@ public abstract class HuggingFaceModel
             Tuple<Expr, Expr> positionEmbeddings,
             Dimension layerId)
     {
-        var residual = hiddenStates;
-        hiddenStates = LLMLayerNorm(
-            hiddenStates,
-            $"model.layers.{count}.input_layernorm.weight");
-
-        // TODO: using `config.attn_implementation` to choose attention implementation
-        // self attention
-        (hiddenStates, pastKeyValues) = LLMSelfAttention(
+        var attentionBlock = BuildAttentionBlockBody(
             count,
             hiddenStates,
             pastKeyValues,
             positionEmbeddings,
             layerId);
-        hiddenStates = residual + hiddenStates;
+        hiddenStates = attentionBlock.Residual + LLMMlp(count, attentionBlock.MlpInput);
 
-        // fully Connected
-        residual = hiddenStates;
-        hiddenStates = LLMLayerNorm(
-            hiddenStates,
-            $"model.layers.{count}.post_attention_layernorm.weight");
-
-        hiddenStates = LLMMlp(count, hiddenStates);
-
-        hiddenStates = residual + hiddenStates;
-
-        var output = hiddenStates;
-
-        return System.Tuple.Create<Expr, Expr>(output, pastKeyValues);
+        return System.Tuple.Create(hiddenStates, attentionBlock.PastKeyValues);
     }
 
     public virtual Call LLMMlp(int count, Expr hiddenStates)
@@ -731,10 +805,15 @@ public abstract class HuggingFaceModel
             layerName: $"model.layers.{count}.mlp.down_proj");
     }
 
-    public virtual Tuple<Call, Call, Call> QKVCompute(int count, Expr hiddenStates, Dimension seqLen, Dimension headDim)
+    protected virtual QKVProjection QKVCompute(
+        int count,
+        Expr hiddenStates,
+        Dimension seqLen,
+        Dimension headDim)
     {
         var hidden_shape = new RankedShape(seqLen, -1L, headDim);
-        return BuildQKVParallelLinear(count, hiddenStates, hidden_shape);
+        var (query, key, value) = BuildQKVParallelLinear(count, hiddenStates, hidden_shape);
+        return new(query, key, value);
     }
 
     public virtual Tuple<Expr, Expr> EagerAttentionForward(Expr query, Expr key, Expr value, Expr? attentionMask, float scaling)
@@ -1013,12 +1092,13 @@ public abstract class HuggingFaceModel
         return casualMask;
     }
 
-    public virtual Call Embedding(Expr input, Tensor embedingWeight, long? paddingIdx = null)
+    public virtual Expr Embedding(Expr input, Tensor embedingWeight, long? paddingIdx = null)
     {
         var gatherResult = IR.F.Tensors.Gather(embedingWeight, 0, input);
+        Expr body;
         if (paddingIdx == null)
         {
-            return gatherResult;
+            body = gatherResult;
         }
         else
         {
@@ -1026,9 +1106,14 @@ public abstract class HuggingFaceModel
             var paddingIndex = Tensor.FromScalar(input.CheckedDataType, paddingIdx.Value);
             var paddingMask = IR.F.Math.Equal(input, paddingIndex);
             paddingMask = IR.F.Tensors.Unsqueeze(paddingMask, [1]);
-            var results = IR.F.Tensors.Where(paddingMask, zeros, gatherResult);
-            return results;
+            body = IR.F.Tensors.Where(paddingMask, zeros, gatherResult);
         }
+
+        body.Metadata.OutputNames = new[] { "model.embed_tokens" };
+        return SemanticRegionUtility.Mark(
+            body,
+            [input],
+            new SemanticRegion(SemanticRegionKinds.Embedding, "model.embed_tokens"));
     }
 
     public virtual Tuple<Expr, Expr> LLMSelfAttention(
@@ -1037,7 +1122,23 @@ public abstract class HuggingFaceModel
                 Expr paskKeyValues,
                 Tuple<Expr, Expr> positionEmbeddings,
                 Dimension layerId)
+        => BuildLLMSelfAttentionBody(
+            count,
+            hiddenStates,
+            paskKeyValues,
+            positionEmbeddings,
+            layerId);
+
+    private Tuple<Expr, Expr> BuildLLMSelfAttentionBody(
+                int count,
+                Expr hiddenStates,
+                Expr paskKeyValues,
+                Tuple<Expr, Expr> positionEmbeddings,
+                Dimension layerId)
     {
+        var cacheRegion = new SemanticRegion(
+            SemanticRegionKinds.PagedAttentionKVCache,
+            $"model.layers.{count}.paged_attention_kv_cache");
         var head_dim = (long)Context!.Config!["hidden_size"] / (long)Context.Config["num_attention_heads"];
         if (Context.Config!.Keys.Contains("head_dim"))
         {
@@ -1048,7 +1149,9 @@ public abstract class HuggingFaceModel
 
         // var batch_size = hiddenStates.CheckedShape[0];
         var seq_len = hiddenStates.CheckedShape[0];
-        var (queryStates, keyStates, valueStates) = QKVCompute(count, hiddenStates, seq_len, head_dim);
+        var projection = QKVCompute(count, hiddenStates, seq_len, head_dim);
+        var (queryStates, keyStates, valueStates) =
+            (projection.Query, projection.Key, projection.Value);
 
         var (cos, sin) = positionEmbeddings;
 
@@ -1066,11 +1169,13 @@ public abstract class HuggingFaceModel
             var castK = pagedAttentionConfig.KVPrimType != qType ? IR.F.Tensors.Cast(transK, pagedAttentionConfig.KVPrimType) : transK;
             var vectorizedK = keyLanes.Length > 0 ? IR.F.Tensors.Pack(castK, keyLanes, keyVectorizedAxis) : castK;
             paskKeyValues = IR.F.NN.UpdatePagedAttentionKVCache(vectorizedK, paskKeyValues, layerId, AttentionCacheKind.Key, kvDestLayout);
+            paskKeyValues.Metadata.SemanticRegion = cacheRegion;
 
             var transV = TransposeIfNeeded(valueStates, kvPerms);
             var castV = pagedAttentionConfig.KVPrimType != qType ? IR.F.Tensors.Cast(transV, pagedAttentionConfig.KVPrimType) : transV;
             var vectorizedV = valueLanes.Length > 0 ? IR.F.Tensors.Pack(castV, valueLanes, valueVectorizedAxis) : castV;
             paskKeyValues = IR.F.NN.UpdatePagedAttentionKVCache(vectorizedV, paskKeyValues, layerId, AttentionCacheKind.Value, kvDestLayout);
+            paskKeyValues.Metadata.SemanticRegion = cacheRegion;
         }
 
         var scaling = Tensor.FromScalar((float)(1.0f / System.Math.Sqrt((double)head_dim)));
@@ -1089,6 +1194,24 @@ public abstract class HuggingFaceModel
         var transQ = TransposeIfNeeded(queryStates, qPerm);
         var castQ = pagedAttentionConfig.KVPrimType != qType ? IR.F.Tensors.Cast(transQ, pagedAttentionConfig.KVPrimType) : transQ;
         var vectorizedQ = qLanes.Length > 0 ? IR.F.Tensors.Pack(castQ, qLanes, qVectorizedAxis) : castQ;
+        Expr outputGate = None.Default;
+        if (projection.OutputGate is not null)
+        {
+            if (queryStates.CheckedShape != projection.OutputGate.CheckedShape)
+            {
+                throw new InvalidOperationException(
+                    $"Attention output gate shape {projection.OutputGate.CheckedShape} must match " +
+                    $"query shape {queryStates.CheckedShape}.");
+            }
+
+            var transGate = TransposeIfNeeded(projection.OutputGate, qPerm);
+            var castGate = pagedAttentionConfig.KVPrimType != projection.OutputGate.CheckedDataType
+                ? IR.F.Tensors.Cast(transGate, pagedAttentionConfig.KVPrimType)
+                : transGate;
+            outputGate = qLanes.Length > 0
+                ? IR.F.Tensors.Pack(castGate, qLanes, qVectorizedAxis)
+                : castGate;
+        }
 
         // cpu : [q_head, max_query_len, max_seq_len + 1 ]<primtype>
         var extra_size = pagedAttentionConfig.KVPrimType.SizeInBytes * (long)Context.Config["num_attention_heads"] * Context.ImportOptions.HuggingFaceOptions.MaxModelLen * (Context.ImportOptions.HuggingFaceOptions.MaxModelLen + 1);
@@ -1100,14 +1223,21 @@ public abstract class HuggingFaceModel
         }
 
         var hidden_size = Context!.Config.ContainsKey("head_dim") ? (int)((long)Context!.Config!["num_attention_heads"] * (long)Context!.Config!["head_dim"]) : (int)(long)Context!.Config!["hidden_size"];
+        var attentionWorkspace = IR.F.Buffer.Uninitialized(
+            DataTypes.UInt8,
+            TIR.MemoryLocation.Data,
+            [extra_size]);
+        attentionWorkspace.Metadata.SemanticRegion = cacheRegion;
         var output = IR.F.NN.PagedAttention(
             vectorizedQ,
             paskKeyValues,
-            IR.F.Buffer.Uninitialized(DataTypes.UInt8, TIR.MemoryLocation.Data, [extra_size]),
+            attentionWorkspace,
             scaling.CastTo(pagedAttentionConfig.KVPrimType, CastMode.KDefault),
             layerId,
+            outputGate,
             qDestLayout,
             hidden_size);
+        output.Metadata.SemanticRegion = cacheRegion;
 
         output = qLanes.Length > 0 ? IR.F.Tensors.Unpack(output, qLanes, qVectorizedAxis) : output;
 
@@ -1119,26 +1249,69 @@ public abstract class HuggingFaceModel
         //     output = seq_len is DimVar ? IR.F.Tensors.Slice(output, new[] { 0 }, new Dimension[] { seq_len }, new[] { 1 }, new[] { 1 }) : output;
         // }
         output = IR.F.Tensors.Reshape(output, new RankedShape(seq_len, -1L));
-        output = LinearByName(
-            output,
+        output = BuildAttentionOutputProjection(count, output);
+        return System.Tuple.Create(output, paskKeyValues);
+    }
+
+    private AttentionBlockResult BuildAttentionBlockBody(
+        int count,
+        Expr hiddenStates,
+        Expr pastKeyValues,
+        Tuple<Expr, Expr> positionEmbeddings,
+        Dimension layerId)
+    {
+        var residual = hiddenStates;
+        hiddenStates = LLMLayerNorm(
+            hiddenStates,
+            $"model.layers.{count}.input_layernorm.weight");
+        (hiddenStates, pastKeyValues) = LLMSelfAttention(
+            count,
+            hiddenStates,
+            pastKeyValues,
+            positionEmbeddings,
+            layerId);
+        residual = residual + hiddenStates;
+        hiddenStates = LLMLayerNorm(
+            residual,
+            $"model.layers.{count}.post_attention_layernorm.weight");
+        return new AttentionBlockResult(hiddenStates, residual, pastKeyValues);
+    }
+
+    protected virtual Call BuildAttentionOutputProjection(int count, Expr input)
+    {
+        return LinearByName(
+            input,
             $"model.layers.{count}.self_attn.o_proj.weight",
             inputScaleName: $"model.layers.{count}.self_attn.o_proj.input_scale",
             weightScaleName: $"model.layers.{count}.self_attn.o_proj.weight_scale",
             layerName: $"model.layers.{count}.self_attn.o_proj");
-        return System.Tuple.Create(output, paskKeyValues);
     }
 
     private DecoderLayerFunction BuildDecoderLayerFunction(
+        int templateLayerStart,
+        int layerCount,
         Expr hiddenStates,
         Expr pastKeyValues,
-        Tuple<Expr, Expr> positionEmbeddings)
+        Tuple<Expr, Expr> positionEmbeddings,
+        bool returnIntermediateStates)
     {
+        if (layerCount <= 0)
+        {
+            throw new ArgumentOutOfRangeException(nameof(layerCount), layerCount, "Decoder layer block must contain at least one layer.");
+        }
+
         var hiddenStatesParam = new Var("hidden_states", hiddenStates.CheckedType);
         var pastKeyValuesParam = new Var("kv_cache", pastKeyValues.CheckedType);
         var layerIdParam = new DimVar("layer_id");
-        var cosParam = new Var("cos", positionEmbeddings.Item1.CheckedType);
-        var sinParam = new Var("sin", positionEmbeddings.Item2.CheckedType);
-        var context = new LayerFunctionBuildContext();
+        var usesRotaryEmbedding = Enumerable.Range(templateLayerStart, layerCount)
+            .Any(DecoderLayerUsesRotaryEmbedding);
+        var cosParam = usesRotaryEmbedding
+            ? new Var("cos", positionEmbeddings.Item1.CheckedType)
+            : null;
+        var sinParam = usesRotaryEmbedding
+            ? new Var("sin", positionEmbeddings.Item2.CheckedType)
+            : null;
+        var context = new LayerFunctionBuildContext("hf_decoder_layer", templateLayerStart);
         if (_layerFunctionBuildContext is not null)
         {
             throw new InvalidOperationException("Nested HuggingFace decoder layer function construction is not supported.");
@@ -1147,17 +1320,41 @@ public abstract class HuggingFaceModel
         _layerFunctionBuildContext = context;
         try
         {
-            var (layerOutput, updatedKvCache) = DecodeLayer(
-                0,
-                hiddenStatesParam,
-                pastKeyValuesParam,
-                System.Tuple.Create<Expr, Expr>(cosParam, sinParam),
-                layerIdParam);
-            var body = new IR.Tuple(layerOutput, updatedKvCache);
-            var parameters = new List<IVar> { hiddenStatesParam, pastKeyValuesParam, layerIdParam, cosParam, sinParam };
+            var layerOutputs = new List<Expr>(layerCount);
+            Expr layerOutput = hiddenStatesParam;
+            Expr layerPastKeyValues = pastKeyValuesParam;
+            for (var layerOffset = 0; layerOffset < layerCount; layerOffset++)
+            {
+                var templateLayerIndex = checked(templateLayerStart + layerOffset);
+                var layerPositionEmbeddings = DecoderLayerUsesRotaryEmbedding(templateLayerIndex)
+                    ? System.Tuple.Create<Expr, Expr>(cosParam!, sinParam!)
+                    : System.Tuple.Create<Expr, Expr>(layerOutput, layerOutput);
+                (layerOutput, layerPastKeyValues) = DecodeLayer(
+                    templateLayerIndex,
+                    layerOutput,
+                    layerPastKeyValues,
+                    layerPositionEmbeddings,
+                    layerIdParam + layerOffset);
+                layerOutputs.Add(layerOutput);
+            }
+
+            var parameters = new List<IVar> { hiddenStatesParam, pastKeyValuesParam, layerIdParam };
+            if (usesRotaryEmbedding)
+            {
+                parameters.Add(cosParam!);
+                parameters.Add(sinParam!);
+            }
+
             parameters.AddRange(context.Parameters);
+            BaseExpr body = returnIntermediateStates
+                ? new IR.Tuple(layerOutputs.ToArray())
+                : layerOutput;
             var function = new Function("hf_decoder_layer", CompileSession.Target.Name, body, parameters.ToArray());
-            return new DecoderLayerFunction(function, context.ParameterSpecs.ToArray());
+            return new DecoderLayerFunction(
+                function,
+                context.ParameterSpecs.ToArray(),
+                usesRotaryEmbedding,
+                layerCount);
         }
         finally
         {
@@ -1167,7 +1364,7 @@ public abstract class HuggingFaceModel
 
     private static Call CallDecoderLayerFunction(
         DecoderLayerFunction layerFunction,
-        int layerIndex,
+        int blockLayerStart,
         Expr hiddenStates,
         Expr pastKeyValues,
         Tuple<Expr, Expr> positionEmbeddings)
@@ -1176,12 +1373,56 @@ public abstract class HuggingFaceModel
         {
             hiddenStates,
             pastKeyValues,
-            new DimConst(layerIndex),
-            positionEmbeddings.Item1,
-            positionEmbeddings.Item2,
+            new DimConst(blockLayerStart),
         };
-        arguments.AddRange(layerFunction.ParameterSpecs.Select(spec => (BaseExpr)spec.ArgumentFactory(layerIndex)));
+        if (layerFunction.UsesRotaryEmbedding)
+        {
+            arguments.Add(positionEmbeddings.Item1);
+            arguments.Add(positionEmbeddings.Item2);
+        }
+
+        arguments.AddRange(layerFunction.ParameterSpecs.Select(spec => (BaseExpr)spec.ArgumentFactory(blockLayerStart)));
         return new Call(layerFunction.Function, arguments.ToArray());
+    }
+
+    protected static int GetDecoderLayerBlockLength(IReadOnlyList<string?> structureKeys)
+    {
+        if (structureKeys.Count == 0)
+        {
+            throw new ArgumentException("Decoder layer structure must contain at least one layer.", nameof(structureKeys));
+        }
+
+        var reusableLayerCount = structureKeys.Count(key => key is not null);
+        if (reusableLayerCount == 0)
+        {
+            return 0;
+        }
+
+        if (reusableLayerCount != structureKeys.Count)
+        {
+            throw new InvalidOperationException(
+                "Decoder layer function reuse must be enabled or disabled for the entire decoder stack.");
+        }
+
+        for (var candidateLength = 1; candidateLength <= structureKeys.Count; candidateLength++)
+        {
+            if (structureKeys.Count % candidateLength != 0)
+            {
+                continue;
+            }
+
+            var isPeriod = Enumerable.Range(candidateLength, structureKeys.Count - candidateLength)
+                .All(index => string.Equals(
+                    structureKeys[index],
+                    structureKeys[index % candidateLength],
+                    StringComparison.Ordinal));
+            if (isPeriod)
+            {
+                return candidateLength;
+            }
+        }
+
+        throw new InvalidOperationException("Failed to determine a decoder layer block period.");
     }
 
     public virtual Tuple<Expr, Expr?> LLMModel(
@@ -1221,51 +1462,69 @@ public abstract class HuggingFaceModel
         // The embedding output dtype follows the prepared embedding weight dtype.
         Expr hiddenStates = inputEmbeds;
 
-        var (invFreq, attentionScaling) = ModelUtils.RoPEInit(Context!.Config!);
-        var positionEmbeddings = RotaryEmbedding(hiddenStates, pastKeyValues, invFreq, attentionScaling);
+        var positionEmbeddings = RequiresRotaryEmbedding
+            ? BuildRotaryEmbedding(hiddenStates, pastKeyValues)
+            : Tuple.Create<Expr, Expr>(hiddenStates, hiddenStates);
 
         Expr? allHiddenStates = null;
-        var layerFunction = SupportsDecoderLayerFunctionReuse
-            ? BuildDecoderLayerFunction(hiddenStates, pastKeyValues, positionEmbeddings)
-            : null;
-
-        for (int i = 0; i < (int)(long)Context!.Config!["num_hidden_layers"]; i++)
+        var numHiddenLayers = checked((int)(long)Context!.Config!["num_hidden_layers"]);
+        var decoderLayerStructureKeys = Enumerable.Range(0, numHiddenLayers)
+            .Select(GetDecoderLayerStructureKey)
+            .ToArray();
+        var decoderLayerBlockLength = GetDecoderLayerBlockLength(decoderLayerStructureKeys);
+        if (decoderLayerBlockLength > 0)
         {
-            if (Context.ImportOptions!.HuggingFaceOptions.OutputHiddenStates)
+            var outputHiddenStates = Context.ImportOptions!.HuggingFaceOptions.OutputHiddenStates;
+            var decoderLayerFunction = BuildDecoderLayerFunction(
+                0,
+                decoderLayerBlockLength,
+                hiddenStates,
+                pastKeyValues,
+                positionEmbeddings,
+                outputHiddenStates);
+            for (var blockLayerStart = 0; blockLayerStart < numHiddenLayers; blockLayerStart += decoderLayerBlockLength)
             {
-                // allHiddenStates.Add(IR.F.Tensors.Unsqueeze(hiddenStates, new long[] { 0 }));
-                if (i == 0)
+                if (outputHiddenStates)
                 {
-                    allHiddenStates = IR.F.Tensors.Unsqueeze(hiddenStates, new long[] { 0 });
+                    AppendHiddenState(hiddenStates);
                 }
-                else
-                {
-                    allHiddenStates = IR.F.Tensors.Concat(new IR.Tuple(allHiddenStates!, IR.F.Tensors.Unsqueeze(hiddenStates, new long[] { 0 })), 0);
-                }
-            }
 
-            // var (hiddenStatesTmp, selfAttenWeights) = DecodeLayer(i, hiddenStates, casualMask, positionIds,
-            //     pastKeyValues, outputAttentions,
-            //     useCache, cachePosition, positionEmbeddings);
-            if (layerFunction is not null)
-            {
-                var layerResult = CallDecoderLayerFunction(
-                    layerFunction,
-                    i,
+                var blockOutput = CallDecoderLayerFunction(
+                    decoderLayerFunction,
+                    blockLayerStart,
                     hiddenStates,
                     pastKeyValues,
                     positionEmbeddings);
-                hiddenStates = IR.F.Tensors.GetItem(layerResult, 0);
-                pastKeyValues = IR.F.Tensors.GetItem(layerResult, 1);
+                if (outputHiddenStates)
+                {
+                    for (var layerOffset = 1; layerOffset < decoderLayerFunction.LayerCount; layerOffset++)
+                    {
+                        AppendHiddenState(blockOutput[layerOffset - 1]);
+                    }
+
+                    hiddenStates = blockOutput[decoderLayerFunction.LayerCount - 1];
+                }
+                else
+                {
+                    hiddenStates = blockOutput;
+                }
             }
-            else
+        }
+        else
+        {
+            for (var layerIndex = 0; layerIndex < numHiddenLayers; layerIndex++)
             {
+                if (Context.ImportOptions!.HuggingFaceOptions.OutputHiddenStates)
+                {
+                    AppendHiddenState(hiddenStates);
+                }
+
                 var (hiddenStatesTmp, pastKeyValuesTmp) = DecodeLayer(
-                    i,
+                    layerIndex,
                     hiddenStates,
                     pastKeyValues,
                     positionEmbeddings,
-                    new DimConst(i));
+                    new DimConst(layerIndex));
                 pastKeyValues = pastKeyValuesTmp;
                 hiddenStates = hiddenStatesTmp;
             }
@@ -1282,6 +1541,20 @@ public abstract class HuggingFaceModel
         return Tuple.Create(lastHiddenStates, allHiddenStates);
 
         // return Tuple.Create(lastHiddenStates, allSelfAttns, allKVcaches);
+
+        Tuple<Expr, Expr> BuildRotaryEmbedding(Expr states, Expr kvCache)
+        {
+            var (invFreq, attentionScaling) = ModelUtils.RoPEInit(Context!.Config!);
+            return RotaryEmbedding(states, kvCache, invFreq, attentionScaling);
+        }
+
+        void AppendHiddenState(Expr state)
+        {
+            var expanded = IR.F.Tensors.Unsqueeze(state, new long[] { 0 });
+            allHiddenStates = allHiddenStates is null
+                ? expanded
+                : IR.F.Tensors.Concat(new IR.Tuple(allHiddenStates, expanded), 0);
+        }
     }
 
     public virtual void VisitForCausalLM()
@@ -1330,14 +1603,15 @@ public abstract class HuggingFaceModel
 
         Expr BuildLmHead(Expr hiddenStates)
         {
-            var lmHeadWeights = GetWeight("model.embed_tokens.weight")!;
-            if (Context.Config!.ContainsKey("tie_word_embeddings") &&
-                !Context.Config.GetNestedValue<bool>("tie_word_embeddings"))
-            {
-                lmHeadWeights = GetWeight("lm_head.weight") ?? lmHeadWeights;
-            }
-
-            return Linear(hiddenStates, lmHeadWeights, layerName: "lm_head");
+            var untied = Context.Config!.ContainsKey("tie_word_embeddings") &&
+                !Context.Config.GetNestedValue<bool>("tie_word_embeddings");
+            var prefix = untied ? "lm_head" : "model.embed_tokens";
+            return LinearByName(
+                hiddenStates,
+                $"{prefix}.weight",
+                inputScaleName: $"{prefix}.input_scale",
+                weightScaleName: $"{prefix}.weight_scale",
+                layerName: "lm_head");
         }
     }
 
@@ -1393,6 +1667,38 @@ public abstract class HuggingFaceModel
         string kWeightScaleName = $"model.layers.{count}.self_attn.k_proj.weight_scale";
         string vWeightScaleName = $"model.layers.{count}.self_attn.v_proj.weight_scale";
 
+        var inputScaleTensors = new[]
+        {
+            GetWeight(qInputScaleName),
+            GetWeight(kInputScaleName),
+            GetWeight(vInputScaleName),
+        };
+        var weightScaleTensors = new[]
+        {
+            GetWeight(qWeightScaleName),
+            GetWeight(kWeightScaleName),
+            GetWeight(vWeightScaleName),
+        };
+        var hasInputScales = inputScaleTensors.All(scale => scale is not null);
+        var hasWeightScales = weightScaleTensors.All(scale => scale is not null);
+        if (inputScaleTensors.Any(scale => scale is not null) != hasInputScales ||
+            weightScaleTensors.Any(scale => scale is not null) != hasWeightScales ||
+            (hasInputScales && !hasWeightScales))
+        {
+            throw new InvalidOperationException(
+                $"Layer {count} QKV projection has an inconsistent quantization contract: " +
+                $"input scales=[{string.Join(",", inputScaleTensors.Select(scale => scale is not null))}], " +
+                $"weight scales=[{string.Join(",", weightScaleTensors.Select(scale => scale is not null))}].");
+        }
+
+        var quantizationMode = (hasInputScales, hasWeightScales) switch
+        {
+            (false, false) => MatMulQuantizationMode.None,
+            (true, true) => MatMulQuantizationMode.StaticTensor,
+            (false, true) => MatMulQuantizationMode.DynamicTensor,
+            _ => throw new InvalidOperationException($"Layer {count} QKV projection has an unsupported quantization contract."),
+        };
+
         Expr PrepareWeight(string weightName, string weightScaleName)
         {
             var weightScale = GetWeight(weightScaleName);
@@ -1401,7 +1707,50 @@ public abstract class HuggingFaceModel
 
         Expr PrepareBias(string biasName) => GetOptionalLayerWeightExpr(biasName, bias => bias.CastTo(hiddenStates.CheckedDataType));
 
-        Expr PrepareScale(string scaleName) => GetOptionalLayerWeightExpr(scaleName, scale => scale);
+        Expr PrepareInputScale(string scaleName) => GetOptionalLayerWeightExpr(
+            scaleName,
+            scale => quantizationMode == MatMulQuantizationMode.StaticTensor && scale.Length != 1
+                ? throw new InvalidOperationException(
+                    $"Static QKV input scale {scaleName} must contain one element, got shape " +
+                    $"[{string.Join(",", scale.Dimensions.ToArray())}].")
+                : scale);
+
+        Expr PrepareWeightScale(string scaleName, string weightName) => GetOptionalLayerWeightExpr(
+            scaleName,
+            scale =>
+            {
+                if (quantizationMode == MatMulQuantizationMode.StaticTensor)
+                {
+                    if (scale.Length != 1)
+                    {
+                        throw new InvalidOperationException(
+                            $"Static QKV weight scale {scaleName} must contain one element, got shape " +
+                            $"[{string.Join(",", scale.Dimensions.ToArray())}].");
+                    }
+
+                    return scale;
+                }
+
+                if (quantizationMode != MatMulQuantizationMode.DynamicTensor)
+                {
+                    return scale;
+                }
+
+                var weight = GetWeight(weightName)
+                    ?? throw new InvalidOperationException($"Required QKV weight {weightName} is missing.");
+                var outputChannels = weight.Dimensions[0];
+                var validShape =
+                    (scale.Rank == 1 && scale.Dimensions[0] == outputChannels) ||
+                    (scale.Rank == 2 && scale.Dimensions[0] == outputChannels && scale.Dimensions[1] == 1);
+                if (!validShape)
+                {
+                    throw new InvalidOperationException(
+                        $"Dynamic-tensor QKV weight scale {scaleName} must have shape [N] or [N,1] " +
+                        $"for N={outputChannels}, got [{string.Join(",", scale.Dimensions.ToArray())}].");
+                }
+
+                return scale.Rank == 1 ? scale : scale.Reshape([outputChannels]);
+            });
 
         var numHeads = (long)Config["num_attention_heads"];
         var numKvHeads = (long)Config["num_key_value_heads"];
@@ -1413,15 +1762,16 @@ public abstract class HuggingFaceModel
             PrepareBias(qBiasName),
             PrepareBias(kBiasName),
             PrepareBias(vBiasName),
-            PrepareScale(qInputScaleName),
-            PrepareScale(kInputScaleName),
-            PrepareScale(vInputScaleName),
-            PrepareScale(qWeightScaleName),
-            PrepareScale(kWeightScaleName),
-            PrepareScale(vWeightScaleName),
+            PrepareInputScale(qInputScaleName),
+            PrepareInputScale(kInputScaleName),
+            PrepareInputScale(vInputScaleName),
+            PrepareWeightScale(qWeightScaleName, qWeightName),
+            PrepareWeightScale(kWeightScaleName, kWeightName),
+            PrepareWeightScale(vWeightScaleName, vWeightName),
             numHeads,
             numKvHeads,
-            hiddenStates.CheckedDataType)
+            hiddenStates.CheckedDataType,
+            quantizationMode)
             .With(metadata: new IRMetadata() { OutputNames = new[] { $"model.layers.{count}.self_attn.qkv_proj" } });
         var queryStates = IR.F.Tensors.Reshape(IR.F.Tensors.GetItem(qkvStates, 0), hiddenShape);
         var keyStates = IR.F.Tensors.Reshape(IR.F.Tensors.GetItem(qkvStates, 1), hiddenShape);

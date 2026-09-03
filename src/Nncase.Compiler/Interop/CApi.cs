@@ -144,6 +144,10 @@ public unsafe struct CApiMT
     public delegate* unmanaged<IntPtr> PyNTTTargetOptionsCreatePtr;
     public delegate* unmanaged<IntPtr, byte*, nuint, void> PyNTTTargetOptionsSetBackendPtr;
     public delegate* unmanaged<IntPtr, byte*, nuint, void> PyNTTTargetOptionsSetOutputDirectoryPtr;
+    public delegate* unmanaged<IntPtr, byte*, nuint, void> PyNTTTargetOptionsSetCpuOffloadRegionsPtr;
+    public delegate* unmanaged<IntPtr, int, void> PyNTTTargetOptionsSetCpuCoreCountPtr;
+    public delegate* unmanaged<IntPtr, byte*, nuint, void> PyNTTTargetOptionsSetCpuTargetMachinePtr;
+    public delegate* unmanaged<IntPtr, long, void> PyNTTTargetOptionsSetBlockCyclicBlockBytesPtr;
     /* end the auto generated block by tools/stackvm_gen/CApiGen at 12/20/2024 5:31:31 PM +08:00. */
     public delegate* unmanaged<IntPtr, IntPtr> RTValueFromHandlePtr;
     public delegate* unmanaged<IntPtr, IntPtr> RTValueGetHandlePtr;
@@ -294,6 +298,10 @@ public static unsafe class CApi
         mt->PyNTTTargetOptionsCreatePtr = &PyNTTTargetOptionsCreate;
         mt->PyNTTTargetOptionsSetBackendPtr = &PyNTTTargetOptionsSetBackend;
         mt->PyNTTTargetOptionsSetOutputDirectoryPtr = &PyNTTTargetOptionsSetOutputDirectory;
+        mt->PyNTTTargetOptionsSetCpuOffloadRegionsPtr = &PyNTTTargetOptionsSetCpuOffloadRegions;
+        mt->PyNTTTargetOptionsSetCpuCoreCountPtr = &PyNTTTargetOptionsSetCpuCoreCount;
+        mt->PyNTTTargetOptionsSetCpuTargetMachinePtr = &PyNTTTargetOptionsSetCpuTargetMachine;
+        mt->PyNTTTargetOptionsSetBlockCyclicBlockBytesPtr = &PyNTTTargetOptionsSetBlockCyclicBlockBytes;
         /* end the auto generated block by tools/stackvm_gen/CApiGen at 12/20/2024 3:41:05 PM +08:00. */
         mt->RTValueFromHandlePtr = &RTValueFromHandle;
         mt->RTValueGetHandlePtr = &RTValueGetHandle;
@@ -1195,6 +1203,30 @@ public static unsafe class CApi
     private static void PyNTTTargetOptionsSetOutputDirectory(IntPtr handle, byte* value, nuint length)
     {
         Get<PyNTTTargetOptions>(handle).OutputDirectory = ToString(value, length);
+    }
+
+    [UnmanagedCallersOnly]
+    private static void PyNTTTargetOptionsSetCpuOffloadRegions(IntPtr handle, byte* value, nuint length)
+    {
+        Get<PyNTTTargetOptions>(handle).CpuOffloadRegions = ToString(value, length);
+    }
+
+    [UnmanagedCallersOnly]
+    private static void PyNTTTargetOptionsSetCpuCoreCount(IntPtr handle, int value)
+    {
+        Get<PyNTTTargetOptions>(handle).CpuCoreCount = value;
+    }
+
+    [UnmanagedCallersOnly]
+    private static void PyNTTTargetOptionsSetCpuTargetMachine(IntPtr handle, byte* value, nuint length)
+    {
+        Get<PyNTTTargetOptions>(handle).CpuTargetMachine = ToString(value, length);
+    }
+
+    [UnmanagedCallersOnly]
+    private static void PyNTTTargetOptionsSetBlockCyclicBlockBytes(IntPtr handle, long value)
+    {
+        Get<PyNTTTargetOptions>(handle).BlockCyclicBlockBytes = value;
     }
 
     /* end the auto generated block by tools/stackvm_gen/CApiGen at 12/20/2024 3:41:05 PM +08:00. */

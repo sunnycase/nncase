@@ -86,23 +86,26 @@ public sealed partial class DecomposeGatedDeltaNet : IRewriteRule
                 $"{gatedDeltaNet.QuantizationMode}."),
         };
 
-        Expr Pack(Expr value, IReadOnlyList<int> lanes) => IR.F.Tensors.Pack(
+        Expr Pack(Expr value, IReadOnlyList<int> lanes, int axis) => IR.F.Tensors.Pack(
             value,
             lanes.ToArray(),
-            Enumerable.Repeat(1, lanes.Count).ToArray());
+            Enumerable.Repeat(axis, lanes.Count).ToArray());
+
+        var convolutionLanes = stateConfig.GetLanes(
+            GatedDeltaNetStateKind.Convolution,
+            GatedDeltaNetStateDimKind.ConvChannels);
 
         var qkv = Pack(
             Project(qkvWeight, qkvWeightScale),
-            stateConfig.GetLanes(
-                GatedDeltaNetStateKind.Convolution,
-                GatedDeltaNetStateDimKind.ConvChannels));
+            convolutionLanes,
+            1);
         var convolution = IR.F.NN.GatedDeltaNetConvolution(
             qkv,
             state,
-            convWeight,
+            Pack(convWeight, convolutionLanes, 0),
             layerId,
             gatedDeltaNet.ConvKernelSize);
-        var z = Pack(Project(zWeight, zWeightScale), stateConfig.ActivationLanes);
+        var z = Pack(Project(zWeight, zWeightScale), stateConfig.ActivationLanes, 1);
         var recurrent = IR.F.NN.GatedDeltaNetRecurrentCore(
             convolution[1],
             convolution[0],
@@ -137,6 +140,31 @@ public sealed partial class DecomposeGatedDeltaNet : IRewriteRule
                 $"{gatedDeltaNet.QuantizationMode}."),
         };
 
-        return new IR.Tuple(output, recurrent[1]).InheritMetaData(call);
+        if (call.Metadata.SemanticRegion is not { } semanticRegion)
+        {
+            return new IR.Tuple(output, recurrent[1]).InheritMetaData(call);
+        }
+
+        var markedOutput = SemanticRegionUtility.Mark(
+                output,
+                [
+                    input,
+                    state,
+                    qkvWeight,
+                    qkvWeightScale,
+                    zWeight,
+                    zWeightScale,
+                    bWeight,
+                    aWeight,
+                    convWeight,
+                    aLog,
+                    dtBias,
+                    normWeight,
+                    outputWeight,
+                    outputWeightScale,
+                    layerId,
+                ],
+                semanticRegion);
+        return new IR.Tuple(markedOutput, recurrent[1]).InheritMetaData(call);
     }
 }

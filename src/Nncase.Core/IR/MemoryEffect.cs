@@ -17,6 +17,7 @@ public enum MemoryAccessScope
     Inferred,
     Block,
     Chip,
+    System,
 }
 
 /// <summary>
@@ -163,6 +164,12 @@ public readonly record struct MemoryEffect(
 
     public static MemoryEffect ChipReadWrite { get; } = new(MemoryAccessMode.ReadWrite, MemoryAccessScope.Chip);
 
+    public static MemoryEffect SystemRead { get; } = new(MemoryAccessMode.Read, MemoryAccessScope.System);
+
+    public static MemoryEffect SystemWrite { get; } = new(MemoryAccessMode.Write, MemoryAccessScope.System);
+
+    public static MemoryEffect SystemReadWrite { get; } = new(MemoryAccessMode.ReadWrite, MemoryAccessScope.System);
+
     public static MemoryEffect ReductionWrite { get; } = new(
         MemoryAccessMode.Write,
         MemoryAccessScope.Inferred,
@@ -285,8 +292,10 @@ public static class MemoryEffectUtility
     }
 
     public static MemoryAccessScope MergeScope(MemoryAccessScope lhs, MemoryAccessScope rhs)
-        => lhs == MemoryAccessScope.Chip || rhs == MemoryAccessScope.Chip
-            ? MemoryAccessScope.Chip
+        => lhs == MemoryAccessScope.System || rhs == MemoryAccessScope.System
+            ? MemoryAccessScope.System
+            : lhs == MemoryAccessScope.Chip || rhs == MemoryAccessScope.Chip
+                ? MemoryAccessScope.Chip
             : lhs == MemoryAccessScope.Block || rhs == MemoryAccessScope.Block
                 ? MemoryAccessScope.Block
                 : MemoryAccessScope.Inferred;

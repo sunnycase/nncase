@@ -87,23 +87,25 @@
 {{ q_base }}q_inv_std = tl.rsqrt(tl.maximum(q_variance, 0.0) + {{ pyrepr(q_norm["Epsilon"]) }})
 {% call(indent) elementwise.iterate(ctx["q"], ctx["q"]["prefix_depth"] + q_guard_depth, scope="q") %}
 {{ indent }}mask = mask & ({{ ctx["q"]["output_physical_rotary"] }} < {{ dim(ctx["q"]["output_rotary_extent"]) }})
+{{ indent }}rotary_mask = mask & ({{ ctx["q"]["is_rotary"] }})
 {% if fused_partial %}
 {{ partial_io.load(ctx["q"]["partial_input"], "q_value", "mask", indent) }}
-{{ partial_io.load(ctx["q"]["paired_partial_input"], "q_pair", "mask", indent) }}
+{{ partial_io.load(ctx["q"]["paired_partial_input"], "q_pair", "rotary_mask", indent) }}
 {% else %}
 {{ indent }}q_value = tl.load({{ access_pointer(q_norm, "Input", "q_input", ctx["q"]["input_access"]) }}, mask=mask, other=0.0).to(tl.float32)
-{{ indent }}q_pair = tl.load({{ access_pointer(q_norm, "Input", "q_input", ctx["q"]["paired_input_access"]) }}, mask=mask, other=0.0).to(tl.float32)
+{{ indent }}q_pair = tl.load({{ access_pointer(q_norm, "Input", "q_input", ctx["q"]["paired_input_access"]) }}, mask=rotary_mask, other=0.0).to(tl.float32)
 {% endif %}
 {{ indent }}q_scale_value = tl.load({{ access_pointer(q_norm, "Scale", "q_scale", ctx["q"]["scale_access"]) }}, mask=mask, other=0.0).to(tl.float32)
-{{ indent }}q_pair_scale = tl.load({{ access_pointer(q_norm, "Scale", "q_scale", ctx["q"]["paired_scale_access"]) }}, mask=mask, other=0.0).to(tl.float32)
+{{ indent }}q_pair_scale = tl.load({{ access_pointer(q_norm, "Scale", "q_scale", ctx["q"]["paired_scale_access"]) }}, mask=rotary_mask, other=0.0).to(tl.float32)
 {{ indent }}q_bias_value = tl.load({{ access_pointer(q_norm, "Bias", "q_bias", ctx["q"]["bias_access"]) }}, mask=mask, other=0.0).to(tl.float32)
-{{ indent }}q_pair_bias = tl.load({{ access_pointer(q_norm, "Bias", "q_bias", ctx["q"]["paired_bias_access"]) }}, mask=mask, other=0.0).to(tl.float32)
+{{ indent }}q_pair_bias = tl.load({{ access_pointer(q_norm, "Bias", "q_bias", ctx["q"]["paired_bias_access"]) }}, mask=rotary_mask, other=0.0).to(tl.float32)
 {{ indent }}q_normalized = ((q_value - q_mean) * q_inv_std * q_scale_value) + q_bias_value
 {{ indent }}q_pair_normalized = ((q_pair - q_mean) * q_inv_std * q_pair_scale) + q_pair_bias
-{{ indent }}q_cos = tl.load({{ access_pointer(q_rope, "Cos", "cos", ctx["q"]["cos_access"]) }}, mask=mask, other=0.0).to(tl.float32)
-{{ indent }}q_sin = tl.load({{ access_pointer(q_rope, "Sin", "sin", ctx["q"]["sin_access"]) }}, mask=mask, other=0.0).to(tl.float32)
+{{ indent }}q_cos = tl.load({{ access_pointer(q_rope, "Cos", "cos", ctx["q"]["cos_access"]) }}, mask=rotary_mask, other=0.0).to(tl.float32)
+{{ indent }}q_sin = tl.load({{ access_pointer(q_rope, "Sin", "sin", ctx["q"]["sin_access"]) }}, mask=rotary_mask, other=0.0).to(tl.float32)
 {{ indent }}q_rotated = tl.where({{ ctx["q"]["first_half"] }}, -q_pair_normalized, q_pair_normalized)
-{{ indent }}q_result = q_normalized * q_cos + q_rotated * q_sin
+{{ indent }}q_rope_result = q_normalized * q_cos + q_rotated * q_sin
+{{ indent }}q_result = tl.where({{ ctx["q"]["is_rotary"] }}, q_rope_result, q_normalized)
 {{ indent }}tl.store({{ access_pointer(model, "QOutput", "q_output", ctx["q"]["final_output_access"]) }}, q_result, mask=mask)
 {% endcall %}
 
@@ -141,23 +143,25 @@
 {{ k_base }}k_inv_std = tl.rsqrt(tl.maximum(k_variance, 0.0) + {{ pyrepr(k_norm["Epsilon"]) }})
 {% call(indent) elementwise.iterate(ctx["k"], ctx["k"]["prefix_depth"] + k_guard_depth, scope="k") %}
 {{ indent }}mask = mask & ({{ ctx["k"]["output_physical_rotary"] }} < {{ dim(ctx["k"]["output_rotary_extent"]) }})
+{{ indent }}rotary_mask = mask & ({{ ctx["k"]["is_rotary"] }})
 {% if fused_partial %}
 {{ partial_io.load(ctx["k"]["partial_input"], "k_value", "mask", indent) }}
-{{ partial_io.load(ctx["k"]["paired_partial_input"], "k_pair", "mask", indent) }}
+{{ partial_io.load(ctx["k"]["paired_partial_input"], "k_pair", "rotary_mask", indent) }}
 {% else %}
 {{ indent }}k_value = tl.load({{ access_pointer(k_norm, "Input", "k_input", ctx["k"]["input_access"]) }}, mask=mask, other=0.0).to(tl.float32)
-{{ indent }}k_pair = tl.load({{ access_pointer(k_norm, "Input", "k_input", ctx["k"]["paired_input_access"]) }}, mask=mask, other=0.0).to(tl.float32)
+{{ indent }}k_pair = tl.load({{ access_pointer(k_norm, "Input", "k_input", ctx["k"]["paired_input_access"]) }}, mask=rotary_mask, other=0.0).to(tl.float32)
 {% endif %}
 {{ indent }}k_scale_value = tl.load({{ access_pointer(k_norm, "Scale", "k_scale", ctx["k"]["scale_access"]) }}, mask=mask, other=0.0).to(tl.float32)
-{{ indent }}k_pair_scale = tl.load({{ access_pointer(k_norm, "Scale", "k_scale", ctx["k"]["paired_scale_access"]) }}, mask=mask, other=0.0).to(tl.float32)
+{{ indent }}k_pair_scale = tl.load({{ access_pointer(k_norm, "Scale", "k_scale", ctx["k"]["paired_scale_access"]) }}, mask=rotary_mask, other=0.0).to(tl.float32)
 {{ indent }}k_bias_value = tl.load({{ access_pointer(k_norm, "Bias", "k_bias", ctx["k"]["bias_access"]) }}, mask=mask, other=0.0).to(tl.float32)
-{{ indent }}k_pair_bias = tl.load({{ access_pointer(k_norm, "Bias", "k_bias", ctx["k"]["paired_bias_access"]) }}, mask=mask, other=0.0).to(tl.float32)
+{{ indent }}k_pair_bias = tl.load({{ access_pointer(k_norm, "Bias", "k_bias", ctx["k"]["paired_bias_access"]) }}, mask=rotary_mask, other=0.0).to(tl.float32)
 {{ indent }}k_normalized = ((k_value - k_mean) * k_inv_std * k_scale_value) + k_bias_value
 {{ indent }}k_pair_normalized = ((k_pair - k_mean) * k_inv_std * k_pair_scale) + k_pair_bias
-{{ indent }}k_cos = tl.load({{ access_pointer(k_rope, "Cos", "cos", ctx["k"]["cos_access"]) }}, mask=mask, other=0.0).to(tl.float32)
-{{ indent }}k_sin = tl.load({{ access_pointer(k_rope, "Sin", "sin", ctx["k"]["sin_access"]) }}, mask=mask, other=0.0).to(tl.float32)
+{{ indent }}k_cos = tl.load({{ access_pointer(k_rope, "Cos", "cos", ctx["k"]["cos_access"]) }}, mask=rotary_mask, other=0.0).to(tl.float32)
+{{ indent }}k_sin = tl.load({{ access_pointer(k_rope, "Sin", "sin", ctx["k"]["sin_access"]) }}, mask=rotary_mask, other=0.0).to(tl.float32)
 {{ indent }}k_rotated = tl.where({{ ctx["k"]["first_half"] }}, -k_pair_normalized, k_pair_normalized)
-{{ indent }}k_result = k_normalized * k_cos + k_rotated * k_sin
+{{ indent }}k_rope_result = k_normalized * k_cos + k_rotated * k_sin
+{{ indent }}k_result = tl.where({{ ctx["k"]["is_rotary"] }}, k_rope_result, k_normalized)
 {{ cache_io.store(k_update, ctx["k"]["cache"], "k_result", "mask", indent) }}
 {% endcall %}
 

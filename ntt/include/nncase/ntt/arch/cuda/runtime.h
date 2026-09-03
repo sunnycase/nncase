@@ -20,12 +20,13 @@
 
 namespace nncase::ntt::runtime {
 struct cuda_block_entry_params_t {
+    uint32_t function_id;
     size_t bdim;
     size_t cdim;
     size_t cid;
     uint8_t enable_profiling;
-    const thread_inout_desc *input_descs;
-    thread_inout_desc *const output_descs;
+    const block_inout_desc *input_descs;
+    block_inout_desc *const output_descs;
     ntt::span<const std::byte> rdata;
     std::byte *output;
     const uint64_t *block_local_rdata_header;

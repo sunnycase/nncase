@@ -78,6 +78,192 @@ public class UnitTestGraphPartition : TestClassBase
     }
 
     [Fact]
+    public async Task TestRequiredPlacementExtractsOnlySelectedCalls()
+    {
+        var input = new Var("input", new TensorType(DataTypes.Float32, new[] { 8 }));
+        var sin = IR.F.Math.Sin(input);
+        var abs = IR.F.Math.Abs(sin);
+        var main = new Function("main", PyNTTTarget.Kind, abs, new IVar[] { input }) { IsEntry = true };
+        Assert.True(CompilerServices.InferenceType(main));
+
+        sin.Metadata.ExecutionModuleKind = PyNTTTarget.Kind;
+        abs.Metadata.ExecutionModuleKind = CPUTarget.Kind;
+        var module = new IRModule(main);
+        var passManager = CompileSession.CreatePassManager("placement_partition");
+        passManager.Add<ModulePartitionPass>(new CPUModuleCompiler(), true);
+
+        await passManager.RunAsync(module);
+
+        var dispatch = Assert.IsType<Function>(module.Entry);
+        Assert.Equal(FunctionRole.ModuleDispatch, dispatch.Role);
+        var cpuFunction = Assert.Single(
+            module.Functions.OfType<Function>().Where(function => function.ModuleKind == CPUTarget.Kind));
+        Assert.Contains(
+            ExprCollector.Collect(cpuFunction.Body).OfType<Call>(),
+            call => call.Target is Unary { UnaryOp: UnaryOp.Abs });
+        Assert.DoesNotContain(
+            ExprCollector.Collect(cpuFunction.Body).OfType<Call>(),
+            call => call.Target is Unary { UnaryOp: UnaryOp.Sin });
+        Assert.Contains(
+            ExprCollector.Collect(dispatch.Body).OfType<Call>(),
+            call => call.Target is Unary { UnaryOp: UnaryOp.Sin });
+    }
+
+    [Fact]
+    public async Task TestRequiredPlacementFollowsAssignedCalleeOwnership()
+    {
+        var input = new Var("input", new TensorType(DataTypes.Float32, new[] { 8 }));
+        var cpuBody = IR.F.Math.Abs(input);
+        cpuBody.Metadata.ExecutionModuleKind = CPUTarget.Kind;
+        var cpuCallee = new Function("cpu_callee", CPUTarget.Kind, cpuBody, new IVar[] { input });
+
+        var callCpu = new Call(cpuCallee, input);
+        var pynttBody = IR.F.Math.Sin(callCpu);
+        pynttBody.Metadata.ExecutionModuleKind = PyNTTTarget.Kind;
+        var main = new Function("main", PyNTTTarget.Kind, pynttBody, new IVar[] { input })
+        {
+            IsEntry = true,
+            Role = FunctionRole.ModuleDispatch,
+        };
+        Assert.True(CompilerServices.InferenceType(main));
+
+        var module = new IRModule(main);
+        module.Add(cpuCallee);
+        var passManager = CompileSession.CreatePassManager("callee_placement_partition");
+        passManager.Add<ModulePartitionPass>(new PyNTTModuleCompiler(), true);
+
+        await passManager.RunAsync(module);
+
+        var dispatch = Assert.IsType<Function>(module.Entry);
+        Assert.Equal(FunctionRole.ModuleDispatch, dispatch.Role);
+        var extracted = Assert.Single(
+            module.Functions.OfType<Function>().Where(function =>
+                !ReferenceEquals(function, dispatch) &&
+                ExprCollector.Collect(function.Body).OfType<Call>().Any(
+                    call => call.Target is Unary { UnaryOp: UnaryOp.Sin })));
+        Assert.Contains(
+            ExprCollector.Collect(extracted.Body).OfType<Call>(),
+            call => call.Target is Unary { UnaryOp: UnaryOp.Sin });
+        Assert.DoesNotContain(
+            ExprCollector.Collect(dispatch.Body).OfType<Call>(),
+            call => call.Target is Unary { UnaryOp: UnaryOp.Sin });
+    }
+
+    [Fact]
+    public async Task TestRequiredPlacementThreadsDimensionParametersAcrossExtractedModuleBoundary()
+    {
+        var input = new Var("input", new TensorType(DataTypes.Float32, new[] { 8 }));
+        var layerId = new DimVar("layer_id");
+        var calleeInput = new Var("callee_input", input.TypeAnnotation);
+        var calleeLayerId = new DimVar("callee_layer_id");
+        var cpuCallee = new Function(
+            "cpu_callee_with_dimension",
+            CPUTarget.Kind,
+            IR.F.Math.Abs(calleeInput),
+            new IVar[] { calleeInput, calleeLayerId });
+        var cpuCall = new Call(cpuCallee, input, layerId);
+        var gpuCall = IR.F.Math.Sin(cpuCall);
+        gpuCall.Metadata.ExecutionModuleKind = PyNTTTarget.Kind;
+        var main = new Function(
+            "main",
+            PyNTTTarget.Kind,
+            gpuCall,
+            new IVar[] { input, layerId })
+        {
+            IsEntry = true,
+        };
+        Assert.True(CompilerServices.InferenceType(main));
+
+        var module = new IRModule(main);
+        module.Add(cpuCallee);
+        var passManager = CompileSession.CreatePassManager("dimension_boundary_partition");
+        passManager.Add<ModulePartitionPass>(new CPUModuleCompiler(), true);
+
+        await passManager.RunAsync(module);
+
+        var extracted = Assert.Single(
+            module.Functions.OfType<Function>().Where(function =>
+                function.ModuleKind == CPUTarget.Kind &&
+                function.Name.Contains("_kernel", StringComparison.Ordinal)));
+        var extractedDimension = Assert.Single(extracted.Parameters.ToArray().OfType<DimVar>());
+        var extractedCall = Assert.Single(
+            ExprCollector.Collect(extracted.Body).OfType<Call>().Where(call =>
+                call.Target is Function { Name: "cpu_callee_with_dimension" }));
+        Assert.Contains(
+            extractedCall.Arguments.ToArray(),
+            argument => ReferenceEquals(argument, extractedDimension));
+    }
+
+    [Fact]
+    public async Task TestRequiredPlacementFormsOnePhaseAcrossOwnedCalleeCall()
+    {
+        var input = new Var("input", new TensorType(DataTypes.Float32, new[] { 8 }));
+        var cpuBody = IR.F.Math.Abs(input);
+        cpuBody.Metadata.ExecutionModuleKind = CPUTarget.Kind;
+        var cpuCallee = new Function("cpu_callee", CPUTarget.Kind, cpuBody, new IVar[] { input });
+
+        var gpuInput = new Var("gpu_input", input.TypeAnnotation);
+        var gpuBody = IR.F.Math.Sin(gpuInput);
+        gpuBody.Metadata.ExecutionModuleKind = PyNTTTarget.Kind;
+        var gpuCallee = new Function("gpu_callee", PyNTTTarget.Kind, gpuBody, new IVar[] { gpuInput });
+
+        var cpuCall = new Call(cpuCallee, input);
+        var gpuCall = new Call(gpuCallee, cpuCall);
+        var gpuPostOp = IR.F.Math.Abs(gpuCall);
+        gpuPostOp.Metadata.ExecutionModuleKind = PyNTTTarget.Kind;
+        var main = new Function("main", PyNTTTarget.Kind, gpuPostOp, new IVar[] { input })
+        {
+            IsEntry = true,
+            Role = FunctionRole.ModuleDispatch,
+        };
+        Assert.True(CompilerServices.InferenceType(main));
+
+        var module = new IRModule(main);
+        module.Add(cpuCallee);
+        module.Add(gpuCallee);
+        var passManager = CompileSession.CreatePassManager("callee_phase_partition");
+        passManager.Add<ModulePartitionPass>(new PyNTTModuleCompiler(), true);
+
+        await passManager.RunAsync(module);
+
+        var dispatch = Assert.IsType<Function>(module.Entry);
+        var phase = Assert.Single(
+            module.Functions.OfType<Function>().Where(function =>
+            {
+                var calls = ExprCollector.Collect(function.Body).OfType<Call>().ToArray();
+                return calls.Any(call => call.Target is Function { Name: "gpu_callee" }) &&
+                    calls.Any(call => call.Target is Unary { UnaryOp: UnaryOp.Abs });
+            }));
+        var phaseCalls = ExprCollector.Collect(phase.Body).OfType<Call>().ToArray();
+        Assert.Contains(phaseCalls, call => call.Target is Function { Name: "gpu_callee" });
+        Assert.Contains(phaseCalls, call => call.Target is Unary { UnaryOp: UnaryOp.Abs });
+        Assert.DoesNotContain(
+            ExprCollector.Collect(dispatch.Body).OfType<Call>(),
+            call => call.Target is Function { Name: "gpu_callee" });
+    }
+
+    [Fact]
+    public async Task TestRewriteDumpSupportsTupleVertices()
+    {
+        var input = new Var("input", new TensorType(DataTypes.Float32, new[] { 8 }));
+        var sin = IR.F.Math.Sin(input);
+        var abs = IR.F.Math.Abs(input);
+        var main = new Function("main", new IR.Tuple(sin, abs), input);
+        Assert.True(CompilerServices.InferenceType(main));
+
+        sin.Metadata.ExecutionModuleKind = PyNTTTarget.Kind;
+        abs.Metadata.ExecutionModuleKind = CPUTarget.Kind;
+
+        var module = new IRModule(main);
+        var passManager = CompileSession.CreatePassManager("tuple_partition_dump");
+        passManager.Add<ModulePartitionPass>(new CPUModuleCompiler(), true);
+
+        await passManager.RunAsync(module);
+
+        Assert.IsType<TupleType>(Assert.IsType<Function>(module.Entry).Body.CheckedType);
+    }
+
+    [Fact]
     public async Task TestLineSameModuleC()
     {
         var input = new Var("input", new TensorType(DataTypes.Float32, new int[] { 1, 32, 32 }));

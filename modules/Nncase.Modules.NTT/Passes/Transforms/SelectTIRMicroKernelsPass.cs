@@ -32,12 +32,15 @@ public sealed class SelectTIRMicroKernelsPass : ModulePass
 
         var functions = input.Functions
             .OfType<PrimFunction>()
-            .Where(x => x.ModuleKind == _moduleKind)
+            .Where(x => x.ModuleKind == _moduleKind && CompileSession.IsFunctionActive(x))
             .ToArray();
         var alignmentRequirements = new OperandAlignmentRequirements();
         foreach (var function in functions)
         {
-            var rewriter = new SelectorRewriter(targetOptions, alignmentRequirements);
+            var rewriter = new SelectorRewriter(
+                targetOptions,
+                alignmentRequirements,
+                function.Name);
             rewriter.Rewrite(function);
             if (rewriter.IsMutated && !CompilerServices.InferenceType(function))
             {
@@ -61,15 +64,18 @@ public sealed class SelectTIRMicroKernelsPass : ModulePass
     {
         private readonly INTTTargetOptions _targetOptions;
         private readonly OperandAlignmentRequirements _alignmentRequirements;
+        private readonly string _functionName;
         private int _bufferIndex;
 
         public SelectorRewriter(
             INTTTargetOptions targetOptions,
-            OperandAlignmentRequirements alignmentRequirements)
+            OperandAlignmentRequirements alignmentRequirements,
+            string functionName)
             : base(visitOtherFunctions: false)
         {
             _targetOptions = targetOptions;
             _alignmentRequirements = alignmentRequirements;
+            _functionName = functionName;
         }
 
         protected override BaseExpr RewriteLeafCall(Call expr)
@@ -87,11 +93,22 @@ public sealed class SelectTIRMicroKernelsPass : ModulePass
             }
 
             var semanticArguments = arguments[..^1];
-            var selection = _targetOptions.TIRMicroKernelSelector.Select(
-                new TIRMicroKernelSelectionContext(
-                    kernelOp,
-                    semanticArguments,
-                    _targetOptions.TargetMachineModel));
+            TIRMicroKernelSelection? selection;
+            try
+            {
+                selection = _targetOptions.TIRMicroKernelSelector.Select(
+                    new TIRMicroKernelSelectionContext(
+                        kernelOp,
+                        semanticArguments,
+                        _targetOptions.TargetMachineModel));
+            }
+            catch (Exception exception) when (exception is InvalidOperationException or NotSupportedException)
+            {
+                throw new NotSupportedException(
+                    $"Failed to select a TIR microkernel for {kernelOp.GetType().Name} " +
+                    $"in prim function {_functionName}: {exception.Message}",
+                    exception);
+            }
             if (selection?.TransferPipeline is { } transferPipeline)
             {
                 ValidateTransferPipelineContract(kernelOp, semanticArguments, selection, transferPipeline);
@@ -288,8 +305,7 @@ public sealed class SelectTIRMicroKernelsPass : ModulePass
 
         private void Add(TIR.Buffer buffer, int alignmentBytes, string channelName)
         {
-            if (!buffer.MemSpan.Start.IsFixed ||
-                buffer.MemSpan.Start.FixedValue % alignmentBytes != 0)
+            if (!Dimension.TryDivExactly(buffer.MemSpan.Start, alignmentBytes, out _))
             {
                 throw new InvalidOperationException(
                     $"Transfer channel {channelName} requires {alignmentBytes}-byte aligned " +

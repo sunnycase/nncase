@@ -21,6 +21,13 @@ public interface ILinkContext
     /// <param name="function">Function.</param>
     /// <returns>Function id.</returns>
     FunctionId GetFunctionId(BaseFunction function);
+
+    /// <summary>
+    /// Gets an already linked dependency module.
+    /// </summary>
+    /// <param name="moduleKind">Module kind.</param>
+    /// <returns>Linked module.</returns>
+    ILinkedModule GetLinkedModule(string moduleKind);
 }
 
 /// <summary>
@@ -127,6 +134,16 @@ public interface ILinkedModule
 /// </summary>
 public interface ILinkableModule
 {
+    /// <summary>
+    /// Gets module kind.
+    /// </summary>
+    string ModuleKind { get; }
+
+    /// <summary>
+    /// Gets module kinds that must be linked before this module.
+    /// </summary>
+    IReadOnlySet<string> DependencyModuleKinds { get; }
+
     IReadOnlyList<ILinkableFunction> PublicFunctions { get; }
 
     /// <summary>

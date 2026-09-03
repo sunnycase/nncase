@@ -34,12 +34,33 @@ public sealed partial class AutoDistributedWithShapeBucketPass : ModulePass
 
     protected override Task<IRModule> RunCoreAsync(IRModule input, RunPassContext context)
     {
-        if (input.Entry is not Function function || function.Metadata is AutoDistributedMetaData { Skip: true })
+        if (_compileOptions.TargetOptions is not INTTTargetOptions targetOptions)
         {
             return Task.FromResult(input);
         }
 
-        if (_compileOptions.TargetOptions is INTTTargetOptions targetOptions)
+        var candidates = input.Functions
+            .OfType<Function>()
+            .Where(function =>
+                function.ModuleKind == _moduleKind &&
+                function.Role != FunctionRole.ModuleDispatch &&
+                function.Metadata is not AutoDistributedMetaData { Skip: true })
+            .ToArray();
+        var candidateSet = candidates.ToHashSet(
+            (IEqualityComparer<Function>)ReferenceEqualityComparer.Instance);
+        var referencedCandidates = candidates
+            .SelectMany(FunctionReferenceValidator.GetDirectFunctionReferences)
+            .OfType<Function>()
+            .Where(candidateSet.Contains)
+            .ToHashSet((IEqualityComparer<Function>)ReferenceEqualityComparer.Instance);
+        var roots = candidates.Where(function => !referencedCandidates.Contains(function)).ToArray();
+        if (candidates.Length > 0 && roots.Length == 0)
+        {
+            throw new InvalidOperationException(
+                $"AutoDistributed found no acyclic compute root for module {_moduleKind}.");
+        }
+
+        foreach (var function in roots)
         {
             var newFunction = Distribute(function, targetOptions);
             input.Replace(GetFunctionIndex(input, function), newFunction);
@@ -270,7 +291,11 @@ public sealed partial class AutoDistributedWithShapeBucketPass : ModulePass
             path.Add(function);
             foreach (var referencedFunction in FunctionReferenceValidator.GetDirectFunctionReferences(function))
             {
-                Visit(referencedFunction);
+                if (referencedFunction.ModuleKind == _moduleKind &&
+                    referencedFunction.Role != FunctionRole.ModuleDispatch)
+                {
+                    Visit(referencedFunction);
+                }
             }
 
             path.RemoveAt(path.Count - 1);

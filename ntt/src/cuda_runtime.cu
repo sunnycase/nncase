@@ -116,9 +116,9 @@ block_entry(const cuda_block_entry_params_t &params) {
                     params.block_local_rdata.size_bytes());
 
     distributed::topology_synchronize();
-    thread_main(params.input_descs, params.output_descs, params.rdata.data(),
-                block_local_rdata.data(), data.data(), block_local_data.data(),
-                params.output);
+    block_main(params.function_id, params.input_descs, params.output_descs,
+               params.rdata.data(), block_local_rdata.data(), data.data(),
+               block_local_data.data(), params.output);
 }
 
 int main() {

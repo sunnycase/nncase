@@ -50,12 +50,30 @@ public class VectorizedRoPEEvaluator : IEvaluator<VectorizedRoPE>, ITypeInferenc
         var sin = OrtKI.Cast(ToLogicalTensor(sinTensor, rotaryAxis), (long)OrtDataType.Float);
 
         var sliceAxis = input.Rank - 1;
-        var sliceDim = input.Shape[sliceAxis] / 2;
-        var parts = OrtKI.Split(input, new[] { sliceDim, sliceDim }, sliceAxis);
+        var rotaryDim = cos.Shape[sliceAxis];
+        if (!cos.Shape.SequenceEqual(sin.Shape) ||
+            rotaryDim <= 0 ||
+            rotaryDim > input.Shape[sliceAxis] ||
+            rotaryDim % 2 != 0)
+        {
+            throw new ArgumentException(
+                $"VectorizedRoPE requires matching sin/cos with a positive even rotary dimension no larger than input, " +
+                $"got input=[{string.Join(',', input.Shape)}], cos=[{string.Join(',', cos.Shape)}], sin=[{string.Join(',', sin.Shape)}].");
+        }
+
+        var inputParts = OrtKI.Split(
+            input,
+            new[] { rotaryDim, input.Shape[sliceAxis] - rotaryDim },
+            sliceAxis);
+        var rotaryHalf = rotaryDim / 2;
+        var rotaryParts = OrtKI.Split(inputParts[0], new[] { rotaryHalf, rotaryHalf }, sliceAxis);
 
         // rotate half
-        var rotated = OrtKI.Concat([OrtKI.Neg(parts[1]), parts[0]], sliceAxis);
-        var output = OrtKI.Add(OrtKI.Mul(input, cos), OrtKI.Mul(rotated, sin));
+        var rotated = OrtKI.Concat([OrtKI.Neg(rotaryParts[1]), rotaryParts[0]], sliceAxis);
+        var rotaryOutput = OrtKI.Add(OrtKI.Mul(inputParts[0], cos), OrtKI.Mul(rotated, sin));
+        var output = rotaryDim == input.Shape[sliceAxis]
+            ? rotaryOutput
+            : OrtKI.Concat([rotaryOutput, inputParts[1]], sliceAxis);
         output = OrtKI.Cast(output, (long)GetScalarDataType(originDtype).ToOrtType());
         output = FromLogicalTensor(output, originDtype, rotaryAxis);
         return output.ToValue(originDtype);

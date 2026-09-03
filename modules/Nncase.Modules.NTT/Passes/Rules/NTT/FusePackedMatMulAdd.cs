@@ -76,7 +76,7 @@ public sealed partial class FusePackedMatMulAdd : IRewriteRule
             packedMatMul.OutputDataType,
             scale,
             packedMatMul.RhsLayout,
-            addend).InheritMetaData(binaryCall);
+            addend).InheritMetaData(packedCall);
     }
 }
 
@@ -142,7 +142,80 @@ public sealed partial class FusePackedBlockScaledMatMulAdd : IRewriteRule
             packedMatMul.WeightBlockK,
             packedMatMul.RhsLayout,
             packedMatMul.OutputNVectorLaneCount,
-            addend).InheritMetaData(binaryCall);
+            addend).InheritMetaData(packedCall);
+    }
+}
+
+/// <summary>
+/// Fuses an exact-layout add into a packed NVFP4 matmul before distributed
+/// layouts are selected.
+/// </summary>
+[RuleGenerator]
+public sealed partial class FusePackedNVFP4MatMulAdd : IRewriteRule
+{
+    public FusePackedNVFP4MatMulAdd()
+    {
+        var packedMatMul = IsPackedNVFP4MatMul(
+            "packedMatMul",
+            "packedCall",
+            _ => true,
+            IsWildcard("lhs"),
+            IsWildcard("rhsPacked"),
+            IsWildcard("rhsScale"),
+            IsWildcard("lhsGlobalScale"),
+            IsWildcard("rhsGlobalScale"),
+            IsNone());
+
+        Pattern = IsAlt(
+            IsBinary(
+                "binary",
+                "binaryCall",
+                op => op.BinaryOp == BinaryOp.Add,
+                packedMatMul,
+                IsWildcard("addend")),
+            IsBinary(
+                "binary",
+                "binaryCall",
+                op => op.BinaryOp == BinaryOp.Add,
+                IsWildcard("addend"),
+                packedMatMul));
+    }
+
+    public IPattern Pattern { get; }
+
+    private Expr? GetReplace(
+        PackedNVFP4MatMul packedMatMul,
+        Call packedCall,
+        Expr lhs,
+        Expr rhsPacked,
+        Expr rhsScale,
+        Expr lhsGlobalScale,
+        Expr rhsGlobalScale,
+        Call binaryCall,
+        Expr addend)
+    {
+        if (ReferenceEquals(addend, packedCall) ||
+            packedCall.Users.Count() != 1 ||
+            !ReferenceEquals(packedCall.Users.Single(), binaryCall) ||
+            !Equals(packedCall.CheckedType, addend.CheckedType) ||
+            !Equals(binaryCall.CheckedType, packedCall.CheckedType))
+        {
+            return null;
+        }
+
+        return IR.F.NTT.PackedNVFP4MatMul(
+            lhs,
+            rhsPacked,
+            rhsScale,
+            lhsGlobalScale,
+            rhsGlobalScale,
+            packedMatMul.OutputDataType,
+            packedMatMul.GroupSize,
+            packedMatMul.InputKVectorLaneCount,
+            packedMatMul.RhsKPackLaneCount,
+            packedMatMul.RhsKVectorLaneCount,
+            packedMatMul.OutputNVectorLaneCount,
+            addend).InheritMetaData(packedCall);
     }
 }
 

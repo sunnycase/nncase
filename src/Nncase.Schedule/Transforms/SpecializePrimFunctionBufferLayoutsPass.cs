@@ -18,15 +18,21 @@ public sealed class SpecializePrimFunctionBufferLayoutsPass : ModulePass
     /// <inheritdoc/>
     protected override Task<IRModule> RunCoreAsync(IRModule input, RunPassContext context)
     {
-        if (input.Entry is not PrimFunction entry)
+        if (input.Entry is null)
         {
             throw new InvalidOperationException(
-                $"{nameof(SpecializePrimFunctionBufferLayoutsPass)} expects a lowered PrimFunction entry, " +
-                $"but found {input.Entry?.GetType().Name ?? "null"}.");
+                $"{nameof(SpecializePrimFunctionBufferLayoutsPass)} requires an entry function.");
+        }
+
+        var roots = TIRCallGraphRootUtility.Collect(input);
+        if (roots.Length == 0)
+        {
+            throw new InvalidOperationException(
+                $"Heterogeneous entry {input.Entry.Name} does not launch any lowered PipelineWorker PrimFunctions.");
         }
 
         var specializer = new BufferLayoutSpecializer(input);
-        return Task.FromResult(specializer.Specialize(entry));
+        return Task.FromResult(specializer.Specialize(input.Entry, roots));
     }
 
     private sealed class BufferLayoutSpecializer
@@ -41,9 +47,12 @@ public sealed class SpecializePrimFunctionBufferLayoutsPass : ModulePass
             _module = module;
         }
 
-        public IRModule Specialize(PrimFunction entry)
+        public IRModule Specialize(BaseFunction entry, IReadOnlyList<PrimFunction> roots)
         {
-            var entryVariant = Discover(entry, GetDeclaredSignature(entry));
+            var rootVariants = roots.ToDictionary(
+                root => root,
+                root => Discover(root, GetDeclaredSignature(root)),
+                new ReferenceEqualityComparer<PrimFunction>());
             AssignNames();
 
             foreach (var variant in _postOrder)
@@ -51,10 +60,19 @@ public sealed class SpecializePrimFunctionBufferLayoutsPass : ModulePass
                 CloneVariant(variant);
             }
 
+            var rootReplacements = rootVariants.ToDictionary(
+                item => item.Key,
+                item => item.Value.Function ??
+                    throw new InvalidOperationException($"Pipeline worker variant {item.Value.Name} was not materialized."),
+                new ReferenceEqualityComparer<PrimFunction>());
+            var wrapperReplacements = TIRCallGraphRootUtility.RebindWrappers(_module, rootReplacements);
+
             var result = new IRModule();
             foreach (var function in _module.Functions.Where(x => x is not PrimFunction))
             {
-                result.Add(function);
+                result.Add(function is PrimFunctionWrapper wrapper && wrapperReplacements.TryGetValue(wrapper, out var replacement)
+                    ? replacement
+                    : function);
             }
 
             foreach (var variant in _postOrder)
@@ -62,7 +80,9 @@ public sealed class SpecializePrimFunctionBufferLayoutsPass : ModulePass
                 result.Add(variant.Function ?? throw new InvalidOperationException($"PrimFunction variant {variant.Name} was not materialized."));
             }
 
-            result.Entry = entryVariant.Function;
+            result.Entry = entry is PrimFunction primEntry
+                ? rootVariants[primEntry].Function
+                : entry;
             return result;
         }
 
@@ -425,7 +445,6 @@ public sealed class SpecializePrimFunctionBufferLayoutsPass : ModulePass
 
             protected override BaseExpr VisitLeafBuffer(TIR.Buffer expr, Unit context)
             {
-                var cloned = (TIR.Buffer)base.VisitLeafBuffer(expr, context);
                 if (expr.MemSpan.Buffer.Start is not BufferVar backingParameter
                     || !_replacements.TryGetValue(backingParameter, out var replacement)
                     || replacement is not BufferVar specializedParameter
@@ -436,17 +455,25 @@ public sealed class SpecializePrimFunctionBufferLayoutsPass : ModulePass
                         specializedParameter.LayoutAnnotation.Strides,
                         out var strides))
                 {
-                    return cloned;
+                    return base.VisitLeafBuffer(expr, context);
                 }
 
+                var clonedMemSpan = Clone(expr.MemSpan, context);
+                var clonedDimensions = expr.Dimensions.ToArray()
+                    .Select(dimension => Clone(dimension, context))
+                    .ToArray();
                 var localShape = GetLocalBufferShape(expr);
-                var byteSpan = BufferViewUtility.GetByteSpanSize(localShape.Dimensions, strides, cloned.ElemType.SizeInBytes);
-                var requiredPhysicalSize = (cloned.MemSpan.Start + byteSpan).Simplify();
-                var physicalSize = Dimension.Max(cloned.MemSpan.Buffer.Size, requiredPhysicalSize).Simplify();
-                var physicalBuffer = cloned.MemSpan.Buffer.With(size: physicalSize);
-                var memSpan = cloned.MemSpan.With(buffer: physicalBuffer, size: byteSpan);
-                return cloned.With(
+                var byteSpan = BufferViewUtility.GetByteSpanSize(
+                    localShape.Dimensions,
+                    strides,
+                    expr.ElemType.SizeInBytes);
+                var requiredPhysicalSize = (clonedMemSpan.Start + byteSpan).Simplify();
+                var physicalSize = Dimension.Max(clonedMemSpan.Buffer.Size, requiredPhysicalSize).Simplify();
+                var physicalBuffer = clonedMemSpan.Buffer.With(size: physicalSize);
+                var memSpan = clonedMemSpan.With(buffer: physicalBuffer, size: byteSpan);
+                return expr.With(
                     memSpan: memSpan,
+                    dimensions: clonedDimensions,
                     strides: strides,
                     distributedStorageKind: specializedParameter.LayoutAnnotation.DistributedStorageKind);
             }

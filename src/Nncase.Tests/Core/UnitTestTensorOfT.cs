@@ -408,6 +408,7 @@ public sealed class UnitTestTensorOfT
         {
             var a = Tensor.From(new[] { 1, 2, 3, 4 }, [2, 2]);
             Assert.Throws<ArgumentException>(() => a.Transpose([0, 2]));
+            Assert.Throws<ArgumentException>(() => a.Transpose([0, 0]));
         }
 
         {
@@ -417,5 +418,21 @@ public sealed class UnitTestTensorOfT
             Assert.Equal(1, b.Dimensions[0]);
             Assert.Equal(2, b.Dimensions[1]);
         }
+    }
+
+    [Fact]
+    public void TestTensorReinterpretSharesBackingMemory()
+    {
+        var source = Tensor.From(new byte[] { 0, 1, 2, 3, 4, 5, 6, 7 }, [2, 4]);
+        var packed = source.Reinterpret(new VectorType(DataTypes.UInt8, [4]), [2]);
+        var restored = packed.Reinterpret(DataTypes.UInt8, [2, 4]);
+
+        packed.BytesBuffer[0] = 42;
+        restored.BytesBuffer[^1] = 84;
+
+        Assert.Equal((byte)42, source.BytesBuffer[0]);
+        Assert.Equal((byte)84, source.BytesBuffer[^1]);
+        Assert.Equal(new long[] { 2 }, packed.Dimensions.ToArray());
+        Assert.Equal(new long[] { 2, 4 }, restored.Dimensions.ToArray());
     }
 }

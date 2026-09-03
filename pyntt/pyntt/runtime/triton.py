@@ -2,9 +2,14 @@
 
 from __future__ import annotations
 
+from dataclasses import dataclass
 from typing import Any, Mapping, Optional, Sequence
 
-from pyntt.runtime.tensor import dtype_item_size, view_typed_buffer
+from pyntt.runtime.tensor import (
+    dtype_item_size,
+    view_typed_backing_buffer,
+    view_typed_buffer,
+)
 
 _TRITON_ALLOCATOR_INSTALLED = False
 _VALIDATED_KERNEL_RESOURCES: set[tuple[object, ...]] = set()
@@ -12,6 +17,27 @@ _VALIDATED_KERNEL_RESOURCES: set[tuple[object, ...]] = set()
 
 class TritonKernelResourceError(RuntimeError):
     """A compiled specialization violates the target resource contract."""
+
+
+@dataclass(frozen=True)
+class HostTensorDescriptorSource:
+    """A descriptor source whose owners use the caller's workspace stride."""
+
+    storage: Any
+    owner_stride_bytes: int
+
+
+def make_host_tensor_descriptor_source(
+    storage: Any, owner_stride_bytes: int
+) -> HostTensorDescriptorSource:
+    """Bind a descriptor source to its caller-owned physical pool stride."""
+    owner_stride_bytes = int(owner_stride_bytes)
+    if owner_stride_bytes <= 0:
+        raise ValueError(
+            "PyNTT host tensor descriptor source owner stride must be positive, "
+            f"got {owner_stride_bytes}."
+        )
+    return HostTensorDescriptorSource(storage, owner_stride_bytes)
 
 
 def _validate_execution_model_launch_options(
@@ -54,6 +80,7 @@ class PreparedTritonKernel:
         "parameter_value",
         "_prepared",
         "_runtime_argument_count",
+        "_static_argument_keepalive",
     )
 
     def __init__(
@@ -63,12 +90,14 @@ class PreparedTritonKernel:
         parameter_value: int,
         prepared: object,
         runtime_argument_count: int,
+        static_argument_keepalive: tuple[object, ...],
     ) -> None:
         self.kernel_name = str(kernel_name)
         self.parameter_name = str(parameter_name)
         self.parameter_value = int(parameter_value)
         self._prepared = prepared
         self._runtime_argument_count = int(runtime_argument_count)
+        self._static_argument_keepalive = static_argument_keepalive
 
     @property
     def compiled_kernel(self):
@@ -113,12 +142,13 @@ class TritonTensorDescriptorCache:
             "block_shape",
             "padding",
             "swizzle_mode",
+            "owner_indexing",
             "entry_size_bytes",
             "entries",
         }
     )
     _TABLE_ENTRY_FIELDS = frozenset(
-        {"offset_bytes", "shape", "strides", "source_shape_axes"}
+        {"owner_index", "offset_bytes", "shape", "strides", "source_shape_axes"}
     )
     _TMA_HOST_DTYPE = {
         "uint8": 0,
@@ -138,6 +168,41 @@ class TritonTensorDescriptorCache:
 
     def __init__(self) -> None:
         self._entries: dict[str, tuple[tuple[object, ...], object]] = {}
+        self._materialized_sets: dict[
+            tuple[str, int],
+            tuple[object, tuple[object, ...], tuple[object, ...]],
+        ] = {}
+
+    @staticmethod
+    def _source_signature(source: Any) -> tuple[object, ...]:
+        if isinstance(source, HostTensorDescriptorSource):
+            storage = source.storage
+            source_kind = "owner_pool"
+            owner_stride_bytes = source.owner_stride_bytes
+        else:
+            storage = source
+            source_kind = "storage"
+            owner_stride_bytes = 0
+        if not hasattr(storage, "data_ptr") or not hasattr(storage, "device"):
+            raise TypeError(
+                "PyNTT host tensor descriptor source expects tensor storage, "
+                f"got {type(storage).__name__}."
+            )
+        untyped_storage = getattr(storage, "untyped_storage", None)
+        backing_bytes = (
+            int(untyped_storage().nbytes()) if untyped_storage is not None else 0
+        )
+        return (
+            source_kind,
+            int(storage.data_ptr()),
+            str(storage.device),
+            str(getattr(storage, "dtype", "")),
+            tuple(int(extent) for extent in getattr(storage, "shape", ())),
+            tuple(int(stride) for stride in storage.stride()),
+            int(storage.storage_offset()),
+            backing_bytes,
+            owner_stride_bytes,
+        )
 
     def materialize_many(
         self,
@@ -146,6 +211,19 @@ class TritonTensorDescriptorCache:
         sources: Mapping[str, Any],
     ) -> tuple[object, ...]:
         """Return descriptors in compiler-defined ABI order."""
+        source_signature = tuple(
+            (name, self._source_signature(source))
+            for name, source in sorted(sources.items())
+        )
+        set_key = str(kernel_name), id(specs)
+        cached_set = self._materialized_sets.get(set_key)
+        if (
+            cached_set is not None
+            and cached_set[0] is specs
+            and cached_set[1] == source_signature
+        ):
+            return cached_set[2]
+
         descriptors = []
         for spec in specs:
             kind = spec.get("kind")
@@ -176,12 +254,13 @@ class TritonTensorDescriptorCache:
                     "PyNTT host tensor descriptor name/source must be non-empty."
                 )
             try:
-                storage = sources[source_name]
+                source = sources[source_name]
             except KeyError as ex:
                 raise ValueError(
                     f"PyNTT host tensor descriptor {name!r} references "
                     f"unbound source {source_name!r}."
                 ) from ex
+            storage = source.storage if isinstance(source, HostTensorDescriptorSource) else source
             slot = f"{kernel_name}:{name}"
             if kind == "single":
                 descriptor = self._materialize(
@@ -203,6 +282,9 @@ class TritonTensorDescriptorCache:
                     padding=str(spec["padding"]),
                 )
             else:
+                owner_stride_bytes, use_backing_storage = self._resolve_owner_indexing(
+                    slot, spec["owner_indexing"], source
+                )
                 descriptor = self._materialize_table(
                     slot,
                     storage,
@@ -211,10 +293,53 @@ class TritonTensorDescriptorCache:
                     padding=str(spec["padding"]),
                     swizzle_mode=int(spec["swizzle_mode"]),
                     entry_size_bytes=int(spec["entry_size_bytes"]),
+                    owner_stride_bytes=owner_stride_bytes,
+                    use_backing_storage=use_backing_storage,
                     entries=tuple(spec["entries"]),
                 )
             descriptors.append(descriptor)
-        return tuple(descriptors)
+        result = tuple(descriptors)
+        self._materialized_sets[set_key] = (specs, source_signature, result)
+        return result
+
+    @staticmethod
+    def _resolve_owner_indexing(
+        slot: str, owner_indexing: Any, source: Any
+    ) -> tuple[int, bool]:
+        if owner_indexing is None:
+            return 0, False
+        if not isinstance(owner_indexing, Mapping):
+            raise ValueError(
+                f"PyNTT host tensor descriptor {slot} owner_indexing must be an object or None."
+            )
+        fields = frozenset(owner_indexing)
+        expected_fields = frozenset({"kind", "stride_bytes"})
+        if fields != expected_fields:
+            raise ValueError(
+                f"PyNTT host tensor descriptor {slot} owner_indexing has fields "
+                f"{sorted(fields)}, expected {sorted(expected_fields)}."
+            )
+        kind = str(owner_indexing["kind"])
+        fixed_stride_bytes = int(owner_indexing["stride_bytes"])
+        if kind == "fixed":
+            if fixed_stride_bytes <= 0:
+                raise ValueError(
+                    f"PyNTT host tensor descriptor {slot} fixed owner stride must be positive."
+                )
+            return fixed_stride_bytes, False
+        if kind == "source_pool":
+            if fixed_stride_bytes != 0:
+                raise ValueError(
+                    f"PyNTT host tensor descriptor {slot} source-pool indexing cannot carry a fixed stride."
+                )
+            if not isinstance(source, HostTensorDescriptorSource):
+                raise ValueError(
+                    f"PyNTT host tensor descriptor {slot} requires a caller-owned source pool stride."
+                )
+            return source.owner_stride_bytes, True
+        raise ValueError(
+            f"PyNTT host tensor descriptor {slot} has unsupported owner indexing kind {kind!r}."
+        )
 
     @staticmethod
     def _resolve_shape(
@@ -260,7 +385,7 @@ class TritonTensorDescriptorCache:
             resolved.append(extent)
         return tuple(resolved)
 
-    def _prepare_descriptor_base(
+    def _validate_descriptor_base(
         self,
         slot: str,
         storage: Any,
@@ -271,7 +396,7 @@ class TritonTensorDescriptorCache:
         strides: tuple[int, ...],
         block_shape: tuple[int, ...],
         padding: str,
-    ) -> tuple[object, tuple[object, ...]]:
+    ) -> tuple[tuple[object, ...], int]:
         if len(shape) == 0 or len(shape) > 5:
             raise ValueError(
                 f"PyNTT host tensor descriptor {slot} rank must be in [1, 5], "
@@ -345,7 +470,23 @@ class TritonTensorDescriptorCache:
             (extent - 1) * stride for extent, stride in zip(shape, strides)
         )
         size_bytes = span_elements * item_size
-        base = view_typed_buffer(storage, offset_bytes, size_bytes, dtype)
+        return signature, size_bytes
+
+    def _materialize_descriptor_base(
+        self,
+        slot: str,
+        storage: Any,
+        *,
+        offset_bytes: int,
+        size_bytes: int,
+        dtype: str,
+        padding: str,
+        use_backing_storage: bool = False,
+    ) -> object:
+        view_buffer = (
+            view_typed_backing_buffer if use_backing_storage else view_typed_buffer
+        )
+        base = view_buffer(storage, offset_bytes, size_bytes, dtype)
         if int(base.data_ptr()) % self._DESCRIPTOR_ALIGNMENT_BYTES != 0:
             raise ValueError(
                 f"PyNTT host tensor descriptor {slot} base address after byte "
@@ -357,7 +498,7 @@ class TritonTensorDescriptorCache:
                 f"PyNTT host tensor descriptor {slot} cannot use NaN padding "
                 f"with dtype {dtype}."
             )
-        return base, signature
+        return base
 
     def _materialize(
         self,
@@ -371,7 +512,7 @@ class TritonTensorDescriptorCache:
         block_shape: tuple[int, ...],
         padding: str,
     ) -> object:
-        base, descriptor_signature = self._prepare_descriptor_base(
+        descriptor_signature, size_bytes = self._validate_descriptor_base(
             slot,
             storage,
             offset_bytes=offset_bytes,
@@ -385,6 +526,15 @@ class TritonTensorDescriptorCache:
         cached = self._entries.get(slot)
         if cached is not None and cached[0] == signature:
             return cached[1]
+
+        base = self._materialize_descriptor_base(
+            slot,
+            storage,
+            offset_bytes=offset_bytes,
+            size_bytes=size_bytes,
+            dtype=dtype,
+            padding=padding,
+        )
 
         from triton.tools.tensor_descriptor import TensorDescriptor
 
@@ -408,6 +558,8 @@ class TritonTensorDescriptorCache:
         padding: str,
         swizzle_mode: int,
         entry_size_bytes: int,
+        owner_stride_bytes: int,
+        use_backing_storage: bool,
         entries: tuple[Mapping[str, Any], ...],
     ) -> object:
         if entry_size_bytes != self._TENSOR_MAP_ALIGNMENT_BYTES:
@@ -430,7 +582,7 @@ class TritonTensorDescriptorCache:
                 f"PyNTT tensor-map table {slot} does not support dtype {dtype!r}."
             ) from ex
 
-        prepared_entries = []
+        prepared_entry_specs = []
         entry_signatures = []
         for index, entry in enumerate(entries):
             fields = frozenset(entry)
@@ -452,17 +604,40 @@ class TritonTensorDescriptorCache:
                 ),
             )
             strides = tuple(int(value) for value in entry["strides"])
-            base, entry_signature = self._prepare_descriptor_base(
+            owner_index = int(entry["owner_index"])
+            if owner_index < 0:
+                raise ValueError(
+                    f"PyNTT tensor-map table {entry_slot} has negative owner index "
+                    f"{owner_index}."
+                )
+            offset_bytes = int(entry["offset_bytes"])
+            if owner_stride_bytes == 0 and owner_index != 0:
+                raise ValueError(
+                    f"PyNTT tensor-map table {entry_slot} indexes owner {owner_index} "
+                    "without owner indexing metadata."
+                )
+            physical_offset_bytes = (
+                offset_bytes + owner_index * owner_stride_bytes
+            )
+            entry_signature, size_bytes = self._validate_descriptor_base(
                 entry_slot,
                 storage,
-                offset_bytes=int(entry["offset_bytes"]),
+                offset_bytes=physical_offset_bytes,
                 dtype=dtype,
                 shape=shape,
                 strides=strides,
                 block_shape=block_shape,
                 padding=padding,
             )
-            prepared_entries.append((base, shape, strides))
+            prepared_entry_specs.append(
+                (
+                    entry_slot,
+                    physical_offset_bytes,
+                    size_bytes,
+                    shape,
+                    strides,
+                )
+            )
             entry_signatures.append(entry_signature)
 
         signature = (
@@ -477,6 +652,19 @@ class TritonTensorDescriptorCache:
         cached = self._entries.get(slot)
         if cached is not None and cached[0] == signature:
             return cached[1]
+
+        prepared_entries = []
+        for entry_slot, offset_bytes, size_bytes, shape, strides in prepared_entry_specs:
+            base = self._materialize_descriptor_base(
+                entry_slot,
+                storage,
+                offset_bytes=offset_bytes,
+                size_bytes=size_bytes,
+                dtype=dtype,
+                padding=padding,
+                use_backing_storage=use_backing_storage,
+            )
+            prepared_entries.append((base, shape, strides))
 
         device = getattr(storage, "device", None)
         if getattr(device, "type", None) != "cuda":
@@ -743,6 +931,11 @@ def prepare_and_validate_triton_kernel(
             candidate,
             prepared,
             len(dynamic_argument_indices),
+            tuple(
+                argument
+                for index, argument in enumerate(kernel_args)
+                if index not in dynamic_argument_indices
+            ),
         )
 
     detail = "; ".join(failures)

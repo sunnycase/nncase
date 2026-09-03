@@ -82,15 +82,22 @@ public sealed class NTTModuleBuilder : IModuleBuilder
             writer.Write(ref header);
         }
 
-        var linkableFunctions = functions.OfType<BaseFunction>()
-            .Select((function, index) => new FunctionBuilder(
-                (uint)index,
+        var linkableFunctions = new List<ILinkableFunction>(functions.Count);
+        uint publicFunctionId = 0;
+        var hasPipelineWorker = primFunctions.Any(function => function.Role == FunctionRole.PipelineWorker);
+        foreach (var function in functions)
+        {
+            var isPublic = function is PrimFunction primFunction &&
+                (!hasPipelineWorker || primFunction.Role == FunctionRole.PipelineWorker);
+            var functionId = isPublic ? publicFunctionId++ : 0;
+            linkableFunctions.Add(new FunctionBuilder(
+                functionId,
                 _rdataWriter,
                 _blockLocalRdataWriters,
                 targetOptions,
                 chipLocalRdataBase,
-                mergedRdataPoolSize).Build(function))
-            .ToArray();
+                mergedRdataPoolSize).Build(function));
+        }
         _rdataWriter.Flush();
         var blockLocalRdataContents = Enumerable.Range(0, _blockLocalRdataWriters.Length).Select(i =>
         {

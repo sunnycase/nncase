@@ -32,6 +32,7 @@ public sealed class UnitTestFusePagedAttentionMergePackedMatMulPass : TestClassB
             maxState,
             sumState,
             accState,
+            None.Default,
             mergedOutput,
             new IRArray<AttentionDimKind>(
                 new[] { AttentionDimKind.Seq, AttentionDimKind.Head, AttentionDimKind.Dim }),

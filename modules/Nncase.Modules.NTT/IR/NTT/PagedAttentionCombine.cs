@@ -18,6 +18,8 @@ public sealed partial class PagedAttentionCombine : Op
 
     public static readonly ParameterInfo AccState = new(typeof(PagedAttentionCombine), 2, "acc_state", ParameterKind.Input);
 
+    public static readonly ParameterInfo OutputGate = new(typeof(PagedAttentionCombine), 3, "output_gate", ParameterKind.Input);
+
     public IRArray<AttentionDimKind> Layout { get; }
 
     public int HiddenSize { get; }

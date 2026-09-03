@@ -26,6 +26,7 @@ public sealed class TritonTIRMicroKernelSelector : ITIRMicroKernelSelector
     private const int SimtPagedAttentionNumStages = 1;
     private const int MmaPagedAttentionNumStages = 2;
     private const int PackedGemvMinimumBlockK = 128;
+    private const int TensorFp8MmaMinimumBlockK = 128;
 
     // The SIMT stage helper statically expands one 32-element reduction group.
     // Keep a stage within 32 groups; larger bodies delay first-tile consumption
@@ -36,7 +37,6 @@ public sealed class TritonTIRMicroKernelSelector : ITIRMicroKernelSelector
     private const int NVFP4BlockK = 512;
     private const int NVFP4MaximumBlockN = 128;
     private const int PackedGemvMinimumLogicalStages = 2;
-    private const int BlockFp8MmaNTilesPerActivationBatch = 2;
     private const int GatedDeltaNetConvolutionMaximumBlockN = 256;
     private const int GatedDeltaNetRecurrentCoreBlockN = 128;
     private const int GatedDeltaNetProjectionMaximumBlockK = 2048;
@@ -130,6 +130,19 @@ public sealed class TritonTIRMicroKernelSelector : ITIRMicroKernelSelector
                 "triton.nvfp4_matmul",
                 [
                     Nncase.TIR.NTT.NVFP4MatMul.RhsPacked.Index,
+                    Nncase.TIR.NTT.NVFP4MatMul.RhsScale.Index,
+                ]),
+            Nncase.TIR.NTT.NVFP4MatMulNormStats nvfp4MatMulNormStats => SelectNVFP4MatMul(
+                context,
+                nvfp4MatMulNormStats.GroupSize,
+                Nncase.TIR.NTT.NVFP4MatMulNormStats.Lhs.Index,
+                Nncase.TIR.NTT.NVFP4MatMulNormStats.RhsPacked.Index,
+                Nncase.TIR.NTT.NVFP4MatMulNormStats.RhsScale.Index,
+                Nncase.TIR.NTT.NVFP4MatMulNormStats.Output.Index,
+                "triton.nvfp4_matmul",
+                [
+                    Nncase.TIR.NTT.NVFP4MatMulNormStats.RhsPacked.Index,
+                    Nncase.TIR.NTT.NVFP4MatMulNormStats.RhsScale.Index,
                 ]),
             Nncase.TIR.NTT.PagedAttentionMergePackedMatMul fused => SelectMatmul(
                 context,
@@ -173,6 +186,8 @@ public sealed class TritonTIRMicroKernelSelector : ITIRMicroKernelSelector
             Nncase.TIR.NTT.NVFP4MatMulGlu nvfp4MatMulGlu => SelectNVFP4MatMulGlu(
                 context,
                 nvfp4MatMulGlu),
+            Nncase.TIR.NTT.GatherReduceNormApplyNVFP4MatMulGlu fusedNormGlu =>
+                SelectGatherReduceNormApplyNVFP4MatMulGlu(context, fusedNormGlu),
             Nncase.TIR.NTT.PagedAttentionPartial pagedAttention =>
                 SelectPagedAttentionPartial(context, pagedAttention),
             Nncase.TIR.NTT.GatedDeltaNetConvolution convolution =>
@@ -323,6 +338,17 @@ public sealed class TritonTIRMicroKernelSelector : ITIRMicroKernelSelector
         long reservedSharedBytes = 0,
         int maximumUsefulStageCount = int.MaxValue)
     {
+        if (TrySelectMaximumFittingAsyncStageCount(
+                machine,
+                stageBytes,
+                slotsPerLogicalStage: 1,
+                reservedSharedBytes,
+                maximumUsefulStageCount,
+                out var stageCount))
+        {
+            return stageCount;
+        }
+
         var sharedSpace = machine.MemorySpaces.Values.SingleOrDefault(
             space => space.TIRBinding?.Location == MemoryLocation.Shared)
             ?? throw new NotSupportedException($"{context} requires Shared memory.");
@@ -331,29 +357,68 @@ public sealed class TritonTIRMicroKernelSelector : ITIRMicroKernelSelector
         var asynchronous = transfer.Asynchronous ?? throw new NotSupportedException(
             $"{context} requires an asynchronous parent-to-Shared transfer.");
         var capacity = machine.GetMaximumUsableAllocationBytes(sharedSpace);
-        foreach (var candidate in asynchronous.SupportedStageCounts
-                     .Where(stageCount => stageCount <= maximumUsefulStageCount)
-                     .OrderDescending())
-        {
-            var pipelineBytes = machine.GetAllocationSizeBytes(
-                sharedSpace,
-                checked(stageBytes * candidate));
-            var reservedBytes = reservedSharedBytes == 0
-                ? 0
-                : machine.GetAllocationSizeBytes(sharedSpace, reservedSharedBytes);
-            var requiredBytes = checked(pipelineBytes + reservedBytes);
-            if (requiredBytes <= capacity)
-            {
-                return candidate;
-            }
-        }
-
         throw new NotSupportedException(
             $"{context} cannot fit one supported async pipeline: stage_bytes={stageBytes}, " +
             $"reserved_shared_bytes={reservedSharedBytes}, " +
             $"maximum_useful_stages={maximumUsefulStageCount}, " +
             $"supported_stages=[{string.Join(',', asynchronous.SupportedStageCounts)}], " +
             $"shared_capacity={capacity}.");
+    }
+
+    private static bool TrySelectMaximumFittingAsyncStageCount(
+        TargetMachineModel machine,
+        long stageBytes,
+        int slotsPerLogicalStage,
+        long reservedSharedBytes,
+        int maximumUsefulStageCount,
+        out int stageCount)
+    {
+        if (stageBytes <= 0)
+        {
+            throw new ArgumentOutOfRangeException(nameof(stageBytes), stageBytes, "Async stage bytes must be positive.");
+        }
+
+        if (slotsPerLogicalStage <= 0)
+        {
+            throw new ArgumentOutOfRangeException(
+                nameof(slotsPerLogicalStage),
+                slotsPerLogicalStage,
+                "Async pipeline slots per logical stage must be positive.");
+        }
+
+        var sharedSpace = machine.MemorySpaces.Values.SingleOrDefault(
+            space => space.TIRBinding?.Location == MemoryLocation.Shared)
+            ?? throw new NotSupportedException("Async pipeline selection requires Shared memory.");
+        var parentSpace = machine.GetTilingParentMemorySpace(sharedSpace.TilingLevel);
+        var transfer = machine.GetTransfer(parentSpace.Id, sharedSpace.Id);
+        var asynchronous = transfer.Asynchronous ?? throw new NotSupportedException(
+            "Async pipeline selection requires an asynchronous parent-to-Shared transfer.");
+        var capacity = machine.GetMaximumUsableAllocationBytes(sharedSpace);
+        foreach (var candidate in asynchronous.SupportedStageCounts
+                     .Where(candidate => candidate <= maximumUsefulStageCount)
+                     .OrderDescending())
+        {
+            if (candidate % slotsPerLogicalStage != 0 ||
+                candidate / slotsPerLogicalStage < PackedGemvMinimumLogicalStages)
+            {
+                continue;
+            }
+
+            var pipelineBytes = machine.GetAllocationSizeBytes(
+                sharedSpace,
+                checked(stageBytes * candidate));
+            var reservedBytes = reservedSharedBytes == 0
+                ? 0
+                : machine.GetAllocationSizeBytes(sharedSpace, reservedSharedBytes);
+            if (checked(pipelineBytes + reservedBytes) <= capacity)
+            {
+                stageCount = candidate;
+                return true;
+            }
+        }
+
+        stageCount = 0;
+        return false;
     }
 
     private static TIRMicroKernelSelection SelectGatedDeltaNetConvolution(
@@ -476,7 +541,6 @@ public sealed class TritonTIRMicroKernelSelector : ITIRMicroKernelSelector
                 "GatedDeltaNet recurrent core requires an integral value-head to key-head ratio.");
         }
 
-        var valueHeadsPerKeyHead = recurrentCore.NumValueHeads / recurrentCore.NumKeyHeads;
         var projectionBlockK = SelectPowerOfTwoAtMost(
             hiddenSize,
             GatedDeltaNetProjectionMaximumBlockK);
@@ -488,22 +552,27 @@ public sealed class TritonTIRMicroKernelSelector : ITIRMicroKernelSelector
                 $"{GatedDeltaNetProjectionTmaKAtom} BF16 elements, got {hiddenSize}/{projectionBlockK}.");
         }
 
-        var projectionHeadCapacity = checked((int)Math.Min(
-            valueHeadsPerKeyHead,
-            DivideRoundUp(
-                checked(localValueElements + recurrentCore.ValueHeadDim -
-                    GreatestCommonDivisor(localValueElements, recurrentCore.ValueHeadDim)),
-                recurrentCore.ValueHeadDim)));
+        // A contiguous local value shard can start at any residue induced by the
+        // shard capacity. Reserve for the maximum number of value heads touched
+        // by such an interval, including intervals that cross a key-head group.
+        var projectionHeadCapacity = checked((int)DivideRoundUp(
+            checked(localValueElements + recurrentCore.ValueHeadDim -
+                GreatestCommonDivisor(localValueElements, recurrentCore.ValueHeadDim)),
+            recurrentCore.ValueHeadDim));
         if (projectionHeadCapacity <= 0)
         {
             throw new InvalidOperationException(
                 "GatedDeltaNet recurrent projection requires at least one local value head.");
         }
 
-        var projectionStageCapacity = RoundUpPowerOfTwo(valueHeadsPerKeyHead);
+        // TMA block extents must be powers of two. Keep the exact logical head
+        // coverage in the task mapping, but reserve a padded physical transfer
+        // capacity and mask the inactive rows in the consumer.
+        var projectionTransferHeadCapacity = RoundUpPowerOfTwo(projectionHeadCapacity);
+        var projectionStageCapacity = projectionTransferHeadCapacity;
         var projectionScratchBytes = checked(2L * projectionStageCapacity * DataTypes.Float32.SizeInBytes);
         var projectionWeightStageBytes = checked(
-            2L * projectionHeadCapacity * projectionBlockK * DataTypes.BFloat16.SizeInBytes);
+            2L * projectionTransferHeadCapacity * projectionBlockK * DataTypes.BFloat16.SizeInBytes);
         var numStages = SelectMaximumFittingAsyncStageCount(
             context.Machine,
             projectionWeightStageBytes,
@@ -513,7 +582,7 @@ public sealed class TritonTIRMicroKernelSelector : ITIRMicroKernelSelector
                 (int)DivideRoundUp(hiddenSize, projectionBlockK) + 1));
         var projectionWeightStageShape = new RankedShape(
             numStages,
-            projectionHeadCapacity,
+            projectionTransferHeadCapacity,
             projectionBlockK / GatedDeltaNetProjectionTmaKAtom,
             GatedDeltaNetProjectionTmaKAtom);
         var bProjectionStage = new TIRSharedWorkspaceDescriptor(
@@ -540,7 +609,7 @@ public sealed class TritonTIRMicroKernelSelector : ITIRMicroKernelSelector
                 blockK: projectionBlockK,
                 numStages)
                 .Add("state_value_tile", GatedDeltaNetStateValueTile)
-                .Add("projection_head_capacity", projectionHeadCapacity)
+                .Add("projection_head_capacity", projectionTransferHeadCapacity)
                 .Add("projection_tma_k_atom", GatedDeltaNetProjectionTmaKAtom),
             ImmutableArray.Create(bProjectionStage, aProjectionStage, projectionStage),
             new TIRTransferPipelineContract(
@@ -1051,6 +1120,7 @@ public sealed class TritonTIRMicroKernelSelector : ITIRMicroKernelSelector
             k,
             kDimension.IsFixed,
             kMajorPacked,
+            outputNVectorLaneCount: GetNVectorLaneCount(output.ElemType),
             sourceArgumentIndices: [rhsIndex],
             consumerLhsStaging: consumerLhsStaging,
             fp8Variant: fp8Variant,
@@ -1083,7 +1153,7 @@ public sealed class TritonTIRMicroKernelSelector : ITIRMicroKernelSelector
             sampling.LogitsType,
             DistributedUtility.DivideFlags.MaxShape);
         if (localLogits.Shape is not RankedShape { Rank: 2 } logitsShape ||
-            localLogits.DType != GetScalarDataType(sampling.PackedOutputType.TensorType.DType))
+            localLogits.DType != sampling.OutputDataType)
         {
             throw new InvalidOperationException(
                 $"PackedMatMulSamplingPartial selector requires rank-2 scalar logits, got {localLogits}.");
@@ -1109,6 +1179,22 @@ public sealed class TritonTIRMicroKernelSelector : ITIRMicroKernelSelector
         var lhsDimensions = GetLocalDimensions(lhs);
         var kDimension = lhsDimensions[^1];
         var k = GetScalarExtent(kDimension, lhs.ElemType);
+        var rhsLanes = rhs.ElemType is VectorType rhsVector
+            ? rhsVector.Lanes.ToArray()
+            : Array.Empty<int>();
+        var packedOutputLanes = sampling.PackedOutputType.TensorType.DType is VectorType outputVector
+            ? outputVector.Lanes.ToArray()
+            : Array.Empty<int>();
+        if (rhsLanes.Length != 3 ||
+            rhsLanes.Any(lane => lane <= 0) ||
+            packedOutputLanes.Length != 1 ||
+            packedOutputLanes[0] != rhsLanes[0])
+        {
+            throw new NotSupportedException(
+                "PackedMatMulSamplingPartial requires K-major RHS lanes " +
+                "[NVector,KPack,KVector] and a matching packed-output NVector lane.");
+        }
+
         if (!TryGetPackedGemvPipelineConfiguration(
                 context.Machine,
                 "triton.matmul_sampling_partial",
@@ -1128,14 +1214,13 @@ public sealed class TritonTIRMicroKernelSelector : ITIRMicroKernelSelector
                 out var pipelineCandidate))
         {
             throw new InvalidOperationException(
-                $"PackedMatMulSamplingPartial cannot select a spill-free BF16 Shared-staged GEMV for " +
+                $"PackedMatMulSamplingPartial cannot select a spill-free Shared-staged GEMV for " +
                 $"local shape M={m}, N={n}, K={k}.");
         }
 
         var pipeline = pipelineCandidate.Configuration;
-
-        const int nVector = 8;
-        const int kAtom = 16;
+        var nVector = rhsLanes[0];
+        var kAtom = checked(rhsLanes[1] * rhsLanes[2]);
         var rhsStage = new TIRSharedWorkspaceDescriptor(
             "rhs_stage",
             new TensorType(
@@ -1188,6 +1273,7 @@ public sealed class TritonTIRMicroKernelSelector : ITIRMicroKernelSelector
             kDimension.IsFixed,
             kMajorPacked: false,
             sourceArgumentIndices: [weightIndex],
+            outputNVectorLaneCount: GetNVectorLaneCount(output.ElemType),
             localNExtents: GetScalarLocalExtentProfile(output, output.Rank - 1));
     }
 
@@ -1292,6 +1378,21 @@ public sealed class TritonTIRMicroKernelSelector : ITIRMicroKernelSelector
                 [1]));
         }
 
+        var outputNVectorLaneCount = GetNVectorLaneCount(qOutput.ElemType);
+        if (qkv.OutputNVectorLaneCount != outputNVectorLaneCount)
+        {
+            throw new InvalidOperationException(
+                $"PackedQKVParallelLinear output N lane contract differs from its output buffer: " +
+                $"op={qkv.OutputNVectorLaneCount}, buffer={outputNVectorLaneCount}.");
+        }
+
+        var directFp8Mma = qkv.RhsLayout == IR.NTT.PackedMatMulRhsLayout.NMajorKPacked;
+        if (directFp8Mma && qkv.QuantizationMode != IR.Math.MatMulQuantizationMode.DynamicTensor)
+        {
+            throw new NotSupportedException(
+                "PackedQKVParallelLinear NMajorKPacked currently requires dynamic-tensor FP8 quantization.");
+        }
+
         return CreateMatrixSelection(
             context.Machine,
             "triton.qkv_parallel_linear",
@@ -1302,9 +1403,14 @@ public sealed class TritonTIRMicroKernelSelector : ITIRMicroKernelSelector
             n,
             k,
             kDimension.IsFixed,
-            qkv.RhsLayout == IR.NTT.PackedMatMulRhsLayout.KMajor,
+            qkv.RhsLayout is IR.NTT.PackedMatMulRhsLayout.KMajor or IR.NTT.PackedMatMulRhsLayout.NMajorKPacked,
+            outputNVectorLaneCount,
             sourceArgumentIndices: [1],
-            consumerLhsStaging: ConsumerLhsStagingKind.PerKTile);
+            consumerLhsStaging: directFp8Mma
+                ? ConsumerLhsStagingKind.None
+                : ConsumerLhsStagingKind.PerKTile,
+            fp8Variant: directFp8Mma ? "mma_fp8_smem_pipeline" : null,
+            localNExtents: GetScalarLocalExtentProfile(qOutput, qOutput.Rank - 1));
     }
 
     private static bool TryGetPackedQkvMmaConfiguration(
@@ -1511,6 +1617,7 @@ public sealed class TritonTIRMicroKernelSelector : ITIRMicroKernelSelector
             matmulGlu.RhsLayout is
                 IR.NTT.PackedMatMulRhsLayout.KMajor or
                 IR.NTT.PackedMatMulRhsLayout.NMajorKPacked,
+            outputNVectorLaneCount: GetNVectorLaneCount(output.ElemType),
             simultaneousRhsTileCount: 2,
             sourceArgumentIndices: [1, 2],
             fp8Variant: matmulGlu.QuantizationMode == IR.Math.MatMulQuantizationMode.DynamicBlock
@@ -1542,7 +1649,10 @@ public sealed class TritonTIRMicroKernelSelector : ITIRMicroKernelSelector
             [
                 Nncase.TIR.NTT.NVFP4MatMulGlu.GateWeightPacked.Index,
                 Nncase.TIR.NTT.NVFP4MatMulGlu.UpWeightPacked.Index,
-            ]);
+                Nncase.TIR.NTT.NVFP4MatMulGlu.GateWeightScale.Index,
+                Nncase.TIR.NTT.NVFP4MatMulGlu.UpWeightScale.Index,
+            ],
+            pipelineSlotsPerLogicalStage: 2);
         var upWeight = GetBuffer(
             context,
             Nncase.TIR.NTT.NVFP4MatMulGlu.UpWeightPacked.Index,
@@ -1568,6 +1678,51 @@ public sealed class TritonTIRMicroKernelSelector : ITIRMicroKernelSelector
         return selection;
     }
 
+    private static TIRMicroKernelSelection SelectGatherReduceNormApplyNVFP4MatMulGlu(
+        TIRMicroKernelSelectionContext context,
+        Nncase.TIR.NTT.GatherReduceNormApplyNVFP4MatMulGlu op)
+    {
+        var selection = SelectNVFP4MatMul(
+            context,
+            op.GroupSize,
+            Nncase.TIR.NTT.GatherReduceNormApplyNVFP4MatMulGlu.Input.Index,
+            Nncase.TIR.NTT.GatherReduceNormApplyNVFP4MatMulGlu.GateWeightPacked.Index,
+            Nncase.TIR.NTT.GatherReduceNormApplyNVFP4MatMulGlu.GateWeightScale.Index,
+            Nncase.TIR.NTT.GatherReduceNormApplyNVFP4MatMulGlu.Output.Index,
+            "triton.nvfp4_matmul_glu",
+            [
+                Nncase.TIR.NTT.GatherReduceNormApplyNVFP4MatMulGlu.GateWeightPacked.Index,
+                Nncase.TIR.NTT.GatherReduceNormApplyNVFP4MatMulGlu.UpWeightPacked.Index,
+                Nncase.TIR.NTT.GatherReduceNormApplyNVFP4MatMulGlu.GateWeightScale.Index,
+                Nncase.TIR.NTT.GatherReduceNormApplyNVFP4MatMulGlu.UpWeightScale.Index,
+            ],
+            pipelineSlotsPerLogicalStage: 2,
+            useGlobalLhsShape: true);
+        var upWeight = GetBuffer(
+            context,
+            Nncase.TIR.NTT.GatherReduceNormApplyNVFP4MatMulGlu.UpWeightPacked.Index,
+            "up packed weight");
+        var upScale = GetBuffer(
+            context,
+            Nncase.TIR.NTT.GatherReduceNormApplyNVFP4MatMulGlu.UpWeightScale.Index,
+            "up weight scale");
+        var gateWeight = GetBuffer(
+            context,
+            Nncase.TIR.NTT.GatherReduceNormApplyNVFP4MatMulGlu.GateWeightPacked.Index,
+            "gate packed weight");
+        var gateScale = GetBuffer(
+            context,
+            Nncase.TIR.NTT.GatherReduceNormApplyNVFP4MatMulGlu.GateWeightScale.Index,
+            "gate weight scale");
+        if (!SameLocalShape(gateWeight, upWeight) || !SameLocalShape(gateScale, upScale))
+        {
+            throw new InvalidOperationException(
+                "GatherReduceNormApplyNVFP4MatMulGlu requires matching gate/up local storage shapes.");
+        }
+
+        return selection;
+    }
+
     private static TIRMicroKernelSelection SelectNVFP4MatMul(
         TIRMicroKernelSelectionContext context,
         long groupSize,
@@ -1576,7 +1731,9 @@ public sealed class TritonTIRMicroKernelSelector : ITIRMicroKernelSelector
         int rhsScaleIndex,
         int outputIndex,
         string family,
-        int[] transferSourceArgumentIndices)
+        int[] transferSourceArgumentIndices,
+        int pipelineSlotsPerLogicalStage = 1,
+        bool useGlobalLhsShape = false)
     {
         if (groupSize != 16)
         {
@@ -1608,7 +1765,7 @@ public sealed class TritonTIRMicroKernelSelector : ITIRMicroKernelSelector
         RequireVectorLanes(rhsScale.ElemType, [], family, "rhs block scale");
         RequireVectorLanes(output.ElemType, [8], family, "output");
 
-        var lhsShape = GetLocalDimensions(lhs);
+        var lhsShape = useGlobalLhsShape ? GetGlobalDimensions(lhs) : GetLocalDimensions(lhs);
         var rhsShape = GetLocalDimensions(rhs);
         var scaleShape = GetLocalDimensions(rhsScale);
         var outputShape = GetLocalDimensions(output);
@@ -1632,6 +1789,14 @@ public sealed class TritonTIRMicroKernelSelector : ITIRMicroKernelSelector
                 $"output=bf16<8>[1,N/8].");
         }
 
+        if (pipelineSlotsPerLogicalStage <= 0)
+        {
+            throw new ArgumentOutOfRangeException(
+                nameof(pipelineSlotsPerLogicalStage),
+                pipelineSlotsPerLogicalStage,
+                $"{family} pipeline slots per logical stage must be positive.");
+        }
+
         var selectedBlockN = SelectPowerOfTwoAtMost(n, NVFP4MaximumBlockN);
         var sharedSpace = context.Machine.MemorySpaces.Values.SingleOrDefault(
             space => space.TIRBinding?.Location == MemoryLocation.Shared)
@@ -1652,31 +1817,69 @@ public sealed class TritonTIRMicroKernelSelector : ITIRMicroKernelSelector
                 $"{family} requires local K to admit at least one group-{groupSize} MMA tile, got K={k}.");
         }
 
-        var stageBytes = checked(
-            (long)selectedBlockN *
-            (selectedBlockK / 2L));
-        var numStages = SelectMaximumFittingAsyncStageCount(
-            context.Machine,
-            stageBytes,
-            family);
+        // One physical pipe slot holds one projection's packed weights and
+        // scales. Fused projections consume adjacent slots as one logical
+        // stage, so the ring must contain at least two complete groups. Keep
+        // the selected K transfer atom stable and shrink N until that grouped
+        // double buffer fits; reducing K would add reduction/TMA iterations
+        // and can violate the descriptor's packed-axis transaction contract.
+        var outputVectorLanes = GetNVectorLaneCount(output.ElemType);
+        var minimumVectorizedBlockN = checked(
+            context.Machine.Execution.WorkersPerBlock * outputVectorLanes);
+        var minimumBlockN = Math.Min(selectedBlockN, minimumVectorizedBlockN);
+        var numStages = 0;
+        while (selectedBlockN >= minimumBlockN)
+        {
+            var stageBytes = checked(
+                (long)selectedBlockN *
+                ((selectedBlockK / 2L) + (selectedBlockK / groupSize)));
+            if (TrySelectMaximumFittingAsyncStageCount(
+                    context.Machine,
+                    stageBytes,
+                    pipelineSlotsPerLogicalStage,
+                    reservedSharedBytes: 0,
+                    maximumUsefulStageCount: int.MaxValue,
+                    out numStages))
+            {
+                break;
+            }
+
+            selectedBlockN /= 2;
+        }
+
+        if (numStages == 0)
+        {
+            throw new NotSupportedException(
+                $"{family} cannot fit two complete logical pipeline stages: " +
+                $"block_k={selectedBlockK}, slots_per_logical_stage={pipelineSlotsPerLogicalStage}, " +
+                $"minimum_vectorized_block_n={minimumBlockN}.");
+        }
+
         var packedWeightStage = new TIRSharedWorkspaceDescriptor(
             "packed_weight_stage",
             new TensorType(
                 DataTypes.UInt8,
                 new RankedShape(numStages, selectedBlockN, selectedBlockK / 2)),
             NvidiaNvmmaSharedAlignmentBytes);
+        var weightScaleStage = new TIRSharedWorkspaceDescriptor(
+            "weight_scale_stage",
+            new TensorType(
+                DataTypes.Float8E4M3,
+                new RankedShape(numStages, selectedBlockN, selectedBlockK / groupSize)),
+            NvidiaNvmmaSharedAlignmentBytes);
+
         return new(
             family,
             "mma_tma_smem_pipeline",
             CreateParameters(1, selectedBlockN, selectedBlockK, numStages)
                 .Add("group_size", groupSize),
-            ImmutableArray.Create(packedWeightStage),
+            ImmutableArray.Create(packedWeightStage, weightScaleStage),
             new TIRTransferPipelineContract(
             [
                 new TIRTransferPipelineChannel(
                     "weight",
                     transferSourceArgumentIndices,
-                    [0],
+                    [0, 1],
                     sourceAlignmentBytes: 16),
             ]));
     }
@@ -1719,6 +1922,7 @@ public sealed class TritonTIRMicroKernelSelector : ITIRMicroKernelSelector
         long k,
         bool fixedK,
         bool kMajorPacked,
+        int outputNVectorLaneCount,
         int simultaneousRhsTileCount = 1,
         IReadOnlyList<int>? sourceArgumentIndices = null,
         ConsumerLhsStagingKind consumerLhsStaging = ConsumerLhsStagingKind.None,
@@ -1731,7 +1935,10 @@ public sealed class TritonTIRMicroKernelSelector : ITIRMicroKernelSelector
         var gemv = m == 1;
         if (gemv)
         {
-            var requestedVariant = rhsType == DataTypes.BFloat16
+            var unscaledFp8 = fp8Variant is null &&
+                lhsType == DataTypes.Float8E4M3 &&
+                rhsType == DataTypes.Float8E4M3;
+            var requestedVariant = rhsType == DataTypes.BFloat16 || unscaledFp8
                 ? "simt_fma_smem_pipeline"
                 : fp8Variant ?? "simt_fp8_fma_smem_pipeline";
             if (TryGetPackedGemvPipelineConfiguration(
@@ -1754,18 +1961,45 @@ public sealed class TritonTIRMicroKernelSelector : ITIRMicroKernelSelector
             {
                 var variant = requestedVariant;
                 var pipeline = selectedPipeline.Configuration;
-                if (outputType != DataTypes.BFloat16)
+                if (outputNVectorLaneCount <= 0 ||
+                    pipeline.BlockN % outputNVectorLaneCount != 0)
                 {
-                    throw new NotSupportedException(
-                        $"{family} Shared-staged GEMV requires BF16 output, got {outputType}.");
+                    throw new InvalidOperationException(
+                        $"{family}/{variant} selected block_n={pipeline.BlockN}, which is not " +
+                        $"divisible by the output N vector lane count {outputNVectorLaneCount}.");
                 }
 
-                var nVector = 16 / outputType.SizeInBytes;
+                if (variant == "simt_fma_smem_pipeline")
+                {
+                    var validUnscaledTypes =
+                        (lhsType == DataTypes.BFloat16 &&
+                         rhsType == DataTypes.BFloat16 &&
+                         outputType == DataTypes.BFloat16) ||
+                        (lhsType == DataTypes.Float8E4M3 &&
+                         rhsType == DataTypes.Float8E4M3 &&
+                         outputType == DataTypes.Float32);
+                    if (!validUnscaledTypes)
+                    {
+                        throw new NotSupportedException(
+                            $"{family}/{variant} does not support the unscaled " +
+                            $"{lhsType}/{rhsType}/{outputType} dtype contract.");
+                    }
+                }
+                else if (outputType != DataTypes.BFloat16)
+                {
+                    throw new NotSupportedException(
+                        $"{family}/{variant} requires BF16 output, got {outputType}.");
+                }
+
+                var nVector = outputNVectorLaneCount;
                 var kVector = 16 / rhsType.SizeInBytes;
                 const int kPack = 2;
                 var kAtom = kPack * kVector;
                 var blockFp8TransferBlockK = 0;
                 var directBlockFp8Mma = IsBlockFp8MmaVariant(variant);
+                var tensorFp8TransferBlockK = variant == "mma_fp8_smem_pipeline"
+                    ? Math.Min(BlockFp8MmaMaximumTransferBlockK, pipeline.BlockK)
+                    : 0;
                 var materializeCompleteBlockFp8Lhs =
                     pipeline.PrequantizeLhs ||
                     consumerLhsStaging == ConsumerLhsStagingKind.CompleteK;
@@ -1778,8 +2012,8 @@ public sealed class TritonTIRMicroKernelSelector : ITIRMicroKernelSelector
                      pipeline.BlockK % blockFp8ReductionGroup != 0))
                 {
                     throw new InvalidOperationException(
-                        $"{family}/{variant} requires block_k divisible by its positive " +
-                        $"block-FP8 reduction group, got block_k={pipeline.BlockK}, " +
+                        $"{family}/{variant} requires a positive block-FP8 reduction " +
+                        $"group, got block_k={pipeline.BlockK}, " +
                         $"group={blockFp8ReductionGroup}.");
                 }
 
@@ -1839,7 +2073,15 @@ public sealed class TritonTIRMicroKernelSelector : ITIRMicroKernelSelector
                                 pipeline.BlockN,
                                 blockFp8TransferBlockK,
                             }
-                            : new[]
+                            : variant == "mma_fp8_smem_pipeline"
+                                ? new[]
+                                {
+                                    pipeline.NumStages,
+                                    pipeline.BlockK / tensorFp8TransferBlockK,
+                                    pipeline.BlockN,
+                                    tensorFp8TransferBlockK,
+                                }
+                                : new[]
                             {
                                 pipeline.NumStages,
                                 pipeline.BlockK / kAtom * (pipeline.BlockN / nVector),
@@ -1906,6 +2148,10 @@ public sealed class TritonTIRMicroKernelSelector : ITIRMicroKernelSelector
                 {
                     parameters = parameters.Add("transfer_block_k", blockFp8TransferBlockK);
                 }
+                else if (tensorFp8TransferBlockK > 0)
+                {
+                    parameters = parameters.Add("transfer_block_k", tensorFp8TransferBlockK);
+                }
 
                 if (pipeline.PrequantizeLhs)
                 {
@@ -1958,8 +2204,12 @@ public sealed class TritonTIRMicroKernelSelector : ITIRMicroKernelSelector
 
             if (rhsType == DataTypes.Float8E4M3 || rhsType == DataTypes.Float8E5M2)
             {
+                var effectiveVariant = fp8Variant ?? "simt_fp8_fma_smem_pipeline";
                 throw new NotSupportedException(
-                    $"{family} has no legal Shared-staged FP8 GEMV configuration for M={m}, N={n}, K={k}.");
+                    $"{family} has no legal Shared-staged FP8 GEMV configuration for " +
+                    $"M={m}, N={n}, K={k}, fixed_k={fixedK}, " +
+                    $"k_major_packed={kMajorPacked}, rhs_tiles_per_group={simultaneousRhsTileCount}, " +
+                    $"variant={effectiveVariant}.");
             }
 
             const int blockK = 256;
@@ -2120,6 +2370,19 @@ public sealed class TritonTIRMicroKernelSelector : ITIRMicroKernelSelector
         out PackedGemvPipelineCandidate result)
     {
         result = default;
+        var directTensorFp8Mma = variant == "mma_fp8_smem_pipeline";
+        var directBlockFp8Mma = IsBlockFp8MmaVariant(variant);
+        var directFp8Mma = directTensorFp8Mma || directBlockFp8Mma;
+        var supportsKTail = family == "triton.qkv_parallel_linear" && directTensorFp8Mma;
+        var minimumBlockK = directTensorFp8Mma
+            ? TensorFp8MmaMinimumBlockK
+            : PackedGemvMinimumBlockK;
+        var unscaledSimtContract = variant == "simt_fma_smem_pipeline" &&
+            ((lhsType == DataTypes.BFloat16 && rhsType == DataTypes.BFloat16) ||
+             (lhsType == DataTypes.Float8E4M3 && rhsType == DataTypes.Float8E4M3));
+        var scaledFp8Contract = variant != "simt_fma_smem_pipeline" &&
+            lhsType == DataTypes.BFloat16 &&
+            rhsType == DataTypes.Float8E4M3;
         if ((family != "triton.matmul" &&
              family != "triton.paged_attention_merge_matmul" &&
              family != "triton.matmul_sampling_partial" &&
@@ -2127,13 +2390,11 @@ public sealed class TritonTIRMicroKernelSelector : ITIRMicroKernelSelector
              family != "triton.matmul_glu") ||
             rhsTilesPerGroup <= 0 ||
             !kMajorPacked ||
-            lhsType != DataTypes.BFloat16 ||
-            (rhsType != DataTypes.BFloat16 &&
-             rhsType != DataTypes.Float8E4M3) ||
+            (!unscaledSimtContract && !scaledFp8Contract) ||
             n < 8 ||
             !fixedK ||
             k <= 0 ||
-            k % PackedGemvMinimumBlockK != 0 ||
+            (!supportsKTail && k % minimumBlockK != 0) ||
             machine.Execution.Kind != BlockExecutionKind.PersistentGpuBlock ||
             machine.Execution.WorkersPerBlock != 8 ||
             machine.Execution.WorkerWidth != 32 ||
@@ -2144,11 +2405,10 @@ public sealed class TritonTIRMicroKernelSelector : ITIRMicroKernelSelector
             return false;
         }
 
-        var directBlockFp8Mma = IsBlockFp8MmaVariant(variant);
         MatrixComputePrimitiveSpec? matrixPrimitive = null;
-        if (directBlockFp8Mma)
+        if (directFp8Mma)
         {
-            if (blockFp8ReductionGroup <= 0)
+            if (directBlockFp8Mma && blockFp8ReductionGroup <= 0)
             {
                 return false;
             }
@@ -2165,10 +2425,10 @@ public sealed class TritonTIRMicroKernelSelector : ITIRMicroKernelSelector
             }
         }
 
-        var minimumBlockN = directBlockFp8Mma
+        var minimumBlockN = directFp8Mma
             ? matrixPrimitive!.M
             : PackedGemvMinimumBlockN;
-        var maximumSupportedBlockN = directBlockFp8Mma
+        var maximumSupportedBlockN = directFp8Mma
             ? Math.Min(
                 MmaPackedGemvMaximumBlockN,
                 checked(
@@ -2229,11 +2489,11 @@ public sealed class TritonTIRMicroKernelSelector : ITIRMicroKernelSelector
                 maximumCandidateBlockK = Math.Min(maximumCandidateBlockK, 256);
             }
 
-            for (var candidateBlockK = PackedGemvMinimumBlockK;
+            for (var candidateBlockK = minimumBlockK;
                  candidateBlockK <= Math.Min(k, maximumCandidateBlockK);
                  candidateBlockK *= 2)
             {
-                if (k % candidateBlockK != 0)
+                if (!supportsKTail && k % candidateBlockK != 0)
                 {
                     continue;
                 }
@@ -2256,7 +2516,9 @@ public sealed class TritonTIRMicroKernelSelector : ITIRMicroKernelSelector
                         continue;
                     }
 
-                    var kTileCount = checked((int)(k / candidateBlockK));
+                    var kTileCount = supportsKTail
+                        ? checked((int)DivideRoundUp(k, candidateBlockK))
+                        : checked((int)(k / candidateBlockK));
                     var maximumUsefulPhysicalStages = checked(
                         rhsTilesPerGroup *
                         (useAuxiliaryConsumer
@@ -2331,6 +2593,16 @@ public sealed class TritonTIRMicroKernelSelector : ITIRMicroKernelSelector
                                     materializeCompleteBlockFp8Lhs,
                                     localNExtents,
                                     candidateConfiguration)
+                                : directTensorFp8Mma
+                                    ? EstimatePackedTensorFp8MmaPipelineCycles(
+                                        machine,
+                                        transfer,
+                                        machine.GetMemoryResource(sharedSpace),
+                                        matrixPrimitive!,
+                                        n,
+                                        k,
+                                        rhsType.SizeInBytes,
+                                        candidateConfiguration)
                                 : EstimatePackedGemvPipelineCycles(
                                     machine,
                                     transfer,
@@ -2521,6 +2793,81 @@ public sealed class TritonTIRMicroKernelSelector : ITIRMicroKernelSelector
             kTileCount,
             bytesPerLogicalTile);
         return checked(localPipelineCycles + chipGlobalCycles);
+    }
+
+    private static long EstimatePackedTensorFp8MmaPipelineCycles(
+        TargetMachineModel machine,
+        TargetMemoryTransferSpec transfer,
+        TargetMemoryResourceSpec sharedMemory,
+        MatrixComputePrimitiveSpec primitive,
+        long n,
+        long k,
+        int elementBytes,
+        PackedGemvPipelineConfiguration configuration)
+    {
+        var nTileCount = DivideRoundUp(n, configuration.BlockN);
+        var kTileCount = DivideRoundUp(k, configuration.BlockK);
+        var logicalTileCount = checked(nTileCount * kTileCount);
+        var bytesPerTile = checked(
+            (long)configuration.BlockN * configuration.BlockK * elementBytes);
+        var producerServiceCycles = checked(
+            DivideRoundUp(bytesPerTile, transfer.BytesPerCycle) +
+            machine.Synchronization.BlockCycles +
+            transfer.Asynchronous!.CommitCycles);
+
+        var accumulatorChains = checked(
+            (double)DivideRoundUp(configuration.BlockN, primitive.M) *
+            DivideRoundUp(1, primitive.N));
+        var dependentInstructions = DivideRoundUp(configuration.BlockK, primitive.K);
+        var matrixCycles = checked((long)Math.Ceiling(
+            MatrixComputeCostModel.EstimateCycles(
+                primitive,
+                accumulatorChains,
+                dependentInstructions,
+                machine.Execution)));
+        var sharedLoadCycles = DivideRoundUp(
+            bytesPerTile,
+            sharedMemory.ReadBytesPerCycle);
+        var activationCycles = checked(
+            DivideRoundUp(
+                configuration.BlockK * DataTypes.BFloat16.SizeInBytes,
+                transfer.BytesPerCycle) +
+            DivideRoundUp(
+                configuration.BlockK,
+                machine.Compute.ElementwiseElementsPerCycle));
+        var epilogueCycles = DivideRoundUp(
+            configuration.BlockN,
+            machine.Compute.ElementwiseElementsPerCycle);
+        var consumerServiceCycles = checked(
+            activationCycles +
+            Math.Max(sharedLoadCycles, matrixCycles) +
+            epilogueCycles +
+            transfer.Asynchronous.WaitCycles);
+
+        var slotLifetimeCycles = checked(
+            producerServiceCycles +
+            transfer.LatencyCycles +
+            consumerServiceCycles);
+        var recurrenceCycles = DivideRoundUp(
+            slotLifetimeCycles,
+            configuration.NumStages);
+        var initiationIntervalCycles = Math.Max(
+            Math.Max(producerServiceCycles, consumerServiceCycles),
+            recurrenceCycles);
+
+        // Dynamic tensor quantization scans the activation once before the
+        // projection tiles. It is independent of N and therefore amortized by
+        // the fused Q/K/V projection.
+        var quantizationSetupCycles = checked(
+            DivideRoundUp(
+                k * DataTypes.BFloat16.SizeInBytes,
+                transfer.BytesPerCycle) +
+            DivideRoundUp(k, machine.Compute.ElementwiseElementsPerCycle));
+        return checked(
+            quantizationSetupCycles +
+            producerServiceCycles +
+            consumerServiceCycles +
+            ((logicalTileCount - 1) * initiationIntervalCycles));
     }
 
     private static long EstimatePackedBlockFp8MmaPipelineCycles(
@@ -2773,11 +3120,29 @@ public sealed class TritonTIRMicroKernelSelector : ITIRMicroKernelSelector
         return extents.MoveToImmutable();
     }
 
+    private static Dimension[] GetGlobalDimensions(TensorBufferOperand buffer)
+    {
+        if (buffer.DistributedType?.TensorType.Shape is RankedShape globalShape)
+        {
+            return globalShape.Dimensions.ToArray();
+        }
+
+        return buffer.Dimensions.ToArray();
+    }
+
     private static int GetVectorLaneCount(DataType dataType)
         => dataType is VectorType vectorType
             ? checked(vectorType.Lanes.Aggregate(1, static (product, lane) => product * lane) *
                 GetVectorLaneCount(vectorType.ElemType))
             : 1;
+
+    private static int GetNVectorLaneCount(DataType dataType)
+        => dataType is VectorType { Lanes.Count: 1 } vectorType
+            ? vectorType.Lanes[0]
+            : dataType is VectorType
+                ? throw new NotSupportedException(
+                    $"Matrix output must have one N vector lane dimension, got {dataType}.")
+                : 1;
 
     private static DataType GetScalarDataType(DataType dataType)
         => dataType is VectorType vectorType

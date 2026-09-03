@@ -333,6 +333,10 @@ typedef struct {
     clr_object_handle_t (*pyntt_target_options_create)();
     void (*pyntt_target_options_set_backend)(clr_object_handle_t handle, const char* value, size_t length);
     void (*pyntt_target_options_set_output_directory)(clr_object_handle_t handle, const char* value, size_t length);
+    void (*pyntt_target_options_set_cpu_offload_regions)(clr_object_handle_t handle, const char* value, size_t length);
+    void (*pyntt_target_options_set_cpu_core_count)(clr_object_handle_t handle, int32_t value);
+    void (*pyntt_target_options_set_cpu_target_machine)(clr_object_handle_t handle, const char* value, size_t length);
+    void (*pyntt_target_options_set_block_cyclic_block_bytes)(clr_object_handle_t handle, int64_t value);
     /* end the auto generated block by tools/stackvm_gen/CApiGen at 12/20/2024 3:41:05 PM +08:00. */
     // clang-format on
 
@@ -876,6 +880,22 @@ class pyntt_target_options : public cpu_target_options {
 
     void output_directory(std::string_view value) {
         nncase_clr_api()->pyntt_target_options_set_output_directory(obj_.get(), value.data(), value.length());
+    }
+
+    void cpu_offload_regions(std::string_view value) {
+        nncase_clr_api()->pyntt_target_options_set_cpu_offload_regions(obj_.get(), value.data(), value.length());
+    }
+
+    void cpu_core_count(int32_t value) {
+        nncase_clr_api()->pyntt_target_options_set_cpu_core_count(obj_.get(), value);
+    }
+
+    void cpu_target_machine(std::string_view value) {
+        nncase_clr_api()->pyntt_target_options_set_cpu_target_machine(obj_.get(), value.data(), value.length());
+    }
+
+    void block_cyclic_block_bytes(int64_t value) {
+        nncase_clr_api()->pyntt_target_options_set_block_cyclic_block_bytes(obj_.get(), value);
     }
 
 };

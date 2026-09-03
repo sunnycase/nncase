@@ -51,10 +51,14 @@ public sealed class FunctionBoundaryLayoutPropagationPass : ModulePass
         var compilerInsertedRestoreTransforms = new HashSet<Call>(ReferenceEqualityComparer.Instance);
         for (int iteration = 0; iteration < MaxPlanningIterations; iteration++)
         {
+            var planningFunctions = GetPlanningFunctions(input);
+            var callSites = FunctionCallGraphUtility.CollectCallSites(planningFunctions);
             var specializer = new FunctionLayoutSpecializer(input, reshardContext, compilerInsertedRestoreTransforms);
             var enableCallerOutputDemandLayouts = _enableCallerOutputDemandLayouts && iteration == 0;
             var selectedLayouts = ModuleLayoutPlanner.Plan(
                 input,
+                planningFunctions,
+                callSites,
                 specializer,
                 compilerInsertedRestoreTransforms,
                 enableCallerOutputDemandLayouts,
@@ -65,8 +69,7 @@ public sealed class FunctionBoundaryLayoutPropagationPass : ModulePass
             }
 
             var anyMutated = false;
-            var functions = input.Functions.OfType<Function>().ToArray();
-            foreach (var function in functions)
+            foreach (var function in planningFunctions)
             {
                 var rewriteTarget = selectedLayouts.TryGetValue(function, out var selectedLayout)
                     ? specializer.GetOrCreate(function, selectedLayout)
@@ -102,8 +105,11 @@ public sealed class FunctionBoundaryLayoutPropagationPass : ModulePass
             }
         }
 
+        var remainingFunctions = GetPlanningFunctions(input);
         var remainingLayoutMap = ModuleLayoutPlanner.CollectCandidateLayouts(
             input,
+            remainingFunctions,
+            FunctionCallGraphUtility.CollectCallSites(remainingFunctions),
             compilerInsertedRestoreTransforms,
             _enableCallerOutputDemandLayouts,
             _enableInternalOutputLayouts);
@@ -116,37 +122,19 @@ public sealed class FunctionBoundaryLayoutPropagationPass : ModulePass
         throw new InvalidOperationException($"Function boundary layout planning did not converge within {MaxPlanningIterations} iterations. Remaining layout functions: {remainingLayouts}. Last signature: {lastSignature}. Last body: {lastBody}");
     }
 
-    private static Dictionary<Function, FunctionBoundaryLayout> CollectCanonicalLayouts(IRModule module)
+    private Function[] GetPlanningFunctions(IRModule module)
     {
-        var layouts = new Dictionary<Function, FunctionBoundaryLayout>(ReferenceEqualityComparer.Instance);
-        foreach (var (function, candidates) in ModuleLayoutPlanner.CollectCandidateLayouts(module))
+        if (CompileSession.ActiveModuleKind is not { } activeModuleKind)
         {
-            var nonIdentity = candidates.Where(candidate => !candidate.IsIdentity).ToArray();
-            if (nonIdentity.Length != 0)
-            {
-                layouts.Add(function, nonIdentity[0]);
-            }
+            return module.Functions.OfType<Function>().ToArray();
         }
 
-        return layouts;
-    }
-
-    private static bool HasFunctionCallUser(Function function)
-    {
-        foreach (var user in function.Users)
-        {
-            if (user is Call { Target: Function callTarget } && ReferenceEquals(callTarget, function))
-            {
-                return true;
-            }
-
-            if (user is FunctionWrapper { Target: Function wrapperTarget } && ReferenceEquals(wrapperTarget, function))
-            {
-                return true;
-            }
-        }
-
-        return false;
+        return module.Functions
+            .OfType<Function>()
+            .Where(function =>
+                function.Role != FunctionRole.ModuleDispatch &&
+                string.Equals(function.ModuleKind, activeModuleKind, StringComparison.Ordinal))
+            .ToArray();
     }
 
     private static Call[] GetFunctionCalls(Function function)
@@ -297,6 +285,8 @@ public sealed class FunctionBoundaryLayoutPropagationPass : ModulePass
     {
         public static IReadOnlyDictionary<Function, FunctionBoundaryLayout> Plan(
             IRModule module,
+            IReadOnlyList<Function> planningFunctions,
+            IReadOnlyDictionary<Function, List<Call>> callSites,
             FunctionLayoutSpecializer specializer,
             IReadOnlySet<Call> compilerInsertedRestoreTransforms,
             bool enableCallerOutputDemandLayouts,
@@ -304,6 +294,8 @@ public sealed class FunctionBoundaryLayoutPropagationPass : ModulePass
         {
             var candidates = CollectCandidateLayouts(
                 module,
+                planningFunctions,
+                callSites,
                 compilerInsertedRestoreTransforms,
                 enableCallerOutputDemandLayouts,
                 enableInternalOutputLayouts);
@@ -333,7 +325,11 @@ public sealed class FunctionBoundaryLayoutPropagationPass : ModulePass
             foreach (var (variant, variable) in variables)
             {
                 weightedVars.Add(variable);
-                weights.Add(EstimateVariantCost(variant.Function, variant.Layout, specializer));
+                weights.Add(EstimateVariantCost(
+                    variant.Function,
+                    variant.Layout,
+                    specializer,
+                    callSites));
             }
 
             model.Minimize(LinearExpr.WeightedSum(weightedVars, weights));
@@ -367,14 +363,16 @@ public sealed class FunctionBoundaryLayoutPropagationPass : ModulePass
 
         public static Dictionary<Function, FunctionBoundaryLayout[]> CollectCandidateLayouts(
             IRModule module,
+            IReadOnlyList<Function> planningFunctions,
+            IReadOnlyDictionary<Function, List<Call>> callSites,
             IReadOnlySet<Call>? compilerInsertedRestoreTransforms = null,
             bool enableCallerOutputDemandLayouts = true,
             bool enableInternalOutputLayouts = true)
         {
             var layouts = new Dictionary<Function, FunctionBoundaryLayout[]>(ReferenceEqualityComparer.Instance);
-            foreach (var function in module.Functions.OfType<Function>())
+            foreach (var function in planningFunctions)
             {
-                if (ReferenceEquals(function, module.Entry) || function.IsEntry || !HasFunctionCallUser(function))
+                if (ReferenceEquals(function, module.Entry) || function.IsEntry || !callSites.TryGetValue(function, out var functionCallSites))
                 {
                     continue;
                 }
@@ -391,7 +389,7 @@ public sealed class FunctionBoundaryLayoutPropagationPass : ModulePass
 
                 if (enableCallerOutputDemandLayouts)
                 {
-                    foreach (var demandLayout in CollectCallDemandLayouts(function, internalLayout))
+                    foreach (var demandLayout in CollectCallDemandLayouts(function, functionCallSites, internalLayout))
                     {
                         candidates.Add(demandLayout);
                     }
@@ -411,9 +409,11 @@ public sealed class FunctionBoundaryLayoutPropagationPass : ModulePass
             return layouts;
         }
 
-        private static IEnumerable<FunctionBoundaryLayout> CollectCallDemandLayouts(Function function, FunctionBoundaryLayout? internalLayout)
+        private static IEnumerable<FunctionBoundaryLayout> CollectCallDemandLayouts(
+            Function function,
+            IReadOnlyList<Call> calls,
+            FunctionBoundaryLayout? internalLayout)
         {
-            var calls = GetFunctionCalls(function);
             foreach (var call in calls)
             {
                 var outputs = FunctionBoundaryLayout.CreateEmptyOutputs(call.CheckedType);
@@ -480,9 +480,15 @@ public sealed class FunctionBoundaryLayoutPropagationPass : ModulePass
                 && transform.Equals(expectedTransform));
         }
 
-        private static long EstimateVariantCost(Function function, FunctionBoundaryLayout layout, FunctionLayoutSpecializer specializer)
+        private static long EstimateVariantCost(
+            Function function,
+            FunctionBoundaryLayout layout,
+            FunctionLayoutSpecializer specializer,
+            IReadOnlyDictionary<Function, List<Call>> callSites)
         {
-            var callCount = Math.Max(GetFunctionCalls(function).Length, 1);
+            var callCount = callSites.TryGetValue(function, out var calls)
+                ? Math.Max(calls.Count, 1)
+                : 1;
             if (layout.IsIdentity)
             {
                 return checked((IdentityVariantPenalty + (CountBoundaryTransforms(function.Body) * LocalTransformCostScale)) * callCount);
@@ -861,7 +867,11 @@ public sealed class FunctionBoundaryLayoutPropagationPass : ModulePass
                 compilerInsertedRestoreTransforms);
             var body = CloneBodyWithPackedOutputs(function.Body, layout, cloner);
             var varMap = RewriteVarMap(function.VarMap, mappedParameters);
-            var specialized = new Function(function.Name, function.ModuleKind, body, specializedParameters, varMap);
+            var specialized = new Function(function.Name, function.ModuleKind, body, specializedParameters, varMap)
+            {
+                Role = function.Role,
+                Metadata = function.Metadata.Clone(),
+            };
             if (!CompilerServices.InferenceType(specialized))
             {
                 throw new InvalidOperationException($"Type inference failed for specialized function {specialized.Name} generated from {function.Name}.");

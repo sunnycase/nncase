@@ -37,7 +37,15 @@ public class UnitTestExpressionOutputNames
         var input = new Var(new TensorType(DataTypes.Float32, new RankedShape(1, 3, 224, 224)));
         var pad1 = Pad(input, new int[,] { { 0, 0 }, { 0, 0 }, { 0, 0 }, { 0, 0 } }, PadMode.Constant, 0.0f);
         pad1.Metadata.OutputNames = new string[] { "pad" };
+        pad1.Metadata.SemanticRegion = new SemanticRegion(
+            SemanticRegionKinds.Attention,
+            "model.layers.0.linear_attn");
+        pad1.Metadata.ExecutionModuleKind = "pyntt";
+        pad1.Metadata.Range = new ValueRange<double>(-1, 1);
         var pad2 = Pad(input, new int[,] { { 0, 0 }, { 1, 1 }, { 1, 1 }, { 0, 0 } }, PadMode.Constant, 0.0f).InheritMetaData(pad1);
         Assert.NotNull(pad2.Metadata.OutputNames);
+        Assert.Same(pad1.Metadata.SemanticRegion, pad2.Metadata.SemanticRegion);
+        Assert.Equal(pad1.Metadata.ExecutionModuleKind, pad2.Metadata.ExecutionModuleKind);
+        Assert.Null(pad2.Metadata.Range);
     }
 }

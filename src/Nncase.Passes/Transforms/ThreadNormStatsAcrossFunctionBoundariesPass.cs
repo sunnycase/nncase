@@ -153,15 +153,18 @@ public sealed class ThreadNormStatsAcrossFunctionBoundariesPass : ModulePass
 
         var candidates = (from call in ExprCollector.Collect(function.Body).OfType<Call>()
                           where call.Target is NormStats
-                          let inputExpr = call[NormStats.Input]
+                          let inputView = call[NormStats.Input] as Expr
+                          where inputView is not null
+                          let inputExpr = StripBoundaryView(inputView)
                           where inputExpr is Var input && parameterIndices.ContainsKey(input)
                           let normStats = (NormStats)call.Target
                           select new
                           {
                               Call = call,
                               Input = (Var)inputExpr,
+                              InputView = inputView,
                               InputIndex = parameterIndices[(Var)inputExpr],
-                              Axis = NormalizeAxis(normStats.Axis, inputExpr),
+                              Axis = NormalizeAxis(normStats.Axis, inputView),
                               normStats.UseMean,
                           })
             .GroupBy(candidate => (candidate.InputIndex, candidate.Axis, candidate.UseMean))
@@ -173,6 +176,12 @@ public sealed class ThreadNormStatsAcrossFunctionBoundariesPass : ModulePass
 
         var candidate = candidates[0];
         var parameter = candidate.First().Input;
+        var inputViewTemplate = candidate.First().InputView;
+        if (candidate.Any(item => !BoundaryViewsMatch(inputViewTemplate, parameter, item.InputView, parameter)))
+        {
+            return false;
+        }
+
         var statsType = candidate.First().Call.CheckedType;
         if (statsType is not TensorType || candidate.First().Call.CheckedDataType != DataTypes.Float32)
         {
@@ -197,7 +206,13 @@ public sealed class ThreadNormStatsAcrossFunctionBoundariesPass : ModulePass
             return false;
         }
 
-        var outputStats = IR.F.NN.NormStats(candidate.Key.Axis, outputExpr, candidate.Key.UseMean);
+        if (!TryApplyBoundaryView(inputViewTemplate, parameter, outputExpr, out var outputView)
+            || !Equals(outputView.CheckedType, inputViewTemplate.CheckedType))
+        {
+            return false;
+        }
+
+        var outputStats = IR.F.NN.NormStats(candidate.Key.Axis, outputView, candidate.Key.UseMean);
         if (!CompilerServices.InferenceType(outputStats) || !Equals(outputStats.CheckedType, statsType))
         {
             return false;
@@ -207,9 +222,12 @@ public sealed class ThreadNormStatsAcrossFunctionBoundariesPass : ModulePass
             candidate.Key.InputIndex,
             outputIndex,
             outputCount,
+            function.Body is IR.Tuple,
             candidate.Key.Axis,
             candidate.Key.UseMean,
             statsType,
+            parameter,
+            inputViewTemplate,
             new HashSet<Call>(candidate.Select(item => item.Call), ReferenceEqualityComparer.Instance));
         return true;
     }
@@ -311,7 +329,8 @@ public sealed class ThreadNormStatsAcrossFunctionBoundariesPass : ModulePass
             throw new InvalidOperationException("NormStats threading output plan is out of sync with the cloned function body.");
         }
 
-        var stats = IR.F.NN.NormStats(plan.Axis, output, plan.UseMean);
+        var outputView = ApplyBoundaryView(plan, output);
+        var stats = IR.F.NN.NormStats(plan.Axis, outputView, plan.UseMean);
         if (!CompilerServices.InferenceType(stats) || !Equals(stats.CheckedType, plan.StatsType))
         {
             throw new InvalidOperationException(
@@ -319,6 +338,111 @@ public sealed class ThreadNormStatsAcrossFunctionBoundariesPass : ModulePass
         }
 
         return new IR.Tuple(fields.Append<BaseExpr>(stats).ToArray());
+    }
+
+    private static Expr StripBoundaryView(Expr value)
+    {
+        var current = value;
+        while (current is Call call
+               && TryGetBoundaryViewInputIndex(call.Target, out var inputIndex)
+               && call.Arguments[inputIndex] is Expr input)
+        {
+            current = input;
+        }
+
+        return current;
+    }
+
+    private static bool TryGetBoundaryViewInputIndex(BaseExpr target, out int inputIndex)
+    {
+        inputIndex = target switch
+        {
+            Pack => Pack.Input.Index,
+            Unpack => Unpack.Input.Index,
+            Bitcast => Bitcast.Input.Index,
+            Reshape => Reshape.Input.Index,
+            Transpose => Transpose.Input.Index,
+            _ => -1,
+        };
+        return inputIndex >= 0;
+    }
+
+    private static bool BoundaryViewsMatch(
+        Expr template,
+        Expr templateRoot,
+        Expr candidate,
+        Expr candidateRoot)
+    {
+        if (ReferenceEquals(template, templateRoot))
+        {
+            return ReferenceEquals(candidate, candidateRoot);
+        }
+
+        if (template is not Call templateCall
+            || candidate is not Call candidateCall
+            || !TryGetBoundaryViewInputIndex(templateCall.Target, out var templateInputIndex)
+            || !TryGetBoundaryViewInputIndex(candidateCall.Target, out var candidateInputIndex)
+            || templateInputIndex != candidateInputIndex
+            || !LeafExprEqualityComparer.Instance.Equals(templateCall.Target, candidateCall.Target)
+            || templateCall.Arguments.Length != candidateCall.Arguments.Length)
+        {
+            return false;
+        }
+
+        for (int i = 0; i < templateCall.Arguments.Length; i++)
+        {
+            if (i == templateInputIndex)
+            {
+                continue;
+            }
+
+            if (!ReferenceEquals(templateCall.Arguments[i], candidateCall.Arguments[i])
+                && !LeafExprEqualityComparer.Instance.Equals(templateCall.Arguments[i], candidateCall.Arguments[i]))
+            {
+                return false;
+            }
+        }
+
+        return templateCall.Arguments[templateInputIndex] is Expr templateInput
+            && candidateCall.Arguments[candidateInputIndex] is Expr candidateInput
+            && BoundaryViewsMatch(templateInput, templateRoot, candidateInput, candidateRoot);
+    }
+
+    private static bool TryApplyBoundaryView(
+        Expr inputView,
+        Var inputParameter,
+        Expr value,
+        out Expr result)
+    {
+        if (ReferenceEquals(inputView, inputParameter))
+        {
+            result = value;
+            return true;
+        }
+
+        var cloner = new ReplacingExprCloner(
+            new Dictionary<BaseExpr, BaseExpr>(ReferenceEqualityComparer.Instance)
+            {
+                [inputParameter] = value,
+            })
+        {
+            CloneUnmutated = false,
+        };
+        result = cloner.Clone(inputView, Unit.Default) as Expr ?? null!;
+        return result is not null
+            && CompilerServices.InferenceType(result)
+            && result.CheckedType is not InvalidType;
+    }
+
+    private static Expr ApplyBoundaryView(ThreadingPlan plan, Expr value)
+    {
+        if (!TryApplyBoundaryView(plan.InputView, plan.InputParameter, value, out var result))
+        {
+            throw new InvalidOperationException(
+                $"Could not apply the NormStats input view of parameter {plan.InputParameter.Name} to {value.CheckedType}.");
+        }
+
+        return result;
     }
 
     private static int NormalizeAxis(int axis, BaseExpr input)
@@ -335,9 +459,12 @@ public sealed class ThreadNormStatsAcrossFunctionBoundariesPass : ModulePass
         int InputParameterIndex,
         int OutputFieldIndex,
         int OutputCount,
+        bool ReturnsTuple,
         int Axis,
         bool UseMean,
         IRType StatsType,
+        Var InputParameter,
+        Expr InputView,
         IReadOnlySet<Call> InputStatsCalls)
     {
         public int StatsOutputIndex => OutputCount;
@@ -408,12 +535,22 @@ public sealed class ThreadNormStatsAcrossFunctionBoundariesPass : ModulePass
                         $"NormStats-threaded input {calleePlan.InputParameterIndex} of {originalTarget.Name} is not a tensor expression.");
                 var stats = TryGetThreadedStats(input, calleePlan.Axis, calleePlan.UseMean, out var threadedStats)
                     ? threadedStats
-                    : IR.F.NN.NormStats(calleePlan.Axis, input, calleePlan.UseMean);
+                    : IR.F.NN.NormStats(
+                        calleePlan.Axis,
+                        ApplyBoundaryView(calleePlan, input),
+                        calleePlan.UseMean);
                 var rawCall = expr.With(
                     target: replacement,
                     arguments: arguments.Append<BaseExpr>(stats).ToArray());
                 Infer(rawCall, $"call to NormStats-threaded function {replacement.Name}");
-                return rawCall;
+                if (calleePlan.ReturnsTuple)
+                {
+                    return rawCall;
+                }
+
+                var value = IR.F.Tensors.GetItem(rawCall, calleePlan.OutputFieldIndex);
+                Infer(value, $"value output of NormStats-threaded function {replacement.Name}");
+                return value;
             }
 
             if (expr.Target is NormStats normStats
@@ -427,11 +564,24 @@ public sealed class ThreadNormStatsAcrossFunctionBoundariesPass : ModulePass
                 return availableStats;
             }
 
-            return ReferenceEquals(target, expr.Target)
-                   && arguments.Zip(expr.Arguments.ToArray()).All(pair => ReferenceEquals(pair.First, pair.Second))
-                ? expr
-                : expr.With(target: target, arguments: arguments);
+            if (ReferenceEquals(target, expr.Target)
+                && arguments.Zip(expr.Arguments.ToArray()).All(pair => ReferenceEquals(pair.First, pair.Second)))
+            {
+                return expr;
+            }
+
+            var replacementCall = expr.With(target: target, arguments: arguments);
+            Infer(replacementCall, $"cloned call to {GetCallTargetName(target)}");
+            return replacementCall;
         }
+
+        private static string GetCallTargetName(BaseExpr target)
+            => target switch
+            {
+                Callable callable => callable.Name,
+                Op op => op.GetType().Name,
+                _ => target.GetType().Name,
+            };
 
         private static void Infer(BaseExpr expr, string context)
         {
@@ -453,14 +603,21 @@ public sealed class ThreadNormStatsAcrossFunctionBoundariesPass : ModulePass
             out Expr stats)
         {
             stats = null!;
-            if (value is not Call { Target: GetItem } getItem
+            var producerValue = StripBoundaryView(value);
+            if (producerValue is not Call { Target: GetItem } getItem
                 || getItem[GetItem.Input] is not Call producer
                 || producer.Target is not Function producerTarget
                 || !_plansByReplacement.TryGetValue(producerTarget, out var producerPlan)
                 || getItem[GetItem.Index] is not DimConst index
                 || index.Value != producerPlan.OutputFieldIndex
                 || axis != producerPlan.Axis
-                || useMean != producerPlan.UseMean)
+                || useMean != producerPlan.UseMean
+                || (!ReferenceEquals(value, producerValue)
+                    && !BoundaryViewsMatch(
+                        producerPlan.InputView,
+                        producerPlan.InputParameter,
+                        value,
+                        producerValue)))
             {
                 return false;
             }

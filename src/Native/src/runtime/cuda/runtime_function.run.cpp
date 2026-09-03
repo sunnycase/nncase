@@ -28,6 +28,7 @@ using namespace nncase::ntt::runtime;
 #define WARP_SIZE 32
 
 result<void> cuda_runtime_function::run(std::byte *output_data) noexcept {
+    try_var(function_id, module().find_id_by_function(this));
     auto enable_profiling = module()
                                 .interp()
                                 .options()
@@ -41,6 +42,7 @@ result<void> cuda_runtime_function::run(std::byte *output_data) noexcept {
                                   sizeof(cuda_block_entry_params_t)));
 
         cuda_block_entry_params_t src_params{
+            .function_id = static_cast<uint32_t>(function_id),
             .bdim = module().bdim(),
             .cdim = module().cdim(),
             .cid = cid,

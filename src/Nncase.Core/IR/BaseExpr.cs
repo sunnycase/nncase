@@ -43,6 +43,20 @@ public class IRMetadata
     /// </summary>
     public Schedule.TIRMicroKernelSelection? TIRMicroKernel { get; set; }
 
+    /// <summary>
+    /// Gets or sets the model-semantic region represented by this expression.
+    /// Backends may use the region kind for heterogeneous placement, while the
+    /// instance is diagnostic identity only.
+    /// </summary>
+    public SemanticRegion? SemanticRegion { get; set; }
+
+    /// <summary>
+    /// Gets or sets the module kind selected for this operation by
+    /// heterogeneous placement. Null means that placement has not assigned the
+    /// operation yet.
+    /// </summary>
+    public string? ExecutionModuleKind { get; set; }
+
     public IRMetadata Clone()
         => new()
         {
@@ -50,6 +64,8 @@ public class IRMetadata
             Range = Range,
             BlockMicroKernel = BlockMicroKernel,
             TIRMicroKernel = TIRMicroKernel,
+            SemanticRegion = SemanticRegion,
+            ExecutionModuleKind = ExecutionModuleKind,
         };
 }
 

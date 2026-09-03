@@ -112,7 +112,8 @@ public partial class NTT
         int inputKVectorLaneCount,
         int rhsKPackLaneCount,
         int rhsKVectorLaneCount,
-        int outputNVectorLaneCount)
+        int outputNVectorLaneCount,
+        Expr? addend = null)
         => new Call(
             new PackedNVFP4MatMul(
                 outputDataType,
@@ -125,7 +126,40 @@ public partial class NTT
             rhsPacked,
             rhsScale,
             lhsGlobalScale,
-            rhsGlobalScale);
+            rhsGlobalScale,
+            addend ?? None.Default);
+
+    public static Expr PackedNVFP4MatMulNormStats(
+        Expr lhs,
+        Expr rhsPacked,
+        Expr rhsScale,
+        Expr lhsGlobalScale,
+        Expr rhsGlobalScale,
+        DataType outputDataType,
+        long groupSize,
+        int inputKVectorLaneCount,
+        int rhsKPackLaneCount,
+        int rhsKVectorLaneCount,
+        int outputNVectorLaneCount,
+        int axis,
+        bool useMean,
+        Expr? addend = null)
+        => new Call(
+            new PackedNVFP4MatMulNormStats(
+                outputDataType,
+                groupSize,
+                inputKVectorLaneCount,
+                rhsKPackLaneCount,
+                rhsKVectorLaneCount,
+                outputNVectorLaneCount,
+                axis,
+                useMean),
+            lhs,
+            rhsPacked,
+            rhsScale,
+            lhsGlobalScale,
+            rhsGlobalScale,
+            addend ?? None.Default);
 
     public static Expr PackedNVFP4MatMulGlu(
         Expr input,
@@ -224,19 +258,28 @@ public partial class NTT
         Expr lhs,
         Expr rhs,
         Expr state,
+        DataType accumulatorDataType,
         DataType outputDataType,
         PackedMatMulRhsLayout rhsLayout,
         IR.NN.SamplerConfig config,
         Expr? scale = null,
-        Expr? addend = null)
+        Expr? addend = null,
+        Expr? lhsScale = null,
+        Expr? rhsScale = null)
     {
         return new Call(
-            new PackedMatMulSamplingPartial(outputDataType, rhsLayout, config),
+            new PackedMatMulSamplingPartial(
+                accumulatorDataType,
+                outputDataType,
+                rhsLayout,
+                config),
             lhs,
             rhs,
             state,
             scale ?? None.Default,
-            addend ?? None.Default);
+            addend ?? None.Default,
+            lhsScale ?? None.Default,
+            rhsScale ?? None.Default);
     }
 
     public static Expr PagedAttentionPartial(
@@ -267,6 +310,7 @@ public partial class NTT
         Expr maxState,
         Expr sumState,
         Expr accState,
+        Expr outputGate,
         IRArray<IR.NN.AttentionDimKind> layout,
         int hiddenSize,
         DataType outputDataType,
@@ -284,7 +328,8 @@ public partial class NTT
                 splitCount),
             maxState,
             sumState,
-            accState);
+            accState,
+            outputGate);
     }
 
     public static Expr SamplingPartial(Expr logits, Expr state, IR.NN.SamplerConfig config)
@@ -320,10 +365,19 @@ public partial class NTT
         long numHeads,
         long numKvHeads,
         DataType? outDataType = null,
-        PackedMatMulRhsLayout rhsLayout = PackedMatMulRhsLayout.NMajor)
+        PackedMatMulRhsLayout rhsLayout = PackedMatMulRhsLayout.NMajor,
+        int outputNVectorLaneCount = 1,
+        global::Nncase.IR.Math.MatMulQuantizationMode quantizationMode =
+            global::Nncase.IR.Math.MatMulQuantizationMode.None)
     {
         return new Call(
-            new PackedQKVParallelLinear(numHeads, numKvHeads, outDataType ?? DataTypes.Float32, rhsLayout),
+            new PackedQKVParallelLinear(
+                numHeads,
+                numKvHeads,
+                outDataType ?? DataTypes.Float32,
+                rhsLayout,
+                outputNVectorLaneCount,
+                quantizationMode),
             input,
             qWeight,
             kWeight,

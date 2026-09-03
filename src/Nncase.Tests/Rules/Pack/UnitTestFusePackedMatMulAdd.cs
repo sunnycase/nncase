@@ -18,6 +18,10 @@ public sealed class UnitTestFusePackedMatMulAdd : TransformTestBase
     public void TestFuseExactDistributedAddend(bool matmulOnRight)
     {
         var (packedMatMul, addend) = CreateDistributedPackedMatMul();
+        var semanticRegion = new SemanticRegion(
+            SemanticRegionKinds.Attention,
+            "model.layers.0.linear_attn");
+        packedMatMul.Metadata.SemanticRegion = semanticRegion;
         var expression = matmulOnRight
             ? IR.F.Math.Add(addend, packedMatMul)
             : IR.F.Math.Add(packedMatMul, addend);
@@ -28,6 +32,7 @@ public sealed class UnitTestFusePackedMatMulAdd : TransformTestBase
         Assert.IsType<IR.NTT.PackedMatMul>(call.Target);
         Assert.Same(addend, call[IR.NTT.PackedMatMul.Addend]);
         Assert.Equal(expression.CheckedType, call.CheckedType);
+        Assert.Same(semanticRegion, call.Metadata.SemanticRegion);
     }
 
     [Fact]
@@ -124,6 +129,55 @@ public sealed class UnitTestFusePackedMatMulAdd : TransformTestBase
         Assert.IsType<InvalidType>(invalid.CheckedType);
     }
 
+    [Theory]
+    [InlineData(false)]
+    [InlineData(true)]
+    public void TestFusePackedNVFP4MatMulExactAddend(bool matmulOnRight)
+    {
+        var (packedMatMul, addend) = CreateTensorPackedNVFP4MatMul();
+        var expression = matmulOnRight
+            ? IR.F.Math.Add(addend, packedMatMul)
+            : IR.F.Math.Add(packedMatMul, addend);
+        Assert.True(expression.InferenceType());
+
+        var rewritten = CompilerServices.Rewrite(
+            expression,
+            [new FusePackedNVFP4MatMulAdd()],
+            new Nncase.Passes.RunPassContext());
+        Assert.True(rewritten.InferenceType());
+
+        var call = Assert.IsType<Call>(rewritten);
+        Assert.IsType<IR.NTT.PackedNVFP4MatMul>(call.Target);
+        Assert.Same(addend, call[IR.NTT.PackedNVFP4MatMul.Addend]);
+        Assert.Equal(expression.CheckedType, call.CheckedType);
+    }
+
+    [Fact]
+    public void TestPackedNVFP4MatMulRejectsMismatchedAddendType()
+    {
+        var (packedMatMul, _) = CreateTensorPackedNVFP4MatMul();
+        var op = Assert.IsType<IR.NTT.PackedNVFP4MatMul>(packedMatMul.Target);
+        var invalid = IR.F.NTT.PackedNVFP4MatMul(
+            (Expr)packedMatMul[IR.NTT.PackedNVFP4MatMul.Lhs],
+            (Expr)packedMatMul[IR.NTT.PackedNVFP4MatMul.RhsPacked],
+            (Expr)packedMatMul[IR.NTT.PackedNVFP4MatMul.RhsScale],
+            (Expr)packedMatMul[IR.NTT.PackedNVFP4MatMul.LhsGlobalScale],
+            (Expr)packedMatMul[IR.NTT.PackedNVFP4MatMul.RhsGlobalScale],
+            op.OutputDataType,
+            op.GroupSize,
+            op.InputKVectorLaneCount,
+            op.RhsKPackLaneCount,
+            op.RhsKVectorLaneCount,
+            op.OutputNVectorLaneCount,
+            new Var(
+                "invalid_addend",
+                new TensorType(
+                    new VectorType(DataTypes.BFloat16, [8]),
+                    new RankedShape(1, 1))));
+
+        Assert.IsType<InvalidType>(invalid.CheckedType);
+    }
+
     private static BaseExpr Rewrite(BaseExpr expression)
     {
         var rewritten = CompilerServices.Rewrite(
@@ -177,6 +231,44 @@ public sealed class UnitTestFusePackedMatMulAdd : TransformTestBase
             rhs,
             outDataType: DataTypes.BFloat16,
             rhsLayout: IR.NTT.PackedMatMulRhsLayout.KMajor));
+        var addend = new Var("addend", packedMatMul.CheckedType);
+        return (packedMatMul, addend);
+    }
+
+    private static (Call PackedMatMul, Var Addend) CreateTensorPackedNVFP4MatMul()
+    {
+        var lhs = new Var(
+            "lhs",
+            new TensorType(
+                new VectorType(DataTypes.BFloat16, [8]),
+                new RankedShape(1, 640)));
+        var rhsPacked = new Var(
+            "rhs_packed",
+            new TensorType(
+                new VectorType(DataTypes.UInt8, [2, 16]),
+                new RankedShape(640, 80)));
+        var rhsScale = new Var(
+            "rhs_scale",
+            new TensorType(DataTypes.Float8E4M3, new RankedShape(640, 320)));
+        var lhsGlobalScale = new Var(
+            "lhs_global_scale",
+            new TensorType(DataTypes.Float32, new RankedShape(1)));
+        var rhsGlobalScale = new Var(
+            "rhs_global_scale",
+            new TensorType(DataTypes.Float32, new RankedShape(1)));
+        var packedMatMul = Assert.IsType<Call>(IR.F.NTT.PackedNVFP4MatMul(
+            lhs,
+            rhsPacked,
+            rhsScale,
+            lhsGlobalScale,
+            rhsGlobalScale,
+            DataTypes.BFloat16,
+            16,
+            8,
+            2,
+            16,
+            8));
+        Assert.True(packedMatMul.InferenceType());
         var addend = new Var("addend", packedMatMul.CheckedType);
         return (packedMatMul, addend);
     }

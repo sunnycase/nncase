@@ -44,7 +44,7 @@ public sealed class SATBufferScheduler : BufferScheduler
             var yInterval = model.NewFixedSizeIntervalVar(memStartVar, memSize, $"{bufferId}_y");
             yEnds.Add(yInterval.EndExpr());
 
-            var alignment = lifetime.Buffer.Alignment;
+            var alignment = GetBufferAlignment(lifetime.Buffer, options);
             model.AddModuloEquality(0, memStartVar, alignment);
             noOverlap.AddRectangle(xInterval, yInterval);
             boxs.Add(lifetime.Buffer, new(xInterval, yInterval));

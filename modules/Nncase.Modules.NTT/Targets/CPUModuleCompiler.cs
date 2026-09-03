@@ -25,7 +25,11 @@ public class CPUModuleCompiler : INTTModuleCompiler
 
     public int GetNr(CompileOptions options) => GetMachine(options).Execution.MatMulNr;
 
-    public IModuleBuilder CreateModuleBuilder(CompileOptions options) => new NTTModuleBuilder(ModuleKind, options);
+    public IModuleBuilder CreateModuleBuilder(CompileOptions options)
+    {
+        CPUTarget.ValidateOptions(options);
+        return new NTTModuleBuilder(ModuleKind, options);
+    }
 
     public bool IsSupportedCall(Call call, CompileOptions options)
     {

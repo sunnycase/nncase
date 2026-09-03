@@ -66,6 +66,9 @@ public static class TypeSerializer
                 Serialize(writer, t.DType);
                 Serialize(writer, t.Shape);
                 break;
+            case DistributedType t:
+                Serialize(writer, t.TensorType);
+                break;
             case TupleType t:
                 writer.Write((byte)TypeSignatureToken.Tuple);
                 foreach (var field in t.Fields)

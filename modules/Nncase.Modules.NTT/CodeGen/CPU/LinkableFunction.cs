@@ -59,33 +59,6 @@ internal sealed class LinkableKernelFunction : ILinkableFunction
     public IReadOnlyList<ILinkedSection> Sections { get; }
 }
 
-internal sealed class LinkableDeviceFunction : ILinkableFunction
-{
-    public LinkableDeviceFunction(uint id, TIR.PrimFunction sourceFunction, string header, Stream text)
-    {
-        Id = id;
-        SourceFunction = sourceFunction;
-        Header = header;
-        PrimFunction = sourceFunction;
-        Text = text;
-        Sections = Array.Empty<ILinkedSection>();
-    }
-
-    public uint Id { get; }
-
-    public BaseFunction SourceFunction { get; }
-
-    public string Header { get; }
-
-    public TIR.PrimFunction PrimFunction { get; }
-
-    public Stream Text { get; }
-
-    public IEnumerable<FunctionRef> FunctionRefs => Enumerable.Empty<FunctionRef>();
-
-    public IReadOnlyList<ILinkedSection> Sections { get; }
-}
-
 internal sealed class LinkableLambdaFunction : ILinkableFunction
 {
     public LinkableLambdaFunction(uint id, Fusion sourceFunction, string header, Stream text)

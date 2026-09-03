@@ -27,7 +27,8 @@ public sealed class PackedNVFP4MatMulEvaluator :
             context.GetArgumentValueAsTensor(target, PackedNVFP4MatMul.RhsPacked),
             context.GetArgumentValueAsTensor(target, PackedNVFP4MatMul.RhsScale),
             context.GetArgumentValueAsTensor(target, PackedNVFP4MatMul.LhsGlobalScale),
-            context.GetArgumentValueAsTensor(target, PackedNVFP4MatMul.RhsGlobalScale)));
+            context.GetArgumentValueAsTensor(target, PackedNVFP4MatMul.RhsGlobalScale),
+            context.GetArgumentValue(target, PackedNVFP4MatMul.Addend)));
 
     public IRType Visit(ITypeInferenceContext context, PackedNVFP4MatMul target)
         => InferType(
@@ -36,11 +37,13 @@ public sealed class PackedNVFP4MatMulEvaluator :
             context.CheckArgumentType<IRType>(target, PackedNVFP4MatMul.RhsPacked),
             context.CheckArgumentType<IRType>(target, PackedNVFP4MatMul.RhsScale),
             context.CheckArgumentType<IRType>(target, PackedNVFP4MatMul.LhsGlobalScale),
-            context.CheckArgumentType<IRType>(target, PackedNVFP4MatMul.RhsGlobalScale));
+            context.CheckArgumentType<IRType>(target, PackedNVFP4MatMul.RhsGlobalScale),
+            context.CheckArgumentType<IRType>(target, PackedNVFP4MatMul.Addend));
 
     public Cost Visit(ICostEvaluateContext context, PackedNVFP4MatMul target)
     {
         var lhs = context.GetArgumentType<IRType>(target, PackedNVFP4MatMul.Lhs);
+        var addend = context.GetArgumentType<IRType>(target, PackedNVFP4MatMul.Addend);
         var output = context.GetReturnType<IRType>();
         return new Cost
         {
@@ -49,9 +52,12 @@ public sealed class PackedNVFP4MatMulEvaluator :
                 CostUtility.GetMemoryAccess(context.GetArgumentType<IRType>(target, PackedNVFP4MatMul.RhsPacked)) +
                 CostUtility.GetMemoryAccess(context.GetArgumentType<IRType>(target, PackedNVFP4MatMul.RhsScale)) +
                 CostUtility.GetMemoryAccess(context.GetArgumentType<IRType>(target, PackedNVFP4MatMul.LhsGlobalScale)) +
-                CostUtility.GetMemoryAccess(context.GetArgumentType<IRType>(target, PackedNVFP4MatMul.RhsGlobalScale)),
+                CostUtility.GetMemoryAccess(context.GetArgumentType<IRType>(target, PackedNVFP4MatMul.RhsGlobalScale)) +
+                (addend is NoneType ? 0 : CostUtility.GetMemoryAccess(addend)),
             [CostFactorNames.BlockLocalMemoryStoreBytes] = CostUtility.GetMemoryAccess(output),
-            [CostFactorNames.CPUCycles] = CostUtility.GetCPUCycles(output, checked(GetLogicalK(lhs) + 8U)),
+            [CostFactorNames.CPUCycles] = CostUtility.GetCPUCycles(
+                output,
+                checked(GetLogicalK(lhs) + 8U + (addend is NoneType ? 0U : 1U))),
         };
     }
 
@@ -61,7 +67,8 @@ public sealed class PackedNVFP4MatMulEvaluator :
         Tensor rhsPacked,
         Tensor rhsScale,
         Tensor lhsGlobalScale,
-        Tensor rhsGlobalScale)
+        Tensor rhsGlobalScale,
+        IValue addend)
     {
         RequireVectorType(
             lhs.ElementType,
@@ -84,7 +91,11 @@ public sealed class PackedNVFP4MatMulEvaluator :
             rhsGlobalScale,
             target.OutputDataType,
             target.GroupSize);
-        return PackTensor(logicalOutput, target.OutputNVectorLaneCount);
+        var packedOutput = PackTensor(logicalOutput, target.OutputNVectorLaneCount);
+        return IsNone(addend)
+            ? packedOutput
+            : OrtKI.Add(packedOutput.ToOrtTensor(), addend.AsTensor().ToOrtTensor())
+                .ToTensor(packedOutput.ElementType);
     }
 
     public static IRType InferType(
@@ -93,7 +104,8 @@ public sealed class PackedNVFP4MatMulEvaluator :
         IRType rhsPacked,
         IRType rhsScale,
         IRType lhsGlobalScale,
-        IRType rhsGlobalScale)
+        IRType rhsGlobalScale,
+        IRType addend)
     {
         if (ValidateTargetContract(target) is { } targetError)
         {
@@ -151,7 +163,17 @@ public sealed class PackedNVFP4MatMulEvaluator :
                 $"{target.OutputNVectorLaneCount}, got {logicalOutput}.");
         }
 
-        return PackOutputType(logicalOutput, target.OutputNVectorLaneCount);
+        var output = PackOutputType(logicalOutput, target.OutputNVectorLaneCount);
+        if (output is InvalidType || addend is NoneType)
+        {
+            return output;
+        }
+
+        return Equals(output, addend)
+            ? output
+            : new InvalidType(
+                $"PackedNVFP4MatMul addend must have exactly the packed output type, " +
+                $"got output={output}, addend={addend}.");
     }
 
     internal static IRType InferProjectionType(
@@ -165,7 +187,8 @@ public sealed class PackedNVFP4MatMulEvaluator :
         IRType weightPacked,
         IRType weightScale,
         IRType inputGlobalScale,
-        IRType weightGlobalScale)
+        IRType weightGlobalScale,
+        IRType? addend = null)
         => InferType(
             new PackedNVFP4MatMul(
                 outputDataType,
@@ -178,7 +201,8 @@ public sealed class PackedNVFP4MatMulEvaluator :
             weightPacked,
             weightScale,
             inputGlobalScale,
-            weightGlobalScale);
+            weightGlobalScale,
+            addend ?? NoneType.Default);
 
     internal static Tensor EvaluateProjection(
         DataType outputDataType,
@@ -204,7 +228,8 @@ public sealed class PackedNVFP4MatMulEvaluator :
             weightPacked,
             weightScale,
             inputGlobalScale,
-            weightGlobalScale);
+            weightGlobalScale,
+            NoneValue.Default);
 
     internal static TensorType? GetTensorType(IRType type) => type switch
     {
@@ -313,4 +338,6 @@ public sealed class PackedNVFP4MatMulEvaluator :
             _ => new InvalidType($"Cannot pack PackedNVFP4MatMul output type {output}."),
         };
     }
+
+    private static bool IsNone(IValue value) => value is NoneValue || value.Type is NoneType;
 }

@@ -6,6 +6,9 @@
 {{ phases.consumer_header(model) }}
 {{ common.mesh_coordinates(model["MeshAxes"]) }}
     output = {{ ptr(model, "Output") }}
+{% if model["HasOutputGate"] %}
+    output_gate = {{ ptr(model, "OutputGate") }}
+{% endif %}
 {{ common.structured_axis(ctx["output_dim_axis"], "    ") }}
     split_offsets = tl.arange(0, {{ ctx["split_tile"] }})
     split_mask = split_offsets < {{ ctx["split_count"] }}
@@ -27,6 +30,10 @@
             acc_values = tl.load({{ access_pointer(model, "AccState", "acc_state_sources", ctx["acc_state_access"]) }}, mask=split_mask[:, None], other=0.0)
             merged_acc = tl.sum(weights[:, None] * acc_values, axis=0)
             result = tl.where(merged_sum > 0.0, merged_acc / merged_sum, 0.0)
+{% if model["HasOutputGate"] %}
+            gate = tl.load({{ access_pointer(model, "OutputGate", "output_gate", ctx["output_gate_access"]) }}, mask={{ ctx["output_active"] }}, other=0.0)
+            result *= tl.sigmoid(tl.reshape(gate, ({{ ctx["local_head_dimension"] }},)))
+{% endif %}
             tl.store({{ access_pointer(model, "Output", "output", ctx["output_access"]) }}, tl.reshape(result, {{ ctx["output_structured_shape"] }}), mask={{ ctx["output_active"] }})
 
 

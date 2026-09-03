@@ -19,7 +19,11 @@ public sealed class CanonicalizeTIRIndexExpressionsPass : ModulePass
     /// <inheritdoc/>
     protected override Task<IRModule> RunCoreAsync(IRModule input, RunPassContext context)
     {
-        foreach (var function in input.Functions.OfType<PrimFunction>())
+        var functions = input.Functions
+            .OfType<PrimFunction>()
+            .Where(CompileSession.IsFunctionActive);
+
+        foreach (var function in functions)
         {
             var canonicalizer = new TIRIndexExpressionCanonicalizer();
             canonicalizer.Rewrite(function);

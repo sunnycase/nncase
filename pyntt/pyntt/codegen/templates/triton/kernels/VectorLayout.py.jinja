@@ -10,7 +10,7 @@
     output_ptr = {{ ptr(model, "Output") }}
 {% call(indent) elementwise.iterate(ctx) %}
 {{ indent }}valid = {{ ctx["valid_expression"] }}
-{{ indent }}value = tl.load({{ access_pointer(model, "Input", "input_ptr", ctx["input_access"]) }}, mask=valid, other=0)
+{{ indent }}value = tl.load({{ access_pointer(model, "Input", "input_ptr", ctx["input_access"]) }}, mask=valid, other={{ load_zero_literal(model["InputDType"]) }})
 {{ indent }}tl.store({{ access_pointer(model, "Output", "output_ptr", ctx["output_access"]) }}, value, mask={{ ctx["store_mask"] }})
 {% endcall %}
 

@@ -91,7 +91,7 @@ public class NTTTargetOptions : INTTTargetOptions, ITargetOpCostModelProvider, I
     public int[] HierarchyBandWidths { get; set; } = new[] { 1 };
 
     [DisplayName("--target-machine")]
-    [Description("the canonical target machine model used by cost evaluation and AutoTiling.")]
+    [Description("the canonical target machine model used by cost evaluation and kernel selection.")]
     [DefaultValue(NTTTargetMachineCatalog.CpuGeneric)]
     public string TargetMachine
     {

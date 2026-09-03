@@ -45,6 +45,79 @@ public sealed class UnitTestInlineSingleCallPrimFunctionsPass : TestClassBase
     }
 
     [Fact]
+    public async Task TestTIRSelectionGroupsContiguousSemanticRegionIntoTraceScope()
+    {
+        CompileOptions.TargetOptions = new Nncase.Targets.NTTTargetOptions();
+        var tensorType = new TensorType(DataTypes.Float32, new[] { 16 });
+        var input = new Var("input", tensorType);
+        var semanticRegion = new SemanticRegion(
+            SemanticRegionKinds.Attention,
+            "model.layers.0.linear_attn");
+        var abs = IR.F.Math.Abs(input);
+        abs.Metadata.SemanticRegion = semanticRegion;
+        var bitcast = IR.F.Tensors.Bitcast(abs, DataTypes.Float32);
+        bitcast.Metadata.SemanticRegion = semanticRegion;
+        var sqrt = IR.F.Math.Sqrt(bitcast);
+        sqrt.Metadata.SemanticRegion = semanticRegion;
+        var output = IR.F.Math.Neg(sqrt);
+        var function = new Function("main", ModuleKind, output, new IVar[] { input });
+        Assert.True(function.InferenceType());
+
+        var lowered = Assert.IsType<PrimFunction>(
+            await new NTTTIRSelectionPass(CompileOptions, ModuleKind).RunAsync(function, new()));
+
+        Assert.Equal(2, lowered.Body.Count);
+        var traceScope = Assert.IsType<Sequential>(lowered.Body[0]);
+        Assert.Equal(
+            SemanticRegionUtility.GetTraceScopeName(semanticRegion),
+            traceScope.TraceScopeName);
+        Assert.Equal(2, traceScope.Count);
+        Assert.IsType<Call>(lowered.Body[1]);
+    }
+
+    [Fact]
+    public async Task TestTIRSelectionErasesNoneControlParameterFromRuntimeAbi()
+    {
+        CompileOptions.TargetOptions = new Nncase.Targets.NTTTargetOptions();
+        var tensorType = new TensorType(DataTypes.Float32, new[] { 16 });
+        var calleeInput = new Var("callee_input", tensorType);
+        var dependency = new Var("pipeline_dependency", NoneType.Default);
+        var callee = new Function(
+            "projection",
+            ModuleKind,
+            IR.F.Heterogeneous.PipelineYield(IR.F.Math.Abs(calleeInput), dependency),
+            new IVar[] { calleeInput, dependency })
+        {
+            Role = FunctionRole.PipelineProjection,
+        };
+        var input = new Var("input", tensorType);
+        var main = new Function(
+            "main",
+            ModuleKind,
+            new Call(callee, input, None.Default),
+            new IVar[] { input });
+        var module = new IRModule(main);
+        module.Add(callee);
+        Assert.True(CompilerServices.InferenceType(main));
+
+        var passManager = CompileSession.CreatePassManager("TIRSelectionErasesNoneControlParameter");
+        passManager.Add<NTTTIRSelectionPass>(ModuleKind);
+        await passManager.RunAsync(module);
+
+        var projection = Assert.Single(module.Functions.OfType<PrimFunctionWrapper>());
+        Assert.Equal(FunctionRole.PipelineProjection, projection.Target.Role);
+        Assert.Equal(1, projection.ParametersCount);
+        Assert.DoesNotContain(projection.Target.Parameters.ToArray(), parameter => parameter.CheckedType is NoneType);
+        var mainPrim = Assert.IsType<PrimFunction>(module.Entry);
+        var call = Assert.Single(
+            ExprCollector.Collect(mainPrim.Body)
+                .OfType<Call>()
+                .Where(candidate => ReferenceEquals(candidate.Target, projection.Target)));
+        Assert.Equal(projection.Target.Parameters.Length, call.Arguments.Length);
+        Assert.DoesNotContain(call.Arguments.ToArray(), argument => argument is None);
+    }
+
+    [Fact]
     public async Task TestInlineSingleCallSubstitutesActualBufferDescriptor()
     {
         var tensorType = new TensorType(DataTypes.Float32, new[] { 4 });
@@ -67,6 +140,35 @@ public sealed class UnitTestInlineSingleCallPrimFunctionsPass : TestClassBase
         var inlinedBuffer = Assert.IsType<Buffer>(load.Arguments[0]);
         Assert.Same(actual, inlinedBuffer);
         Assert.Equal(2L, inlinedBuffer.Strides[0].FixedValue);
+    }
+
+    [Fact]
+    public async Task TestPreservesSingleCallPipelineProjection()
+    {
+        var projection = new PrimFunction(
+            "decoder_cpu_projection",
+            ModuleKind,
+            new Sequential(),
+            System.Array.Empty<IVar>())
+        {
+            Role = FunctionRole.PipelineProjection,
+        };
+        var worker = new PrimFunction(
+            "cpu_worker",
+            ModuleKind,
+            new Sequential(new Call(projection)),
+            System.Array.Empty<IVar>())
+        {
+            Role = FunctionRole.PipelineWorker,
+        };
+        var module = new IRModule(worker);
+        module.Add(projection);
+
+        await new InlineSingleCallPrimFunctionsPass(ModuleKind).RunAsync(module, new());
+
+        Assert.Equal(2, module.Functions.Count);
+        var call = Assert.IsType<Call>(Assert.Single(GetExecutableStatements(worker.Body)));
+        Assert.Same(projection, call.Target);
     }
 
     [Fact]
@@ -385,6 +487,38 @@ public sealed class UnitTestInlineSingleCallPrimFunctionsPass : TestClassBase
     }
 
     [Fact]
+    public async Task TestActiveModuleIgnoresHostDispatchCallee()
+    {
+        var hostDispatch = new PrimFunction(
+            "host_dispatch",
+            ModuleKind,
+            new Sequential(),
+            System.Array.Empty<IVar>())
+        {
+            Role = FunctionRole.ModuleDispatch,
+        };
+        var caller = new PrimFunction(
+            "caller",
+            ModuleKind,
+            new Sequential(new Call(hostDispatch)),
+            System.Array.Empty<IVar>());
+        var module = new IRModule(caller);
+        module.Add(hostDispatch);
+
+        using var moduleSession = CompileSession.Create(
+            CompileSessionScope.Current!.Target,
+            CompileOptions,
+            ModuleKind);
+        using var scope = new CompileSessionScope(moduleSession);
+
+        await new InlineSingleCallPrimFunctionsPass(ModuleKind).RunAsync(module, new());
+
+        Assert.Equal(2, module.Functions.Count);
+        var call = Assert.IsType<Call>(Assert.Single(GetExecutableStatements(caller.Body)));
+        Assert.Same(hostDispatch, call.Target);
+    }
+
+    [Fact]
     public async Task TestBufferizePreservesCanonicalSharedCalleeForInlining()
     {
         T.CreateBuffer(
@@ -518,7 +652,14 @@ public sealed class UnitTestInlineSingleCallPrimFunctionsPass : TestClassBase
             tensorType,
             new SBP[] { SBP.SContiguous([0], 2) },
             placement);
-        var formal = new BufferVar("formal", distributedType, BufferVarRole.Output, MemoryLocation.Output);
+        var formal = new BufferVar(
+            "formal",
+            distributedType,
+            BufferVarRole.Output,
+            MemoryLocation.Output,
+            BufferLayoutAnnotation.ExactStrided(
+                [Dimension.One],
+                DistributedBufferStorageKind.CompactPerOwner));
         var formalBuffer = T.AttachBuffer(
             formal,
             tensorType,

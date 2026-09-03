@@ -13,7 +13,7 @@ namespace Nncase.Schedule.Bufferize;
 
 public sealed record BufferScheduleResult(IReadOnlyDictionary<TIR.PhysicalBuffer, BufferLifetime> Buffers, long MemoryPoolStart, long MemoryPoolEnd, int Alignment);
 
-public sealed record BufferScheduleOptions(long StartAddress = 0);
+public sealed record BufferScheduleOptions(long StartAddress = 0, int MinimumAlignment = 1);
 
 public abstract class BufferScheduler
 {
@@ -70,8 +70,16 @@ public abstract class BufferScheduler
 
     public bool TrySchedule(IReadOnlyDictionary<TIR.PhysicalBuffer, BufferLifetime> lifetimes, BufferScheduleOptions options, [MaybeNullWhen(false)] out BufferScheduleResult result)
     {
+        if (options.MinimumAlignment <= 0 || !System.Numerics.BitOperations.IsPow2((uint)options.MinimumAlignment))
+        {
+            throw new ArgumentOutOfRangeException(
+                nameof(options),
+                options.MinimumAlignment,
+                "Minimum buffer alignment must be a positive power of two.");
+        }
+
         long maxMemoryPoolEnd = options.StartAddress;
-        int maxAlignment = 8;
+        int maxAlignment = Math.Max(8, options.MinimumAlignment);
         foreach (var lifetime in lifetimes.Values)
         {
             if (lifetime.Buffer.Location != MemoryLocation)
@@ -79,7 +87,7 @@ public abstract class BufferScheduler
                 throw new ArgumentException($"Memory location to schedule of {lifetime.Buffer} is not expected.");
             }
 
-            var alignment = Math.Max(8, lifetime.Buffer.Alignment);
+            var alignment = GetBufferAlignment(lifetime.Buffer, options);
             maxMemoryPoolEnd = MathUtility.AlignUp(maxMemoryPoolEnd, alignment) + lifetime.Memory.Size;
             maxAlignment = Math.Max(maxAlignment, alignment);
         }
@@ -95,6 +103,9 @@ public abstract class BufferScheduler
             return false;
         }
     }
+
+    protected static int GetBufferAlignment(TIR.PhysicalBuffer buffer, BufferScheduleOptions options)
+        => Math.Max(Math.Max(8, buffer.Alignment), options.MinimumAlignment);
 
     protected abstract bool TryScheduleCore(IEnumerable<BufferLifetime> lifetimes, long maxMemoryPoolEnd, BufferScheduleOptions options, out long memoryPoolEnd);
 }

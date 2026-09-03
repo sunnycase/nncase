@@ -8,13 +8,17 @@ namespace Nncase.Importer
 {
     public class Qwen3 : HuggingFaceModel
     {
-        public override Tuple<Call, Call, Call> QKVCompute(int count, Expr hiddenStates, Dimension seqLen, Dimension headDim)
+        protected override QKVProjection QKVCompute(
+            int count,
+            Expr hiddenStates,
+            Dimension seqLen,
+            Dimension headDim)
         {
             var hidden_shape = new RankedShape(seqLen, -1L, headDim);
             var (queryStates, keyStates, valueStates) = BuildQKVParallelLinear(count, hiddenStates, hidden_shape);
             queryStates = LLMLayerNorm(queryStates, $"model.layers.{count}.self_attn.q_norm.weight");
             keyStates = LLMLayerNorm(keyStates, $"model.layers.{count}.self_attn.k_norm.weight");
-            return System.Tuple.Create(queryStates, keyStates, valueStates);
+            return new(queryStates, keyStates, valueStates);
         }
     }
 }

@@ -67,6 +67,7 @@ public sealed class DimRemainder : Dimension, IEquatable<DimRemainder?>
             (_, DimConst dimConst) when dimConst.Value == 1 => DimConst.Zero,
             (_, _) when numerator.IsUnknown || denominator.IsUnknown => Unknown,
             (DimProduct dimProduct, DimConst dimConst) when dimProduct.Scale % dimConst.Value == 0 => DimConst.Zero,
+            (DimSum dimSum, DimConst dimConst) when IsDivisible(dimSum, dimConst) => DimConst.Zero,
             (DimProduct dimProductA, DimProduct dimProductB) => SimplifyProductRemainder(dimProductA, dimProductB),
             (OpaqueDim opaqueDim, DimProduct dimProduct) => SimplifyProductRemainder(new DimProduct([opaqueDim]), dimProduct),
             (DimProduct dimProduct, OpaqueDim opaqueDim) => SimplifyProductRemainder(dimProduct, new DimProduct([opaqueDim])),
@@ -77,6 +78,24 @@ public sealed class DimRemainder : Dimension, IEquatable<DimRemainder?>
 
     /// <inheritdoc/>
     protected override int GetHashCodeCore() => HashCode.Combine(Numerator, Denominator);
+
+    private static bool IsDivisible(DimSum sum, DimConst divisor)
+    {
+        if (sum.Bias % divisor.Value != 0)
+        {
+            return false;
+        }
+
+        foreach (var operand in sum.Operands)
+        {
+            if (Simplify(operand, divisor) is not DimConst { Value: 0 })
+            {
+                return false;
+            }
+        }
+
+        return true;
+    }
 
     private static Dimension SimplifyProductRemainder(DimProduct numerator, DimProduct denominator)
     {

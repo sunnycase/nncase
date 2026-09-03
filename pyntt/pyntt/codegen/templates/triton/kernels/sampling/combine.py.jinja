@@ -5,7 +5,8 @@
 {% set processed_logprobs = model["LogprobsMode"] in ("ProcessedLogprobs", "ProcessedLogits") %}
 # generated from PyNTT Jinja sampling/combine.py.jinja
 # {{ model["Comment"] }}; vocab={{ model["VocabSize"] }}, blocks={{ model["BlockCount"] }}, max_logprobs={{ model["MaxLogprobs"] }}, mode={{ model["LogprobsMode"] }}
-{{ phases.consumer_header(model) }}
+@triton.jit(noinline=True)
+def {{ model["FunctionName"] }}__general_consumer({{ helper_parameters(model) }}):
 {{ common.mesh_coordinates(model["MeshAxes"]) }}
     logits_ptr = {{ ptr(model, "Logits") }}
     processed_ptr = {{ ptr(model, "ProcessedLogits") }}
@@ -402,6 +403,83 @@
 {% endfilter %}
 {% endfilter %}
 {% endfilter %}
+
+
+{{ "@triton.jit(noinline=True)" if model["NoInline"] else "@triton.jit" }}
+def {{ model["FunctionName"] }}__consumer({{ helper_parameters(model) }}):
+{{ common.mesh_coordinates(model["MeshAxes"]) }}
+    all_plain_greedy = True
+    for batch in tl.static_range(0, {{ model["MaxBatchSize"] }}):
+        temperature = tl.load({{ model["Temperature"] }} + batch).to(tl.float32)
+        requested_logprobs = tl.maximum(
+            -1,
+            tl.minimum(
+                {{ model["MaxLogprobs"] }},
+                tl.load({{ model["RequestedLogprobs"] }} + batch),
+            ),
+        )
+        all_plain_greedy &= (
+            (temperature < 1.0e-5)
+            & (requested_logprobs < 0)
+        )
+
+    if all_plain_greedy:
+        block_offsets = tl.arange(0, {{ ctx["summary_width"] }})
+        block_mask = block_offsets < {{ model["BlockCount"] }}
+        sampled_ids_ptr = {{ ptr(model, "SampledIds") }}
+        logprob_ids_ptr = {{ ptr(model, "LogprobIds") }}
+        logprobs_ptr = {{ ptr(model, "Logprobs") }}
+        ranks_ptr = {{ ptr(model, "Ranks") }}
+        counts_ptr = {{ ptr(model, "Counts") }}
+        for batch in tl.static_range(0, {{ model["MaxBatchSize"] }}):
+            active = (batch < {{ ctx["global_batch"] }}) & (tl.load({{ model["Active"] }} + batch) != 0)
+            sampled_token = -1
+            if shard_index == 0:
+                owner_argmax_keys = tl.load(
+                    {{ ctx["argmax_owner_pointer"] }}
+                    + batch * {{ dim(model["ArgMaxStateStrides"][0]) }},
+                    mask=block_mask,
+                    other=0,
+                )
+                global_argmax_key = tl.max(owner_argmax_keys)
+                global_inverse_token = global_argmax_key.to(tl.uint32)
+                global_arg_token = (
+                    0xFFFFFFFF - global_inverse_token
+                ).to(tl.int32)
+                sampled_token = tl.where(active, global_arg_token, -1)
+                if active:
+                    state_row = batch * {{ model["VocabSize"] }}
+                    old_count = tl.load(
+                        {{ model["OutputTokenCounts"] }}
+                        + state_row
+                        + sampled_token
+                    )
+                    tl.store(
+                        {{ model["OutputTokenCounts"] }}
+                        + state_row
+                        + sampled_token,
+                        old_count + 1,
+                    )
+                tl.store(sampled_ids_ptr + batch, sampled_token)
+                for output_slot in tl.static_range(0, {{ model["MaxLogprobs"] + 1 }}):
+                    tl.store(
+                        logprob_ids_ptr
+                        + batch * {{ model["MaxLogprobs"] + 1 }}
+                        + output_slot,
+                        -1,
+                    )
+                    tl.store(
+                        logprobs_ptr
+                        + batch * {{ model["MaxLogprobs"] + 1 }}
+                        + output_slot,
+                        -float("inf"),
+                    )
+                tl.store(ranks_ptr + batch, 0)
+                tl.store(counts_ptr + batch, 0)
+    else:
+        {{ model["FunctionName"] }}__general_consumer(
+            {{ helper_argument_names(model) }}
+        )
 
 
 {{ phases.dispatch(model) }}

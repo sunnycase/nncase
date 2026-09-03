@@ -1,6 +1,6 @@
 {% macro pipeline_setup(stage) -%}
 {% set stage_model = stage["Model"] %}
-{% set stage_ctx = packed_gemv_pipeline_context(stage_model) %}
+{% set stage_ctx = packed_gemv_pipeline_context(stage_model, allow_unscaled_fp8=True) %}
 {% set shared_buffer_shape = [stage_ctx["num_stages"]] + (stage_ctx["shared_stage_shape"] | list) %}
 {{ stage["StageName"] }}__rhs_stages = tle.gpu.alloc(
     [{{ shared_buffer_shape | join(", ") }}],
@@ -40,7 +40,7 @@
 {%- endmacro %}
 {% if model is defined %}
 {% import "triton/kernels/_common.py.jinja" as common with context %}
-{% set ctx = packed_gemv_pipeline_context(model) %}
+{% set ctx = packed_gemv_pipeline_context(model, allow_unscaled_fp8=True) %}
 # generated from PyNTT algorithm triton.matmul/simt_fma_smem_pipeline
 # {{ model["Comment"] }}; lhs_dtype={{ model["LhsDType"] }}, rhs_dtype={{ model["RhsDType"] }}, output_dtype={{ model["OutputDType"] }}, lhs_shape={{ shape_tuple(model["LhsShape"]) }}, rhs_shape={{ shape_tuple(model["RhsShape"]) }}, output_shape={{ shape_tuple(model["OutputShape"]) }}, rhs_layout={{ ctx["rhs_layout"] }}, rhs_n_lane={{ model["RhsNVectorLaneCount"] }}, rhs_k_pack={{ model["RhsKPackLaneCount"] }}, rhs_k_lane={{ model["RhsKVectorLaneCount"] }}, block_n={{ ctx["block_n"] }}, block_k={{ ctx["block_k"] }}, num_stages={{ ctx["num_stages"] }}, has_addend={{ model["HasAddend"] }}
 {{ ctx["consumer_weight_layout_name"] }} = tl.constexpr(

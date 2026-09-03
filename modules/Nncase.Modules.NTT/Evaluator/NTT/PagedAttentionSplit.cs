@@ -83,7 +83,8 @@ public sealed class PagedAttentionPartialEvaluator :
             query,
             extra,
             scale,
-            kvCaches);
+            kvCaches,
+            NoneType.Default);
         if (attentionType is InvalidType)
         {
             return attentionType;
@@ -160,7 +161,8 @@ public sealed class PagedAttentionCombineEvaluator :
         var maxState = context.GetOrtArgumentValue(target, PagedAttentionCombine.MaxState);
         var sumState = context.GetOrtArgumentValue(target, PagedAttentionCombine.SumState);
         var accState = context.GetOrtArgumentValue(target, PagedAttentionCombine.AccState);
-        return Evaluate(target, maxState, sumState, accState, context.GetReturnType());
+        var outputGate = context.GetArgumentValue(target, PagedAttentionCombine.OutputGate);
+        return Evaluate(target, maxState, sumState, accState, outputGate, context.GetReturnType());
     }
 
     internal static IValue Evaluate(
@@ -168,12 +170,22 @@ public sealed class PagedAttentionCombineEvaluator :
         OrtKISharp.Tensor maxState,
         OrtKISharp.Tensor sumState,
         OrtKISharp.Tensor accState,
+        IValue outputGate,
         IRType returnType)
     {
         _ = maxState;
         var output = accState / sumState;
         var dimAxis = PagedAttentionSplitTypeUtility.GetAxis(target.Layout, AttentionDimKind.Dim);
         output = output.Cast(PagedAttentionSplitTypeUtility.GetScalarDataType(target.OutputDataType).ToOrtType());
+        if (outputGate is not NoneValue && outputGate.Type is not NoneType)
+        {
+            var scalarGate = PagedAttentionSplitTypeUtility.UnpackToScalar(
+                outputGate.AsTensor().ToOrtTensor(),
+                target.OutputDataType,
+                dimAxis);
+            output *= OrtKI.Sigmoid(scalarGate);
+        }
+
         output = PagedAttentionSplitTypeUtility.PackFromScalar(output, target.OutputDataType, dimAxis);
         return output.ToValue(returnType);
     }
@@ -183,14 +195,17 @@ public sealed class PagedAttentionCombineEvaluator :
             target,
             context.CheckArgumentType<IRType>(target, PagedAttentionCombine.MaxState),
             context.CheckArgumentType<IRType>(target, PagedAttentionCombine.SumState),
-            context.CheckArgumentType<IRType>(target, PagedAttentionCombine.AccState));
+            context.CheckArgumentType<IRType>(target, PagedAttentionCombine.AccState),
+            context.CheckArgumentType<IRType>(target, PagedAttentionCombine.OutputGate));
 
     public static IRType InferType(
         PagedAttentionCombine target,
         IRType maxState,
         IRType sumState,
-        IRType accState)
-        => PagedAttentionSplitTypeUtility.CreateCombineOutputType(
+        IRType accState,
+        IRType outputGate)
+    {
+        var output = PagedAttentionSplitTypeUtility.CreateCombineOutputType(
             maxState,
             sumState,
             accState,
@@ -200,10 +215,22 @@ public sealed class PagedAttentionCombineEvaluator :
             target.OutputType,
             target.SplitHierarchyAxis,
             target.SplitCount);
+        if (output is InvalidType || outputGate is NoneType)
+        {
+            return output;
+        }
+
+        return outputGate == output
+            ? output
+            : new InvalidType(
+                $"PagedAttentionCombine output gate must have exactly the output type, " +
+                $"got output={output}, gate={outputGate}.");
+    }
 
     public Cost Visit(ICostEvaluateContext context, PagedAttentionCombine target)
     {
         var maxState = context.GetArgumentType<IRType>(target, PagedAttentionCombine.MaxState);
+        var outputGate = context.GetArgumentType<IRType>(target, PagedAttentionCombine.OutputGate);
         var output = context.GetReturnType<IRType>();
         var localOutput = output switch
         {
@@ -234,12 +261,21 @@ public sealed class PagedAttentionCombineEvaluator :
         var stateBytes = checked(
             (CostUtility.GetMemoryAccess(localStatsType) * 2 +
              CostUtility.GetMemoryAccess(localAccType)) * fanIn);
-        return new Cost
+        var cost = new Cost
         {
             [CostFactorNames.BlockLocalMemoryLoadBytes] = stateBytes,
             [CostFactorNames.BlockLocalMemoryStoreBytes] = CostUtility.GetMemoryAccess(output),
             [CostFactorNames.CPUCycles] = stateBytes / sizeof(float),
         };
+        if (outputGate is not NoneType)
+        {
+            var gateBytes = CostUtility.GetMemoryAccess(outputGate);
+            cost[CostFactorNames.BlockLocalMemoryLoadBytes] += gateBytes;
+            cost[CostFactorNames.CPUCycles] += gateBytes /
+                (UInt128)System.Math.Max(1, localOutput.DType.SizeInBytes) * 3;
+        }
+
+        return cost;
     }
 }
 

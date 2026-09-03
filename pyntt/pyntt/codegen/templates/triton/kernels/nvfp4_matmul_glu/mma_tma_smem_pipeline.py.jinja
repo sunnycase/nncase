@@ -2,6 +2,7 @@
 {% set stage_model = stage["Model"] %}
 {% set stage_ctx = nvfp4_matmul_glu_context(stage_model) %}
 {% set packed_shape = [stage_ctx["num_stages"]] + (stage_ctx["packed_tma_block_shape"] | list) %}
+{% set scale_shape = [stage_ctx["num_stages"]] + (stage_ctx["scale_tma_block_shape"] | list) %}
 {{ stage["StageName"] }}__packed_weight_stages = tle.gpu.alloc(
     [{{ packed_shape | join(", ") }}],
     dtype=tl.uint8,
@@ -19,16 +20,36 @@
     alias=pyntt_shared_arena,
     alias_offset_bytes={{ stage["SharedWorkspaceOffsets"]["packed_weight_stage"] }},
 )
+{{ stage["StageName"] }}__weight_scale_stages = tle.gpu.alloc(
+    [{{ scale_shape | join(", ") }}],
+    dtype=tl.float8e4nv,
+    layout=tle.gpu.nv_tma_shared_layout(
+        [{{ scale_shape | join(", ") }}],
+        [{{ range((scale_shape | length) - 1, -1, -1) | join(", ") }}],
+        tl.float8e4nv,
+        [{% for _ in scale_shape %}1{{ ", " if not loop.last }}{% endfor %}],
+        [{% for _ in scale_shape %}1{{ ", " if not loop.last }}{% endfor %}],
+        [{{ range((scale_shape | length) - 1, -1, -1) | join(", ") }}],
+        False,
+        True,
+    ),
+    scope=tle.gpu.smem,
+    alias=pyntt_shared_arena,
+    alias_offset_bytes={{ stage["SharedWorkspaceOffsets"]["weight_scale_stage"] }},
+)
 {{ stage["PipeName"] }} = tle.pipe(
     capacity={{ stage_ctx["num_stages"] }},
     scope="cta",
     name="{{ stage["StageName"] }}_weight",
     packed_weight={{ stage["StageName"] }}__packed_weight_stages,
+    weight_scale={{ stage["StageName"] }}__weight_scale_stages,
 )
 {%- endmacro %}
 {% if model is defined %}
 {% import "triton/kernels/_common.py.jinja" as common with context %}
 {% set ctx = nvfp4_matmul_glu_context(model) %}
+{% set norm_ctx = ctx["input_normalization"] %}
+{% set norm = model["InputNormalization"] if norm_ctx else none %}
 # generated from PyNTT algorithm triton.nvfp4_matmul_glu/mma_tma_smem_pipeline
 # {{ model["Comment"] }}; input_shape={{ shape_tuple(model["InputShape"]) }}, packed_weight_shape={{ shape_tuple(model["WeightPackedShape"]) }}, scale_shape={{ shape_tuple(model["WeightScaleShape"]) }}, output_shape={{ shape_tuple(model["OutputShape"]) }}, glu={{ model["GluType"] }}, group_size={{ ctx["group_size"] }}, block_n={{ ctx["block_n"] }}, block_k={{ ctx["block_k"] }}, num_stages={{ ctx["num_stages"] }}
 {{ model["FunctionName"] }}__mma_layout = tl.constexpr(
@@ -49,19 +70,23 @@
 def {{ model["FunctionName"] }}__producer(writer, {{ helper_parameters(model) }}):
 {{ common.mesh_coordinates(model["MeshAxes"]) }}
 {% for projection in ctx["projections"] %}
-{% for n_tile in range(ctx["num_n_tiles"]) %}
-    {{ projection["lower"] }}_packed_entry_{{ n_tile }} = tle.gpu.tensor_map_table_entry(
+    {{ projection["lower"] }}_packed_entry = tle.gpu.tensor_map_table_entry(
         {{ projection["packed_descriptor_name"] }},
-        shard_index * {{ ctx["num_n_tiles"] }} + {{ n_tile }},
+        shard_index,
     )
-    tle.gpu.tensor_map_fenceproxy_acquire({{ projection["lower"] }}_packed_entry_{{ n_tile }})
-{% endfor %}
+    tle.gpu.tensor_map_fenceproxy_acquire({{ projection["lower"] }}_packed_entry)
+    {{ projection["lower"] }}_scale_entry = tle.gpu.tensor_map_table_entry(
+        {{ projection["scale_descriptor_name"] }},
+        shard_index,
+    )
+    tle.gpu.tensor_map_fenceproxy_acquire({{ projection["lower"] }}_scale_entry)
 {% endfor %}
 {% for n_batch_start in range(0, ctx["num_n_tiles"], ctx["n_tiles_per_activation_batch"]) %}
 {% set n_batch_end = [n_batch_start + ctx["n_tiles_per_activation_batch"], ctx["num_n_tiles"]] | min %}
 {% set n_batch_count = n_batch_end - n_batch_start %}
     for k_tile_{{ n_batch_start }} in tl.range(0, {{ ctx["num_k_tiles"] }}):
         k_tile = k_tile_{{ n_batch_start }}
+        k_start = k_tile * {{ ctx["block_k"] }}
 {% for n_tile in range(n_batch_start, n_batch_end) %}
 {% for projection in ctx["projections"] %}
         {{ projection["lower"] }}_sequence = (
@@ -74,7 +99,7 @@ def {{ model["FunctionName"] }}__producer(writer, {{ helper_parameters(model) }}
         ).to(tl.int32)
         {{ projection["lower"] }}_slot = writer.acquire({{ projection["lower"] }}_sequence)
         {{ projection["lower"] }}_packed_descriptor = tle.gpu.reinterpret_tensor_map(
-            {{ projection["lower"] }}_packed_entry_{{ n_tile }},
+            {{ projection["lower"] }}_packed_entry,
             {{ projection["lower"] }}_slot.packed_weight,
         )
         tle.gpu.copy(
@@ -82,7 +107,22 @@ def {{ model["FunctionName"] }}__producer(writer, {{ helper_parameters(model) }}
             {{ projection["lower"] }}_slot.packed_weight,
             [{{ ctx["packed_tma_block_shape"] | join(", ") }}],
             offsets=[
-{% for offset in ctx["packed_tma_offsets"] %}
+{% for offset in ctx["packed_tma_offsets_by_n_tile"][n_tile] %}
+                {{ tma_offset(offset) }},
+{% endfor %}
+            ],
+            eviction_policy="evict_first",
+        )
+        {{ projection["lower"] }}_scale_descriptor = tle.gpu.reinterpret_tensor_map(
+            {{ projection["lower"] }}_scale_entry,
+            {{ projection["lower"] }}_slot.weight_scale,
+        )
+        tle.gpu.copy(
+            {{ projection["lower"] }}_scale_descriptor,
+            {{ projection["lower"] }}_slot.weight_scale,
+            [{{ ctx["scale_tma_block_shape"] | join(", ") }}],
+            offsets=[
+{% for offset in ctx["scale_tma_offsets_by_n_tile"][n_tile] %}
                 {{ tma_offset(offset) }},
 {% endfor %}
             ],
@@ -104,13 +144,75 @@ def {{ model["FunctionName"] }}__producer(writer, {{ helper_parameters(model) }}
 {{ "@triton.jit(noinline=True)" if model["NoInline"] else "@triton.jit" }}
 def {{ model["FunctionName"] }}__consumer(reader, {{ helper_parameters(model) }}):
 {{ common.mesh_coordinates(model["MeshAxes"]) }}
+{% if norm_ctx %}
+    norm_scale = {{ ptr(norm, "NormScale") }}
+{% if norm_ctx["has_bias"] %}
+    norm_bias = {{ ptr(norm, "NormBias") }}
+{% endif %}
+    partial_reduction_width: tl.constexpr = min(
+        {{ model["TargetWorkerWidth"] }},
+        {{ norm_ctx["partial"]["reduction_width_cap"] }},
+    )
+    inner_count = ({{ norm_ctx["normalization_size"] }}) + 0.0
+{% for component in range(2 if norm_ctx["use_mean"] else 1) %}
+    stats_acc{{ component }} = tl.full(
+        (),
+        {{ norm_ctx["partial"]["zero"] }},
+        {{ norm_ctx["partial"]["accumulator_dtype"] }},
+    )
+    for partial_start{{ component }} in tl.range(
+        0,
+        {{ norm_ctx["partial"]["reduction_extent"] }},
+        partial_reduction_width,
+    ):
+        partial_lane{{ component }} = partial_start{{ component }} + tl.arange(0, partial_reduction_width)
+        partial_mask{{ component }} = partial_lane{{ component }} < {{ norm_ctx["partial"]["reduction_extent"] }}
+{% for axis in range(norm["Hierarchy"] | length) %}
+{% if axis in norm_ctx["partial"]["axes"] %}
+        source_shard_coord{{ axis }} = (
+            partial_lane{{ component }} // {{ norm_ctx["partial"]["axis_strides"][axis] }}
+        ) % {{ norm["Hierarchy"][axis] }}
+{% else %}
+        source_shard_coord{{ axis }} = shard_coord{{ axis }}
+{% endif %}
+{% endfor %}
+        source_shard_index = {{ norm_ctx["partial"]["source_shard_index"] }}
+        source_pool_index = {{ norm_ctx["partial"]["source_pool_index"] }}
+        stats_source_byte_offset = (
+            source_pool_index * {{ norm_ctx["partial"]["address"]["PoolStrideBytes"] }}
+            + {{ norm_ctx["partial"]["address"]["OffsetBytes"] }}
+        )
+        stats_source = (
+            {{ norm_ctx["partial"]["address"]["BaseName"] }} + stats_source_byte_offset
+        ).to({{ norm_ctx["partial"]["pointer_type"] }})
+        stats_value = tl.load(
+            stats_source + {{ norm_ctx["stats_accesses"][component]["ScalarOffset"] }},
+            mask=partial_mask{{ component }},
+            other={{ norm_ctx["partial"]["zero"] }},
+        ).to({{ norm_ctx["partial"]["accumulator_dtype"] }})
+        stats_acc{{ component }} += tl.sum(stats_value, axis=0)
+{% endfor %}
+{% if norm_ctx["use_mean"] %}
+    mean_value = stats_acc0 / inner_count
+    variance = (stats_acc1 / inner_count) - (mean_value * mean_value)
+{% else %}
+    mean_value = 0.0
+    variance = stats_acc0 / inner_count
+{% endif %}
+    variance = tl.maximum(variance, 0.0)
+    inv_std = tl.rsqrt(variance + {{ pyrepr(norm_ctx["epsilon"]) }})
+{% else %}
     input = {{ ptr(model, "Input") }}
+{% endif %}
 {% for projection in ctx["projections"] %}
-    {{ projection["lower"] }}_weight_scale_ptr = {{ ptr(model, projection["prefix"] ~ "WeightScale") }}
+{% if ctx["shared_input_quantization"] and not loop.first %}
+    {{ projection["lower"] }}_input_global_scale = {{ ctx["projections"][0]["lower"] }}_input_global_scale
+{% else %}
     {{ projection["lower"] }}_input_global_scale_ptr = {{ ptr(model, projection["prefix"] ~ "InputGlobalScale") }}
     {{ projection["lower"] }}_input_global_scale = tl.load(
         {{ access_pointer(model, projection["prefix"] ~ "InputGlobalScale", projection["lower"] ~ "_input_global_scale_ptr") }}
     ).to(tl.float32)
+{% endif %}
     {{ projection["lower"] }}_weight_global_scale_ptr = {{ ptr(model, projection["prefix"] ~ "WeightGlobalScale") }}
     {{ projection["lower"] }}_weight_global_scale = tl.load(
         {{ access_pointer(model, projection["prefix"] ~ "WeightGlobalScale", projection["lower"] ~ "_weight_global_scale_ptr") }}
@@ -141,14 +243,57 @@ def {{ model["FunctionName"] }}__consumer(reader, {{ helper_parameters(model) }}
         k_tile = k_tile_{{ n_batch_start }}
         k_start = k_tile * {{ ctx["block_k"] }}
         offs_k = k_start + logical_k
+{% if norm_ctx %}
+        input_source_pool_index = {{ norm_ctx["source_pool_index"] }}
+        input_source_byte_offset = (
+            input_source_pool_index * {{ norm_ctx["input_address"]["PoolStrideBytes"] }}
+            + {{ norm_ctx["input_address"]["OffsetBytes"] }}
+        )
+        input_source = (
+            {{ norm_ctx["input_address"]["BaseName"] }} + input_source_byte_offset
+        ).to({{ norm_ctx["input_pointer_type"] }})
+        raw_input_value = tl.load(
+            input_source + {{ norm_ctx["input_scalar_offset"] }},
+            mask=offs_k < {{ dim(ctx["k"]) }},
+            other=0.0,
+        ).to(tl.float32)
+        norm_scale_value = tl.load(
+            norm_scale + offs_k,
+            mask=offs_k < {{ dim(ctx["k"]) }},
+            other=0.0,
+        ).to(tl.float32)
+{% if norm_ctx["has_bias"] %}
+        norm_bias_value = tl.load(
+            norm_bias + offs_k,
+            mask=offs_k < {{ dim(ctx["k"]) }},
+            other=0.0,
+        ).to(tl.float32)
+        input_value = (
+            (raw_input_value - mean_value) * inv_std * norm_scale_value
+            + norm_bias_value
+        ).to({{ model["InputTritonDType"] }}).to(tl.float32)
+{% else %}
+        input_value = (
+            (raw_input_value - mean_value) * inv_std * norm_scale_value
+        ).to({{ model["InputTritonDType"] }}).to(tl.float32)
+{% endif %}
+{% else %}
         input_value = tl.load(
             {{ access_pointer(model, "Input", "input", ctx["input_access"]) }},
             mask=offs_k < {{ dim(ctx["k"]) }},
             other=0.0,
         ).to(tl.float32)
-        input_groups = tl.reshape(input_value, ({{ ctx["scale_block_k"] }}, {{ ctx["group_size"] }}))
+{% endif %}
+        input_groups = tl.reshape(
+            input_value,
+            ({{ ctx["scale_block_k"] }}, {{ ctx["group_size"] }}),
+        )
         input_max = tl.max(tl.abs(input_groups), axis=1)
 {% for projection in ctx["projections"] %}
+{% if ctx["shared_input_quantization"] and not loop.first %}
+        {{ projection["lower"] }}_input_fp4_mma = {{ ctx["projections"][0]["lower"] }}_input_fp4_mma
+        {{ projection["lower"] }}_input_scale_mma = {{ ctx["projections"][0]["lower"] }}_input_scale_mma
+{% else %}
         {{ projection["lower"] }}_input_block_scale = tl.maximum(
             -448.0,
             tl.minimum(
@@ -156,7 +301,9 @@ def {{ model["FunctionName"] }}__consumer(reader, {{ helper_parameters(model) }}
                 448.0,
             ),
         ).to(tl.float8e4nv)
-        {{ projection["lower"] }}_input_block_scale_f32 = {{ projection["lower"] }}_input_block_scale.to(tl.float32)
+        {{ projection["lower"] }}_input_block_scale_f32 = (
+            {{ projection["lower"] }}_input_block_scale.to(tl.float32)
+        )
         {{ projection["lower"] }}_input_quantized = tl.where(
             {{ projection["lower"] }}_input_block_scale_f32[:, None] != 0.0,
             input_groups * {{ projection["lower"] }}_input_global_scale
@@ -198,8 +345,10 @@ def {{ model["FunctionName"] }}__consumer(reader, {{ helper_parameters(model) }}
             {{ projection["lower"] }}_input_block_scale[None, :],
             (8, {{ ctx["scale_block_k"] }}),
         )
+{% endif %}
+{% endfor %}
 {% for n_tile in range(n_batch_start, n_batch_end) %}
-        offs_n = {{ n_tile * ctx["block_n"] }} + local_n_source
+{% for projection in ctx["projections"] %}
         {{ projection["lower"] }}_sequence = (
             (
                 {{ n_batch_start * ctx["num_k_tiles"] }}
@@ -216,11 +365,11 @@ def {{ model["FunctionName"] }}__consumer(reader, {{ helper_parameters(model) }}
             ),
             {{ model["FunctionName"] }}__weight_dot_layout,
         )
-        {{ projection["lower"] }}_weight_scale = tl.load(
-            {{ access_pointer(model, projection["prefix"] ~ "WeightScale", projection["lower"] ~ "_weight_scale_ptr", projection["weight_scale_access"]) }},
-            mask=(offs_n[:, None] < {{ dim(ctx["n"]) }})
-            & (k_start // {{ ctx["group_size"] }} + scale_k[None, :] < {{ dim(ctx["k"]) }} // {{ ctx["group_size"] }}),
-            other=0.0,
+        {{ projection["lower"] }}_weight_scale = tl.reshape(
+            tl.load(
+                tle.gpu.local_ptr({{ projection["lower"] }}_ready.slot.weight_scale)
+            ),
+            ({{ ctx["block_n"] }}, {{ ctx["scale_block_k"] }}),
         )
         {{ projection["lower"] }}_mma = tl.dot_scaled(
             {{ projection["lower"] }}_weight,

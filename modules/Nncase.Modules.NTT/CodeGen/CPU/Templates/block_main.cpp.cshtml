@@ -9,8 +9,8 @@
   var shardCount = TensorUtilities.GetProduct(Model.Options.Hierarchies[0]);
 }
 
-extern "C" NTT_DEVICE void thread_main(const nncase::ntt::runtime::thread_inout_desc *input_descs,
-  nncase::ntt::runtime::thread_inout_desc *const output_descs,
+extern "C" NTT_DEVICE void @(Model.EntryPoint)(const nncase::ntt::runtime::block_inout_desc *input_descs,
+  nncase::ntt::runtime::block_inout_desc *const output_descs,
   const std::byte *rdata,
   const std::byte *block_local_rdata,
   std::byte *data,
@@ -42,7 +42,10 @@ extern "C" NTT_DEVICE void thread_main(const nncase::ntt::runtime::thread_inout_
       var dimStr = $"make_shape({string.Join(", ", Enumerable.Range(0, rank).Select(d => shape[d].IsFixed ? $"{shape[d].FixedValue}_dim" : $"input_descs[{i}].shape[{d}]"))})";
       var strideStr = $"make_strides({string.Join(", ", Enumerable.Range(0, rank).Select(d => $"input_descs[{i}].strides[{d}]"))})";
       if (input.CheckedDataType is ReferenceType referenceType) {
-        if (referenceType.ElemType is Nncase.IR.NN.PagedAttentionKVCacheType kvcacheType) {
+        if (referenceType.ElemType is Nncase.IR.Heterogeneous.PipelineChannelType) {
+  @:auto @(name) = reinterpret_cast<runtime::pipeline_channel *>(input_descs[@i].data);
+        }
+        else if (referenceType.ElemType is Nncase.IR.NN.PagedAttentionKVCacheType kvcacheType) {
           var size = TensorUtilities.GetProduct(shape.ToValueArray()); // todo: support dynamic shape
           var kv_tensor_shape = kvcacheType.Config.AxisPolicies.Select(p => p.HierarchyAxes.Select(i => Model.Options.Hierarchies[0][i]).Product()).ToArray();
           var kv_tensor_size = kv_tensor_shape.Product();
@@ -51,7 +54,7 @@ extern "C" NTT_DEVICE void thread_main(const nncase::ntt::runtime::thread_inout_
           }
           var placement = new Placement(Model.Options.Hierarchies[0], Model.Options.HierarchyNames, Model.Options.HierarchyLevels);
 
-  @:std::span<runtime::thread_paged_attention_kv_cache_desc> p@(name)_descs((runtime::thread_paged_attention_kv_cache_desc*)input_descs[@i].data, input_descs[@i].size / sizeof(runtime::thread_paged_attention_kv_cache_desc));
+  @:std::span<runtime::block_paged_attention_kv_cache_desc> p@(name)_descs((runtime::block_paged_attention_kv_cache_desc*)input_descs[@i].data, input_descs[@i].size / sizeof(runtime::block_paged_attention_kv_cache_desc));
   @:using paged_attention_kv_cache_mesh_t = @Html.Raw(KernelUtility.PlacementToC(placement));
   @:const auto paged_attention_kv_cache_config = @Html.Raw(kvcacheType.Config.ToC());
   @:using paged_attention_kv_cache_config_t = std::decay_t<decltype(paged_attention_kv_cache_config)>;
@@ -59,12 +62,15 @@ extern "C" NTT_DEVICE void thread_main(const nncase::ntt::runtime::thread_inout_
   @:using kv_storage_type_t = typename paged_attention_kv_cache_t::kv_storage_type_t;
   @:alignas(paged_attention_kv_cache_t) std::byte p@(name)[sizeof(paged_attention_kv_cache_t) * @size];
   @:for (size_t i = 0; i < @size; ++i) {
-    @:auto desc = p@(name)_descs[i];
+    @:const auto &desc = p@(name)_descs[i];
     @:auto kv_addrs = make_tensor_view_from_address((kv_storage_type_t **)desc.kv_cache_addrs.data(), paged_attention_kv_cache_t::kv_addrs_shape);
     @:auto ptr = (paged_attention_kv_cache_t*)p@(name) + i;
     @:new (ptr) paged_attention_kv_cache_t(desc.num_seqs, desc.num_tokens, make_tensor_view_from_address(desc.context_lens, make_shape(desc.context_lens_size)), make_tensor_view_from_address(desc.seq_lens, make_shape(desc.seq_lens_size)), make_tensor_view_from_address(desc.block_table, make_shape(desc.block_table_shape[0], desc.block_table_shape[1], paged_attention_kv_cache_t::id_length)), make_tensor_view_from_address(desc.slot_mapping, make_shape(desc.slot_mapping_shape[0], paged_attention_kv_cache_t::id_length)), kv_addrs);
   @:}
   @:auto @(name) = make_tensor_view_from_address((paged_attention_kv_cache_t *)p@(name), @Html.Raw(dimStr), @Html.Raw(strideStr));
+        }
+        else {
+          throw new NotSupportedException($"Unsupported NTT runtime reference input {referenceType.ElemType}.");
         }
       } else {
   @:auto @(name) = make_tensor_view_from_address((@Html.Raw(qualifiedElemType) *)input_descs[@i].data, @Html.Raw(dimStr), @Html.Raw(strideStr));
@@ -104,64 +110,3 @@ extern "C" NTT_DEVICE void thread_main(const nncase::ntt::runtime::thread_inout_
   
   @(Model.PrimFunction.Name)(@(string.Concat(names.Select(x => $"{x}, ")))rdata, block_local_rdata, data, block_local_data, output, output_descs);
 }
-
-#ifdef NNCASE_STANDALONE
-int main([[maybe_unused]] int argc, [[maybe_unused]] char** argv) {
-  std::byte *inputs[@inputCount];
-  size_t align = @(Model.Alignment);
-  @foreach(var (b,i) in abi.Abi.Inputs.OfType<Nncase.TIR.Buffer>().Select((b,i)=>(Model.GetInfo(b),i)))
-  {
-  @:inputs[@i] = (std::byte *)nncase::ntt::runtime::thread_alloc(sizeof(@Html.Raw(b.ElemType)) * @b.Size, align);
-  }
-
-  std::byte* rdata = (std::byte *)nncase::ntt::runtime::thread_alloc(@Model.RDataSize, align);
-  std::byte* block_local_rdata = (std::byte *)nncase::ntt::runtime::thread_alloc(@Model.BlockLocalRdataPoolSize, align);
-
-#ifdef __APPLE__
-  pthread_key_t cpu_thread_context_key_ = {};
-  pthread_key_create(&cpu_thread_context_key_, [](void *ptr) { delete (nncase::ntt::runtime::cpu_thread_context_t *)ptr; });
-#endif
-
-  std::vector<std::thread> blocks;
-  for (size_t cid = 0; cid < cdim(); cid++) {
-    for (size_t bid = 0; bid < bdim(); bid++) {
-      blocks.emplace_back([cid, bid, inputs, rdata, block_local_rdata
-#ifdef __APPLE__
-      , &cpu_thread_context_key_
-#endif
-      ] {
-        nncase::ntt::runtime::cpu_block_entry_params_t block_entry_params{
-            .bdim = bdim(),
-            .cdim = cdim(),
-            .bid = bid,
-            .cid = cid,
-            .input_descs = nullptr,
-            .output_descs = nullptr,
-            .rdata = rdata,
-            .block_local_rdata = block_local_rdata,
-#ifdef __APPLE__
-            .cpu_thread_context_key = cpu_thread_context_key_,
-#endif
-        };
-
-        block_entry(block_entry_params);
-      });
-    }
-  }
-
-  for (auto &block : blocks) {
-    block.join();
-  }
-    
-    
-#ifdef __APPLE__
-  pthread_key_delete(cpu_thread_context_key_);
-#endif
-
-  for (size_t i = 0; i < @inputCount; i++) {
-    nncase::ntt::runtime::thread_free(inputs[i]);
-  }
-  nncase::ntt::runtime::thread_free(rdata);
-  return 0;
-}
-#endif

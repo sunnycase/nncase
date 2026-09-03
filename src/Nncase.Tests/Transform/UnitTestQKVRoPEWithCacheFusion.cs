@@ -84,6 +84,7 @@ public sealed class UnitTestQKVRoPEWithCacheFusion : TestClassBase
             extra,
             scale,
             layerId,
+            None.Default,
             attentionLayout.ToArray(),
             16);
         var function = new Function(
@@ -109,6 +110,7 @@ public sealed class UnitTestQKVRoPEWithCacheFusion : TestClassBase
         Assert.Equal(2e-6f, fused.KEpsilon);
         Assert.Equal(qkvLayout, fused.QKVLayout);
         Assert.Equal(attentionLayout, fused.AttentionLayout);
+        Assert.Null(fusedCall.Metadata.SemanticRegion);
         Assert.DoesNotContain(
             calls,
             call => call.Target is NormStats or NormApply or RoPE or Transpose or Pack or UpdatePagedAttentionKVCache);
@@ -125,6 +127,98 @@ public sealed class UnitTestQKVRoPEWithCacheFusion : TestClassBase
             new[] { 2, 8 },
             Assert.IsType<VectorType>(vectorized[QKVRoPEWithCache.Cos].CheckedDataType).Lanes.ToArray());
         Assert.Equal(fusedCall.CheckedType, vectorized.CheckedType);
+    }
+
+    [Fact]
+    public async Task TestFusionDoesNotCrossSemanticRegionBoundary()
+    {
+        var q = new Var("q", new TensorType(DataTypes.BFloat16, new[] { 1, 2, 16 }));
+        var k = new Var("k", new TensorType(DataTypes.BFloat16, new[] { 1, 1, 16 }));
+        var v = new Var("v", new TensorType(DataTypes.BFloat16, new[] { 1, 1, 16 }));
+        var qScale = new Var("q_scale", new TensorType(DataTypes.BFloat16, new[] { 16 }));
+        var kScale = new Var("k_scale", new TensorType(DataTypes.BFloat16, new[] { 16 }));
+        var cos = new Var("cos", new TensorType(DataTypes.Float32, new[] { 1, 1, 16 }));
+        var sin = new Var("sin", new TensorType(DataTypes.Float32, new[] { 1, 1, 16 }));
+        var extra = new Var("extra", new TensorType(DataTypes.UInt8, new[] { 1 }));
+        var scale = new Var("scale", TensorType.Scalar(DataTypes.BFloat16));
+        var layerId = new DimVar("layer_id");
+        var config = CreateCacheConfig();
+        var cache = new Var(
+            "cache",
+            TensorType.Scalar(new ReferenceType(new PagedAttentionKVCacheType { Config = config })));
+        IRArray<AttentionDimKind> sourceLayout =
+            [AttentionDimKind.Seq, AttentionDimKind.Head, AttentionDimKind.Dim];
+        IRArray<AttentionDimKind> attentionLayout =
+            [AttentionDimKind.Head, AttentionDimKind.Dim, AttentionDimKind.Seq];
+        var qNorm = IR.F.NN.NormApply(
+            2,
+            1e-6f,
+            q,
+            IR.F.NN.NormStats(2, q, useMean: false),
+            qScale,
+            Tensor.Zeros(DataTypes.BFloat16, [16]),
+            useMean: false);
+        var kNorm = IR.F.NN.NormApply(
+            2,
+            1e-6f,
+            k,
+            IR.F.NN.NormStats(2, k, useMean: false),
+            kScale,
+            Tensor.Zeros(DataTypes.BFloat16, [16]),
+            useMean: false);
+        var permutation = AttentionLayoutUtility.GetPermutation(sourceLayout, attentionLayout);
+        var qView = IR.F.Tensors.Pack(
+            IR.F.Tensors.Transpose(IR.F.NN.RoPE(qNorm, cos, sin), permutation),
+            [8],
+            [1]);
+        var kView = IR.F.Tensors.Pack(
+            IR.F.Tensors.Transpose(IR.F.NN.RoPE(kNorm, cos, sin), permutation),
+            [8],
+            [1]);
+        var vView = IR.F.Tensors.Pack(IR.F.Tensors.Transpose(v, permutation), [8], [2]);
+        var cacheRegion = new SemanticRegion(
+            SemanticRegionKinds.PagedAttentionKVCache,
+            "layer.0.paged_attention_kv_cache");
+        var cacheAfterKey = IR.F.NN.UpdatePagedAttentionKVCache(
+            kView,
+            cache,
+            layerId,
+            AttentionCacheKind.Key,
+            attentionLayout.ToArray());
+        cacheAfterKey.Metadata.SemanticRegion = cacheRegion;
+        var cacheAfterValue = IR.F.NN.UpdatePagedAttentionKVCache(
+            vView,
+            cacheAfterKey,
+            layerId,
+            AttentionCacheKind.Value,
+            attentionLayout.ToArray());
+        cacheAfterValue.Metadata.SemanticRegion = cacheRegion;
+        var attention = IR.F.NN.PagedAttention(
+            qView,
+            cacheAfterValue,
+            extra,
+            scale,
+            layerId,
+            None.Default,
+            attentionLayout.ToArray(),
+            16);
+        attention.Metadata.SemanticRegion = cacheRegion;
+        var function = new Function(
+            "decoder",
+            string.Empty,
+            new IR.Tuple(attention, cacheAfterValue),
+            new IVar[] { q, k, v, qScale, kScale, cos, sin, extra, scale, cache, layerId });
+        Assert.True(function.InferenceType());
+
+        var rewritten = Assert.IsType<Function>(
+            await new FormQKVRoPEWithCachePass().RunAsync(function, new()));
+        var calls = ExprCollector.Collect(rewritten.Body).OfType<Call>().ToArray();
+
+        Assert.DoesNotContain(calls, call => call.Target is QKVRoPEWithCache);
+        Assert.Equal(2, calls.Count(call => call.Target is UpdatePagedAttentionKVCache));
+        Assert.Single(calls.Where(call => call.Target is PagedAttention));
+        Assert.Equal(2, calls.Count(call => call.Target is NormApply));
+        Assert.Equal(2, calls.Count(call => call.Target is RoPE));
     }
 
     [Fact]

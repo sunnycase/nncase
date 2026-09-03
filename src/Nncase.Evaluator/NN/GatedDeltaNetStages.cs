@@ -82,7 +82,19 @@ public sealed class GatedDeltaNetConvolutionEvaluator :
         }
 
         var scalarType = GatedDeltaNetStageUtility.GetScalarDataType(qkvValue.ElementType);
-        var convWeight = context.GetArgumentValueAsTensor(target, GatedDeltaNetConvolution.ConvWeight).ToOrtTensor();
+        var convWeightValue = context.GetArgumentValueAsTensor(
+            target,
+            GatedDeltaNetConvolution.ConvWeight);
+        var convWeight = convWeightValue.ToOrtTensor();
+        var convWeightLanes = GatedDeltaNetStageUtility.GetDataTypeLanes(
+            convWeightValue.ElementType);
+        if (convWeightLanes.Count != 0)
+        {
+            convWeight = convWeight.Unpack(
+                convWeightLanes.Count,
+                Enumerable.Repeat(0, convWeightLanes.Count).ToArray());
+        }
+
         var outputs = new List<OrtKISharp.Tensor>(checked((int)qkv.Shape[0]));
         for (var token = 0L; token < qkv.Shape[0]; token++)
         {
@@ -245,18 +257,19 @@ public sealed class GatedDeltaNetConvolutionEvaluator :
         DataType expectedQkvType = qkvLanes.Count == 0
             ? stateConfig.ActivationPrimType
             : new VectorType(stateConfig.ActivationPrimType, qkvLanes);
-        if (qkv.DType != expectedQkvType || convWeight.DType != stateConfig.ActivationPrimType)
+        if (qkv.DType != expectedQkvType || convWeight.DType != expectedQkvType)
         {
             return new InvalidType(
-                $"GatedDeltaNetConvolution QKV must use packed activation dtype " +
-                $"{expectedQkvType}, and convolution weight must use " +
-                $"{stateConfig.ActivationPrimType}.");
+                $"GatedDeltaNetConvolution QKV and convolution weight must use " +
+                $"the common packed activation dtype {expectedQkvType}.");
         }
 
         var scalarQkv = GatedDeltaNetStageUtility.UnpackTensorAxis(qkv, 1);
+        var scalarConvWeight = GatedDeltaNetStageUtility.UnpackTensorAxis(convWeight, 0);
         if (scalarQkv.Shape is not RankedShape scalarQkvShape ||
-            !GatedDeltaNetStageUtility.AreCompatible(scalarQkvShape[1], convWeightShape[0]) ||
-            !GatedDeltaNetStageUtility.IsFixedValue(convWeightShape[1], target.ConvKernelSize) ||
+            scalarConvWeight.Shape is not RankedShape scalarConvWeightShape ||
+            !GatedDeltaNetStageUtility.AreCompatible(scalarQkvShape[1], scalarConvWeightShape[0]) ||
+            !GatedDeltaNetStageUtility.IsFixedValue(scalarConvWeightShape[1], target.ConvKernelSize) ||
             !GatedDeltaNetStageUtility.IsFixedValue(
                 scalarQkvShape[1],
                 stateConfig.GetDimension(GatedDeltaNetStateDimKind.ConvChannels)) ||

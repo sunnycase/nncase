@@ -11,6 +11,9 @@
 {% for name, key in (("query", "Query"), ("scale_ptr", "Scale"), ("output", "Output")) %}
     {{ name }} = {{ ptr(model, key) }}
 {% endfor %}
+{% if model["HasOutputGate"] %}
+    output_gate = {{ ptr(model, "OutputGate") }}
+{% endif %}
     scale_value = tl.load({{ access_pointer(model, "Scale", "scale_ptr") }}).to(tl.float32)
     scale_log2_value = scale_value * 1.4426950408889634
     max_seq_len = tl.full((), 0, tl.int64)
@@ -96,6 +99,10 @@
                 max_score = tl.where(has_context, new_max, max_score)
             inv_sum = tl.where(sum_exp != 0.0, 1.0 / sum_exp, 0.0)
             result = tl.reshape(acc * inv_sum[:, None], {{ ctx["query_structured_shape"] }})
+{% if model["HasOutputGate"] %}
+            gate = tl.load({{ access_pointer(model, "OutputGate", "output_gate", ctx["output_gate_access"]) }}, mask=found_seq & {{ ctx["output_mask"] }}, other=0.0)
+            result *= tl.sigmoid(gate)
+{% endif %}
             tl.store({{ access_pointer(model, "Output", "output", ctx["output_access"]) }}, result, mask=found_seq & {{ ctx["output_mask"] }})
 
 

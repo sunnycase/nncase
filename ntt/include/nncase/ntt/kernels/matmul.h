@@ -17,6 +17,7 @@
 #include "../shape_infer/matmul.h"
 #include "../shape_infer/reduce.h"
 #include "../ukernels.h"
+#include "detail/load_previous.h"
 #include <type_traits>
 
 namespace nncase::ntt {
@@ -313,5 +314,30 @@ matmul([[maybe_unused]] const TLhs &lhs, [[maybe_unused]] const TRhs &rhs,
         }
     }
 #endif
+}
+
+template <bool TransposedA = false, bool TransposedB = false, Tensor TLhs,
+          Tensor TRhs, class TOut, class TLoadC,
+          class TScaleTensor = std::nullptr_t,
+          FixedDimensions LhsVectorizedAxes = shape_t<>,
+          FixedDimensions RhsVectorizedAxes = shape_t<>>
+constexpr void matmul_kernel(const TLhs &lhs, const TRhs &rhs, TOut &output,
+                             const TLoadC &load_c,
+                             const TScaleTensor &scale_tensor,
+                             const LhsVectorizedAxes &lhs_vectorized_axes,
+                             const RhsVectorizedAxes &rhs_vectorized_axes) {
+    if constexpr (!detail::has_load_previous_v<TLoadC>) {
+        matmul<false, TransposedA, TransposedB>(
+            lhs, rhs, output, scale_tensor, lhs_vectorized_axes,
+            fixed_shape_v<>, rhs_vectorized_axes, fixed_shape_v<>);
+    } else if (detail::load_previous(load_c)) {
+        matmul<true, TransposedA, TransposedB>(
+            lhs, rhs, output, scale_tensor, lhs_vectorized_axes,
+            fixed_shape_v<>, rhs_vectorized_axes, fixed_shape_v<>);
+    } else {
+        matmul<false, TransposedA, TransposedB>(
+            lhs, rhs, output, scale_tensor, lhs_vectorized_axes,
+            fixed_shape_v<>, rhs_vectorized_axes, fixed_shape_v<>);
+    }
 }
 } // namespace nncase::ntt

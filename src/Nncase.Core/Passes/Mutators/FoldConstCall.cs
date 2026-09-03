@@ -15,6 +15,12 @@ namespace Nncase.Passes.Mutators;
 public sealed class FoldConstCall : ExprRewriter
 {
     private readonly Dictionary<Expr, Expr> _cseMemo = new();
+    private readonly bool _deduplicateConstants;
+
+    public FoldConstCall(bool deduplicateConstants = true)
+    {
+        _deduplicateConstants = deduplicateConstants;
+    }
 
     protected override Expr RewriteLeafConst(Const @const)
     {
@@ -64,6 +70,11 @@ public sealed class FoldConstCall : ExprRewriter
 
     private Expr CSEConst(Const c)
     {
+        if (!_deduplicateConstants)
+        {
+            return c;
+        }
+
         if (!_cseMemo.TryGetValue(c, out var result))
         {
             result = c;

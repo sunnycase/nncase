@@ -98,6 +98,7 @@ public class RoPEEvaluator : IEvaluator<RoPE>, ITypeInferencer<RoPE>, ICostEvalu
 
     internal static Tensor Evaluate(Tensor inputTensor, Tensor cosTensor, Tensor sinTensor)
     {
+        ValidateShapes(inputTensor, cosTensor, sinTensor);
         var originDtype = inputTensor.ElementType;
         var computeDtype = originDtype.IsFloat() && originDtype != DataTypes.Float32
             ? DataTypes.Float32
@@ -111,13 +112,56 @@ public class RoPEEvaluator : IEvaluator<RoPE>, ITypeInferencer<RoPE>, ICostEvalu
         var sin = sinTensor.ToOrtTensor();
 
         var sliceAxis = inputTensor.Dimensions.Length - 1;
-        var sliceDim = inputTensor.Dimensions[sliceAxis] / 2;
-        var parts = OrtKI.Split(input, new[] { sliceDim, sliceDim }, sliceAxis);
+        var rotaryDim = cosTensor.Dimensions[^1];
+        var rotaryHalf = rotaryDim / 2;
+        var inputParts = OrtKI.Split(
+            input,
+            new[] { rotaryDim, inputTensor.Dimensions[sliceAxis] - rotaryDim },
+            sliceAxis);
+        var rotaryParts = OrtKI.Split(inputParts[0], new[] { rotaryHalf, rotaryHalf }, sliceAxis);
 
         // rotate half
-        var rotated = OrtKI.Concat([OrtKI.Neg(parts[1]), parts[0]], sliceAxis);
-        var output = OrtKI.Add(OrtKI.Mul(input, cos), OrtKI.Mul(rotated, sin)).ToTensor(computeDtype);
-        return output.CastElementTo(originDtype);
+        var rotated = OrtKI.Concat([OrtKI.Neg(rotaryParts[1]), rotaryParts[0]], sliceAxis);
+        var rotaryOutput = OrtKI.Add(OrtKI.Mul(inputParts[0], cos), OrtKI.Mul(rotated, sin));
+        var output = rotaryDim == inputTensor.Dimensions[sliceAxis]
+            ? rotaryOutput
+            : OrtKI.Concat([rotaryOutput, inputParts[1]], sliceAxis);
+        return output.ToTensor(computeDtype).CastElementTo(originDtype);
+    }
+
+    private static void ValidateShapes(Tensor input, Tensor cos, Tensor sin)
+    {
+        if (!cos.Dimensions.SequenceEqual(sin.Dimensions))
+        {
+            throw new ArgumentException(
+                $"RoPE cos/sin shapes must match, got cos=[{string.Join(',', cos.Dimensions.ToArray())}], " +
+                $"sin=[{string.Join(',', sin.Dimensions.ToArray())}].");
+        }
+
+        if (input.Rank != cos.Rank || input.Rank == 0)
+        {
+            throw new ArgumentException(
+                $"RoPE input and sin/cos must have the same non-zero rank, got input={input.Rank}, cos={cos.Rank}.");
+        }
+
+        for (var axis = 0; axis < input.Rank - 1; axis++)
+        {
+            if (cos.Dimensions[axis] != 1 && cos.Dimensions[axis] != input.Dimensions[axis])
+            {
+                throw new ArgumentException(
+                    $"RoPE sin/cos axis {axis} must be broadcastable to the input, got " +
+                    $"input=[{string.Join(',', input.Dimensions.ToArray())}], " +
+                    $"sin/cos=[{string.Join(',', cos.Dimensions.ToArray())}].");
+            }
+        }
+
+        var rotaryDim = cos.Dimensions[^1];
+        if (rotaryDim <= 0 || rotaryDim > input.Dimensions[^1] || rotaryDim % 2 != 0)
+        {
+            throw new ArgumentException(
+                $"RoPE rotary dimension must be positive, even, and no larger than the input dimension, " +
+                $"got rotary={rotaryDim}, input={input.Dimensions[^1]}.");
+        }
     }
 
     private static IRType Visit(TensorType input)

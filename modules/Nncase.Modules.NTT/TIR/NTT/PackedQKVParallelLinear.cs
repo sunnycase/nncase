@@ -2,6 +2,7 @@
 // Licensed under the Apache license. See LICENSE file in the project root for full license information.
 
 using Nncase.IR;
+using Nncase.IR.Math;
 
 namespace Nncase.TIR.NTT;
 
@@ -45,5 +46,12 @@ public sealed partial class PackedQKVParallelLinear : NTTKernelOp
 
     public IR.NTT.PackedMatMulRhsLayout RhsLayout { get; }
 
-    public override string DisplayProperty() => $"NumHeads: {NumHeads}, NumKvHeads: {NumKvHeads}, RhsLayout: {RhsLayout}";
+    public int OutputNVectorLaneCount { get; }
+
+    public MatMulQuantizationMode QuantizationMode { get; }
+
+    public override string DisplayProperty() =>
+        $"NumHeads: {NumHeads}, NumKvHeads: {NumKvHeads}, RhsLayout: {RhsLayout}, " +
+        $"OutputNVectorLaneCount: {OutputNVectorLaneCount}, " +
+        $"QuantizationMode: {QuantizationMode}";
 }

@@ -5,6 +5,7 @@ using System.Collections.Generic;
 using System.Linq;
 using Nncase.Evaluator.IR.NTT;
 using Nncase.IR;
+using Nncase.IR.NN;
 using Nncase.IR.NTT;
 
 namespace Nncase.Passes.Distributed;
@@ -111,15 +112,49 @@ internal sealed class PagedAttentionCombineCandidateProvider :
     {
         var results = new List<DistributedCandidateTuple>();
         var candidateTarget = WithOutputType(target, returnType);
-        foreach (var inputTypes in EnumerateInputTypes(context))
+        if (context.AvailableInputTypes.Count != 4)
         {
-            if (PagedAttentionCombineEvaluator.InferType(
+            tuples = results;
+            return false;
+        }
+
+        var sumStateTypes = context.AvailableInputTypes[PagedAttentionCombine.SumState.Index].ToHashSet();
+        var accStateTypes = context.AvailableInputTypes[PagedAttentionCombine.AccState.Index].ToHashSet();
+        var outputGateTypes = context.AvailableInputTypes[PagedAttentionCombine.OutputGate.Index]
+            .Where(type => type is NoneType || type == returnType)
+            .ToArray();
+        foreach (var maxStateType in context.AvailableInputTypes[PagedAttentionCombine.MaxState.Index])
+        {
+            if (!TryCreateCompanionStateTypes(
                     candidateTarget,
-                    inputTypes[PagedAttentionCombine.MaxState.Index],
-                    inputTypes[PagedAttentionCombine.SumState.Index],
-                    inputTypes[PagedAttentionCombine.AccState.Index]) == returnType)
+                    returnType,
+                    maxStateType,
+                    out var sumStateType,
+                    out var accStateType) ||
+                !sumStateTypes.Contains(sumStateType) ||
+                !accStateTypes.Contains(accStateType))
             {
-                results.Add(new DistributedCandidateTuple(inputTypes, "paged-attention-combine-sbp"));
+                continue;
+            }
+
+            foreach (var outputGateType in outputGateTypes)
+            {
+                var inputTypes = new IRType[]
+                {
+                    maxStateType,
+                    sumStateType,
+                    accStateType,
+                    outputGateType,
+                };
+                if (PagedAttentionCombineEvaluator.InferType(
+                        candidateTarget,
+                        maxStateType,
+                        sumStateType,
+                        accStateType,
+                        outputGateType) == returnType)
+                {
+                    results.Add(new DistributedCandidateTuple(inputTypes, "paged-attention-combine-sbp"));
+                }
             }
         }
 
@@ -133,22 +168,56 @@ internal sealed class PagedAttentionCombineCandidateProvider :
         IRType returnType)
         => WithOutputType(target, returnType);
 
-    private static IEnumerable<IRType[]> EnumerateInputTypes(DistributedCandidateContext context)
+    private static bool TryCreateCompanionStateTypes(
+        PagedAttentionCombine target,
+        IRType returnType,
+        IRType maxStateType,
+        out IRType sumStateType,
+        out IRType accStateType)
     {
-        if (context.AvailableInputTypes.Count != 3)
+        sumStateType = AnyType.Default;
+        accStateType = AnyType.Default;
+        var outputTensorType = PagedAttentionSplitTypeUtility.GetTensorType(returnType);
+        if (outputTensorType?.Shape is not RankedShape outputShape ||
+            outputShape.Rank != target.Layout.Count)
         {
-            yield break;
+            return false;
         }
 
-        foreach (var maxState in context.AvailableInputTypes[PagedAttentionCombine.MaxState.Index])
+        var dimAxis = PagedAttentionSplitTypeUtility.GetAxis(target.Layout, AttentionDimKind.Dim);
+        var scalarDimensions = outputShape.Dimensions.ToArray();
+        scalarDimensions[dimAxis] = (scalarDimensions[dimAxis] *
+            PagedAttentionSplitTypeUtility.GetVectorLaneCount(target.OutputDataType)).Simplify();
+        var statsDimensions = scalarDimensions.ToArray();
+        statsDimensions[dimAxis] = Dimension.One;
+        var statsTensorType = new TensorType(DataTypes.Float32, new RankedShape(statsDimensions));
+        var accTensorType = new TensorType(DataTypes.Float32, new RankedShape(scalarDimensions));
+        if (PagedAttentionSplitTypeUtility.GetTensorType(maxStateType) != statsTensorType)
         {
-            foreach (var sumState in context.AvailableInputTypes[PagedAttentionCombine.SumState.Index])
-            {
-                foreach (var accState in context.AvailableInputTypes[PagedAttentionCombine.AccState.Index])
-                {
-                    yield return [maxState, sumState, accState];
-                }
-            }
+            return false;
+        }
+
+        switch (maxStateType)
+        {
+            case TensorType when returnType is TensorType:
+                sumStateType = statsTensorType;
+                accStateType = accTensorType;
+                return true;
+            case DistributedType { Partial: { Op: ReduceOp.Max } partial } distributedMax
+                when returnType is DistributedType:
+                sumStateType = new DistributedType(
+                    statsTensorType,
+                    distributedMax.AxisPolicies,
+                    distributedMax.Placement,
+                    SBP.P(partial.Axes, ReduceOp.Sum));
+                accStateType = new DistributedType(
+                    accTensorType,
+                    distributedMax.AxisPolicies,
+                    distributedMax.Placement,
+                    SBP.P(partial.Axes, ReduceOp.Sum));
+                return true;
+            default:
+                return false;
         }
     }
 

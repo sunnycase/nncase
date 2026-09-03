@@ -13,6 +13,7 @@
  * limitations under the License.
  */
 #pragma once
+#include "detail/load_previous.h"
 #include "../primitive_ops.h"
 #include "../shape.h"
 #include "../shape_infer/reduce.h"
@@ -257,4 +258,26 @@ DEFINE_NTT_REDUCE(sum)
 DEFINE_NTT_REDUCE(prod)
 
 #undef DEFINE_NTT_REDUCE
+
+template <reduce_op Op, Tensor TIn, class TOut, class TLoadPrevious,
+          FixedDimensions TReduceAxes,
+          FixedDimensions VectorizedAxes = shape_t<>,
+          FixedDimensions PadedNums =
+              decltype(make_zeros_shape<VectorizedAxes::rank()>())>
+constexpr void reduce_kernel(const TIn &input, TOut &output,
+                             const TLoadPrevious &load_previous,
+                             const TReduceAxes &reduce_axes,
+                             const VectorizedAxes &vectorized_axes,
+                             const PadedNums &paded_nums) noexcept {
+    if constexpr (!detail::has_load_previous_v<TLoadPrevious>) {
+        reduce<Op, false>(input, output, reduce_axes, vectorized_axes,
+                          paded_nums);
+    } else if (detail::load_previous(load_previous)) {
+        reduce<Op, true>(input, output, reduce_axes, vectorized_axes,
+                         paded_nums);
+    } else {
+        reduce<Op, false>(input, output, reduce_axes, vectorized_axes,
+                          paded_nums);
+    }
+}
 } // namespace nncase::ntt

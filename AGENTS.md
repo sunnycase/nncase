@@ -224,6 +224,32 @@ candidates belong to `PYNTT_KERNEL_CONFIGS`; a selected microkernel parameter
 may enter the manifest only when it determines the compiler-reserved resource
 contract.
 
+Generated readonly-data bundles are keyed by linked-function id plus source
+name; source names are not unique after function specialization. In
+heterogeneous PyNTT models, all GPU `RData` and `ChipLocalRdata` allocations are
+serialized into module-wide binary assets and materialized once as resident
+device tensors. Runtime top-kernel bundles may reference those same complete
+assets; the runtime cache must return the same device allocation for identical
+payload specifications. Do not add owner-scoped slicing, staging arenas,
+per-launch copies, offset rebasing, or an RData streaming protocol. C# codegen
+owns the module layout and emitted offsets, while Python only memory-maps and
+materializes the declared complete resident assets.
+
+CPU NTT follows the same late compiler boundary: it skips nncase AutoTiling and
+receives selected, bufferized semantic TIR over each local shard. CPU hierarchy
+axes must all map to physical `block`; logical meshes such as `yx -> bb` are
+allowed, and each physical block is executed by one core-bound thread-pool
+worker. Handwritten NTT C++ kernels own block-internal cache tiling, SIMD,
+microkernels, and tails. Do not reintroduce compiler `Grid`/`For`, `TileLoad` or
+`TileStore`, cache-level buffer placement, or model-specific block-local
+rewrites for CPU codegen.
+
+The native NTT target family also skips AutoTiling. Its generated source must
+call handwritten functions under `ntt/include/nncase/ntt/kernels/` once per
+semantic TIR operation; Razor templates may specialize static types and op
+attributes but must not implement operator loops, temporary tensors, reduction
+phases, or block-internal scheduling.
+
 Every executable PyNTT helper follows the producer/consumer specialization ABI.
 Algorithms with an independent gmem-to-Shared transfer phase use a real
 `tle.pipe` producer and consumer. Algorithms without a legal or profitable

@@ -13,7 +13,9 @@ using Nncase.CodeGen;
 using Nncase.CodeGen.NTT;
 using Nncase.Diagnostics;
 using Nncase.IR;
+using Nncase.IR.Affine;
 using Nncase.IR.F;
+using Nncase.IR.NN;
 using Nncase.IR.Tensors;
 using Nncase.Runtime.Interop;
 using Nncase.Targets;
@@ -67,6 +69,7 @@ public class UnitTestCPUTarget : TestClassBase
     {
         var target = CompilerServices.GetTarget(CPUTarget.Kind);
         Assert.NotNull(target);
+        Assert.False(target.IsAutoTilingEnabled);
     }
 
     [Theory]
@@ -75,6 +78,389 @@ public class UnitTestCPUTarget : TestClassBase
     {
         var moduleBuilder = CompileSession.Target.GetModuleCompiler(moduleKind).CreateModuleBuilder(CompileOptions);
         Assert.NotNull(moduleBuilder);
+    }
+
+    [Fact]
+    public void TestCPUHierarchyUsesOnlyPhysicalBlocks()
+    {
+        CompileOptions.TargetOptions = new NTTTargetOptions
+        {
+            Hierarchies = [[2, 4]],
+            HierarchyNames = "yx",
+            HierarchyLevels = "bb",
+        };
+        var moduleBuilder = CompileSession.Target.GetModuleCompiler(CPUTarget.Kind).CreateModuleBuilder(CompileOptions);
+        Assert.NotNull(moduleBuilder);
+
+        CompileOptions.TargetOptions = new NTTTargetOptions
+        {
+            Hierarchies = [[2, 4]],
+            HierarchyNames = "cb",
+            HierarchyLevels = "cb",
+        };
+        var exception = Assert.Throws<InvalidOperationException>(
+            () => CompileSession.Target.GetModuleCompiler(CPUTarget.Kind).CreateModuleBuilder(CompileOptions));
+        Assert.Contains("only physical block hierarchy levels", exception.Message, StringComparison.Ordinal);
+    }
+
+    [Fact]
+    public async Task TestCPUCompilationUsesDirectSemanticTIR()
+    {
+        var x = new Var("x", new TensorType(DataTypes.Float32, new[] { 32 }));
+        var main = new Function("main", CPUTarget.Kind, IR.F.Math.Unary(UnaryOp.Abs, x), new[] { x });
+        var compiler = Assert.IsType<global::Nncase.Compiler.Compiler>(CompileSession.Compiler);
+        compiler.ImportIRModule(new IRModule(main));
+
+        await compiler.CompileAsync();
+
+        var expressions = compiler.Module.Functions
+            .SelectMany(ExprCollector.Collect)
+            .ToArray();
+        Assert.Contains(
+            expressions.OfType<Call>(),
+            call => call.Target is TIR.NTT.NTTKernelOp);
+        Assert.Empty(expressions.OfType<Grid>());
+        Assert.Empty(expressions.OfType<TIR.For>());
+        Assert.Empty(expressions.OfType<TIR.PipelineFor>());
+        Assert.DoesNotContain(
+            expressions.OfType<Call>(),
+            call => call.Target is TIR.TileLoad or TIR.TileStore);
+        Assert.Empty(
+            Directory.GetDirectories(Dumpper.Directory, "*AutoTilingPass*", SearchOption.AllDirectories));
+    }
+
+    [Fact]
+    public void TestCPUCodegenRejectsScheduledTIR()
+    {
+        var loop = new TIR.For(
+            new DimVar("tile"),
+            new TIR.Range(0, 8, 4),
+            TIR.LoopMode.Serial,
+            new TIR.Sequential());
+        var function = new TIR.PrimFunction(
+            "scheduled",
+            CPUTarget.Kind,
+            new TIR.Sequential(loop),
+            Array.Empty<IVar>())
+        {
+            Role = FunctionRole.ScheduledRegion,
+        };
+        var moduleBuilder = CompileSession.Target.GetModuleCompiler(CPUTarget.Kind).CreateModuleBuilder(CompileOptions);
+
+        var exception = Assert.Throws<NotSupportedException>(() => moduleBuilder.Build([function]));
+        Assert.Contains("does not accept AutoTiling ScheduledRegion", exception.Message, StringComparison.Ordinal);
+    }
+
+    [Fact]
+    public void TestCPUCodegenRejectsCompilerGeneratedLoops()
+    {
+        var loop = new TIR.For(
+            new DimVar("tile"),
+            new TIR.Range(0, 8, 4),
+            TIR.LoopMode.Serial,
+            new TIR.Sequential());
+        var function = new TIR.PrimFunction(
+            "loop",
+            CPUTarget.Kind,
+            new TIR.Sequential(loop),
+            Array.Empty<IVar>());
+        var moduleBuilder = CompileSession.Target.GetModuleCompiler(CPUTarget.Kind).CreateModuleBuilder(CompileOptions);
+
+        var exception = Assert.Throws<NotSupportedException>(() => moduleBuilder.Build([function]));
+        Assert.Contains("contains For", exception.Message, StringComparison.Ordinal);
+    }
+
+    [Fact]
+    public void TestCPUEntryAbiSkipsExplicitDimensionParametersWhenScanningTensorShapes()
+    {
+        var sequenceLength = new DimVar("sequence_length")
+        {
+            Metadata = new() { Range = new(1, 128) },
+        };
+        var input = new Var(
+            "input",
+            new TensorType(DataTypes.Float32, new RankedShape(sequenceLength, 64)));
+        var function = new TIR.PrimFunction(
+            "dynamic_entry",
+            CPUTarget.Kind,
+            new TIR.Sequential(),
+            new IVar[] { sequenceLength, input });
+
+        var layout = KernelEntryAbiLayout.Create(function);
+
+        Assert.Empty(layout.DynamicDimensions);
+    }
+
+    [Fact]
+    public void TestCPUPagedAttentionObjectRetainsRuntimeDescriptorLifetime()
+    {
+        var config = new PagedAttentionConfig(
+            1,
+            1,
+            8,
+            DataTypes.BFloat16,
+            16,
+            [
+                PagedKVCacheDimKind.NumBlocks,
+                PagedKVCacheDimKind.NumLayers,
+                PagedKVCacheDimKind.KV,
+                PagedKVCacheDimKind.BlockSize,
+                PagedKVCacheDimKind.NumKVHeads,
+                PagedKVCacheDimKind.HeadDim,
+            ],
+            [
+                PagedKVCacheDimKind.NumBlocks,
+                PagedKVCacheDimKind.NumLayers,
+                PagedKVCacheDimKind.KV,
+                PagedKVCacheDimKind.BlockSize,
+                PagedKVCacheDimKind.NumKVHeads,
+                PagedKVCacheDimKind.HeadDim,
+            ],
+            [PagedKVCacheDimKind.HeadDim],
+            [PagedKVCacheDimKind.HeadDim],
+            [8],
+            [8],
+            [],
+            []);
+        var cache = new Var(
+            "cache",
+            TensorType.Scalar(new ReferenceType(new PagedAttentionKVCacheType { Config = config })));
+        var function = new TIR.PrimFunction(
+            "cache_user_prim",
+            CPUTarget.Kind,
+            new TIR.Sequential(),
+            new IVar[] { cache });
+        var options = new NTTTargetOptions
+        {
+            Hierarchies = [[1]],
+            HierarchyNames = "b",
+            HierarchyLevels = "b",
+        };
+
+        var source = CSourceBuiltn.MakeBlockMain(
+            function,
+            0,
+            "block_main_0",
+            8,
+            0,
+            0,
+            0,
+            0,
+            options);
+
+        Assert.Contains("const auto &desc = pid_cache_descs[i];", source, StringComparison.Ordinal);
+        Assert.DoesNotContain("auto desc = pid_cache_descs[i];", source, StringComparison.Ordinal);
+    }
+
+    [Fact]
+    public void TestCPUReturnWritesOnlyCallerAllocatedOutputDescriptors()
+    {
+        var objectType = TensorType.Scalar(new ReferenceType(DataTypes.Int32));
+        var state = new TIR.BufferVar(
+            "state",
+            objectType,
+            TIR.BufferVarRole.InOut,
+            TIR.MemoryLocation.Input);
+        var (outputParameter, output) = CreateOutputBuffer(
+            "output",
+            DataTypes.Float32,
+            [4],
+            [1]);
+        var function = new TIR.PrimFunction(
+            "stateful_prim",
+            CPUTarget.Kind,
+            new TIR.Sequential(),
+            new TIR.Return(new Expr[] { output, state }),
+            new IVar[] { state, outputParameter });
+
+        Assert.True(function.InferenceType());
+        using var visitor = new KernelCSourceConvertVisitor((NTTTargetOptions)CompileOptions.TargetOptions);
+        visitor.Visit(function);
+        var kernelSource = visitor.GetCSource().Kernel;
+
+        Assert.Contains("output_descs[0].data", kernelSource, StringComparison.Ordinal);
+        Assert.DoesNotContain("output_descs[1]", kernelSource, StringComparison.Ordinal);
+    }
+
+    [Fact]
+    public void TestCPUCodegenMakesRepeatedBufferNamesUnique()
+    {
+        var firstInput = CreateBuffer("first_input", DataTypes.Float32, TIR.MemoryLocation.Data, 0, [4], [1]);
+        var secondInput = CreateBuffer("second_input", DataTypes.Float32, TIR.MemoryLocation.Data, 16, [4], [1]);
+        var firstOutput = CreateBuffer("repeated_result", DataTypes.Float32, TIR.MemoryLocation.Data, 32, [4], [1]);
+        var secondOutput = CreateBuffer("repeated_result", DataTypes.Float32, TIR.MemoryLocation.Data, 48, [4], [1]);
+        var function = new TIR.PrimFunction(
+            "repeated_buffer_names_prim",
+            CPUTarget.Kind,
+            new TIR.Sequential(
+                TIR.F.NTT.Unary(UnaryOp.Abs, firstInput, firstOutput),
+                TIR.F.NTT.Unary(UnaryOp.Abs, secondInput, secondOutput)),
+            Array.Empty<IVar>());
+
+        Assert.True(function.InferenceType());
+        using var visitor = new KernelCSourceConvertVisitor((NTTTargetOptions)CompileOptions.TargetOptions);
+        visitor.Visit(function);
+        var kernelSource = visitor.GetCSource().Kernel;
+
+        Assert.Contains("auto repeated_result ", kernelSource, StringComparison.Ordinal);
+        Assert.Contains("auto repeated_result_1 ", kernelSource, StringComparison.Ordinal);
+    }
+
+    [Fact]
+    public void TestCPUCodegenTreatsDistributedParametersAsLocalShardAddresses()
+    {
+        var targetOptions = Assert.IsType<NTTTargetOptions>(CompileOptions.TargetOptions);
+        targetOptions.Hierarchies = [[24]];
+        targetOptions.HierarchyNames = "b";
+        targetOptions.HierarchyLevels = "b";
+
+        var tensorType = new TensorType(DataTypes.Float32, new[] { 16, 24 });
+        var placement = new Placement(new[] { 24 }, "b", "b");
+        var distributedType = new DistributedType(
+            tensorType,
+            new SBP[] { SBP.B, SBP.SContiguous([0], 1) },
+            placement);
+        var inputParameter = new TIR.BufferVar(
+            "input_storage",
+            distributedType,
+            TIR.BufferVarRole.Input,
+            TIR.MemoryLocation.Input,
+            TIR.BufferLayoutAnnotation.ExactStrided([24, 1]));
+        var outputParameter = new TIR.BufferVar(
+            "output_storage",
+            distributedType,
+            TIR.BufferVarRole.Output,
+            TIR.MemoryLocation.Output,
+            TIR.BufferLayoutAnnotation.ExactStrided([24, 1]));
+        var input = TIR.T.AttachBuffer(
+            inputParameter,
+            DistributedUtility.GetDividedTensorType(distributedType),
+            TIR.MemoryLocation.Input,
+            0,
+            out _,
+            "input",
+            distributedType);
+        var output = TIR.T.AttachBuffer(
+            outputParameter,
+            DistributedUtility.GetDividedTensorType(distributedType),
+            TIR.MemoryLocation.Output,
+            0,
+            out _,
+            "output",
+            distributedType);
+        var function = new TIR.PrimFunction(
+            "distributed_parameter_prim",
+            CPUTarget.Kind,
+            new TIR.Sequential(TIR.F.NTT.Unary(UnaryOp.Abs, input, output)),
+            new IVar[] { inputParameter, outputParameter });
+
+        Assert.True(function.InferenceType());
+        using var visitor = new KernelCSourceConvertVisitor(targetOptions);
+        visitor.Visit(function);
+        var kernelSource = visitor.GetCSource().Kernel;
+
+        Assert.Equal(2, kernelSource.Split("make_sharded_tensor_view_from_address", StringSplitOptions.None).Length - 1);
+        Assert.DoesNotContain("make_sharded_tensor_view_from_global_buffer", kernelSource, StringComparison.Ordinal);
+    }
+
+    [Fact]
+    public void TestCPUCodegenSupportsUnevenContiguousReshard()
+    {
+        var targetOptions = Assert.IsType<NTTTargetOptions>(CompileOptions.TargetOptions);
+        targetOptions.Hierarchies = [[24]];
+        targetOptions.HierarchyNames = "b";
+        targetOptions.HierarchyLevels = "b";
+
+        var tensorType = new TensorType(DataTypes.Float32, new[] { 1, 65 });
+        var placement = new Placement(new[] { 24 }, "b", "b");
+        var splitType = new DistributedType(
+            tensorType,
+            new SBP[] { SBP.B, SBP.SContiguous([0]) },
+            placement);
+        var broadcastType = new DistributedType(
+            tensorType,
+            new SBP[] { SBP.B, SBP.B },
+            placement);
+        var splitBuffer = new TIR.Buffer(
+            "split_input",
+            DataTypes.Float32,
+            new TIR.MemSpan(new TIR.PhysicalBuffer(4, 0, 12, TIR.MemoryLocation.Data)),
+            new Dimension[] { 1, 65 },
+            new Dimension[] { 0, 1 },
+            splitType);
+        var broadcastBuffer = new TIR.Buffer(
+            "broadcast_output",
+            DataTypes.Float32,
+            new TIR.MemSpan(new TIR.PhysicalBuffer(4, 16, 260, TIR.MemoryLocation.Data)),
+            new Dimension[] { 1, 65 },
+            new Dimension[] { 0, 1 },
+            broadcastType);
+        var function = new TIR.PrimFunction(
+            "uneven_reshard_prim",
+            CPUTarget.Kind,
+            new TIR.Sequential(
+                TIR.F.NTT.GatherReduceScatter(
+                    splitBuffer,
+                    broadcastBuffer,
+                    splitType,
+                    broadcastType)),
+            Array.Empty<IVar>());
+
+        Assert.True(function.InferenceType());
+        using var visitor = new KernelCSourceConvertVisitor(targetOptions);
+        visitor.Visit(function);
+        var kernelSource = visitor.GetCSource().Kernel;
+
+        Assert.Contains("reshard(split_input, broadcast_output);", kernelSource, StringComparison.Ordinal);
+        Assert.DoesNotContain("mesh_type::local_index", kernelSource, StringComparison.Ordinal);
+    }
+
+    [Fact]
+    public void TestCPUSupportCheckerAcceptsCanonicalReduceAxes()
+    {
+        var input = new Var("input", new TensorType(DataTypes.Float32, new[] { 2, 4 }));
+        var reduce = Assert.IsType<Call>(
+            IR.F.Tensors.Reduce(ReduceOp.Sum, input, new[] { 1L }, 0.0f, false));
+        Assert.True(CompilerServices.InferenceType(reduce));
+
+        Assert.True(new CPUModuleCompiler().IsSupportedCall(reduce, CompileOptions));
+    }
+
+    [Fact]
+    public void TestCPUSupportCheckerAcceptsDecomposedBFloat16Norm()
+    {
+        var input = new Var(
+            "input",
+            new TensorType(DataTypes.BFloat16, new[] { 1, 1, 128 }));
+        var scale = new Var(
+            "scale",
+            new TensorType(DataTypes.BFloat16, new[] { 128 }));
+        var bias = new Var(
+            "bias",
+            new TensorType(DataTypes.BFloat16, new[] { 128 }));
+        var stats = Assert.IsType<Call>(IR.F.NN.NormStats(2, input, useMean: false));
+        Assert.True(CompilerServices.InferenceType(stats));
+        var apply = Assert.IsType<Call>(
+            IR.F.NN.NormApply(2, 1e-6f, input, stats, scale, bias, useMean: false));
+        Assert.True(CompilerServices.InferenceType(apply));
+
+        var compiler = new CPUModuleCompiler();
+        Assert.True(compiler.IsSupportedCall(stats, CompileOptions));
+        Assert.True(compiler.IsSupportedCall(apply, CompileOptions));
+        Assert.Equal(DataTypes.Float32, stats.CheckedDataType);
+    }
+
+    [Fact]
+    public void TestCPUSupportCheckerAcceptsCallerAllocatedStorage()
+    {
+        var storage = Assert.IsType<Call>(
+            IR.F.Buffer.Uninitialized(
+                DataTypes.UInt8,
+                TIR.MemoryLocation.Data,
+                new[] { 1024 }));
+        Assert.True(CompilerServices.InferenceType(storage));
+
+        Assert.True(new CPUModuleCompiler().IsSupportedCall(storage, CompileOptions));
     }
 
     [Fact]
@@ -151,8 +537,8 @@ public class UnitTestCPUTarget : TestClassBase
         visitor.Visit(main);
         var kernelSource = visitor.GetCSource().Kernel;
         Assert.Contains("qkv_parallel_linear", kernelSource, StringComparison.Ordinal);
-        Assert.Equal(3, CountOccurrences(kernelSource, "matmul<false, false, false>"));
-        Assert.Contains("binary<ops::add>", kernelSource, StringComparison.Ordinal);
+        Assert.DoesNotContain("matmul<false, false, false>", kernelSource, StringComparison.Ordinal);
+        Assert.DoesNotContain("binary<ops::add>", kernelSource, StringComparison.Ordinal);
     }
 
     [Fact]
@@ -205,8 +591,8 @@ public class UnitTestCPUTarget : TestClassBase
         visitor.Visit(main);
         var kernelSource = visitor.GetCSource().Kernel;
         Assert.Contains("packed_qkv_parallel_linear", kernelSource, StringComparison.Ordinal);
-        Assert.Equal(3, CountOccurrences(kernelSource, "packed_matmul<false>"));
-        Assert.Contains("binary<ops::add>", kernelSource, StringComparison.Ordinal);
+        Assert.DoesNotContain("packed_matmul<false>", kernelSource, StringComparison.Ordinal);
+        Assert.DoesNotContain("binary<ops::add>", kernelSource, StringComparison.Ordinal);
     }
 
     [Fact]
@@ -247,10 +633,10 @@ public class UnitTestCPUTarget : TestClassBase
         using var visitor = new KernelCSourceConvertVisitor((NTTTargetOptions)CompileOptions.TargetOptions);
         visitor.Visit(main);
         var kernelSource = visitor.GetCSource().Kernel;
-        Assert.Contains("matmul_glu", kernelSource, StringComparison.Ordinal);
-        Assert.Equal(2, CountOccurrences(kernelSource, "matmul<false, false, false>"));
-        Assert.Contains("unary<ops::swish>", kernelSource, StringComparison.Ordinal);
-        Assert.Contains("binary<ops::mul>", kernelSource, StringComparison.Ordinal);
+        Assert.Contains("matmul_swiglu", kernelSource, StringComparison.Ordinal);
+        Assert.DoesNotContain("matmul<false, false, false>", kernelSource, StringComparison.Ordinal);
+        Assert.DoesNotContain("unary<ops::swish>", kernelSource, StringComparison.Ordinal);
+        Assert.DoesNotContain("binary<ops::mul>", kernelSource, StringComparison.Ordinal);
     }
 
     [Fact]
@@ -294,187 +680,10 @@ public class UnitTestCPUTarget : TestClassBase
         using var visitor = new KernelCSourceConvertVisitor((NTTTargetOptions)CompileOptions.TargetOptions);
         visitor.Visit(main);
         var kernelSource = visitor.GetCSource().Kernel;
-        Assert.Contains("packed_matmul_glu", kernelSource, StringComparison.Ordinal);
-        Assert.Equal(2, CountOccurrences(kernelSource, "packed_matmul<false>"));
-        Assert.Contains("unary<ops::swish>", kernelSource, StringComparison.Ordinal);
-        Assert.Contains("binary<ops::mul>", kernelSource, StringComparison.Ordinal);
-    }
-
-    [Fact]
-    public void TestMatmulReductionUsesBackendPrivateAccumulator()
-    {
-        var lhs = CreateBufferParameter("lhs", DataTypes.BFloat16, [2, 4], TIR.BufferVarRole.Input);
-        var rhs = CreateBufferParameter("rhs", DataTypes.BFloat16, [4, 3], TIR.BufferVarRole.Input);
-        var output = CreateBufferParameter("output", DataTypes.BFloat16, [2, 3], TIR.BufferVarRole.Output);
-        var source = GenerateReductionDeviceSource(
-            TIR.F.NTT.Matmul(lhs, rhs, output, false, None.Default),
-            lhs,
-            rhs,
-            output);
-
-        Assert.Contains("replace_element_t<typename std::decay_t<decltype(", source, StringComparison.Ordinal);
-        Assert.Contains("::element_type, float>", source, StringComparison.Ordinal);
-        Assert.Contains("matmul<false, false, false>", source, StringComparison.Ordinal);
-        Assert.Contains("matmul<true, false, false>", source, StringComparison.Ordinal);
-        AssertReductionLifetime(source, "ntt_reduction_0_acc0", IRHelpers.GetIdentityName(output.Name));
-    }
-
-    [Fact]
-    public void TestQKVReductionUsesThreeBackendPrivateAccumulators()
-    {
-        var input = CreateBufferParameter("input", DataTypes.BFloat16, [2, 4], TIR.BufferVarRole.Input);
-        var qWeight = CreateBufferParameter("q_weight", DataTypes.BFloat16, [4, 6], TIR.BufferVarRole.Input);
-        var kWeight = CreateBufferParameter("k_weight", DataTypes.BFloat16, [4, 3], TIR.BufferVarRole.Input);
-        var vWeight = CreateBufferParameter("v_weight", DataTypes.BFloat16, [4, 3], TIR.BufferVarRole.Input);
-        var qOutput = CreateBufferParameter("q_output", DataTypes.BFloat16, [2, 6], TIR.BufferVarRole.Output);
-        var kOutput = CreateBufferParameter("k_output", DataTypes.BFloat16, [2, 3], TIR.BufferVarRole.Output);
-        var vOutput = CreateBufferParameter("v_output", DataTypes.BFloat16, [2, 3], TIR.BufferVarRole.Output);
-        var source = GenerateReductionDeviceSource(
-            TIR.F.NTT.QKVParallelLinear(
-                input,
-                qWeight,
-                kWeight,
-                vWeight,
-                None.Default,
-                None.Default,
-                None.Default,
-                None.Default,
-                None.Default,
-                None.Default,
-                None.Default,
-                None.Default,
-                None.Default,
-                qOutput,
-                kOutput,
-                vOutput,
-                2,
-                1),
-            input,
-            qWeight,
-            kWeight,
-            vWeight,
-            qOutput,
-            kOutput,
-            vOutput);
-
-        Assert.Contains("ntt_reduction_0_acc0", source, StringComparison.Ordinal);
-        Assert.Contains("ntt_reduction_0_acc1", source, StringComparison.Ordinal);
-        Assert.Contains("ntt_reduction_0_acc2", source, StringComparison.Ordinal);
-        Assert.Equal(3, CountOccurrences(source, "matmul<false, false, false>"));
-        Assert.Equal(3, CountOccurrences(source, "matmul<true, false, false>"));
-        AssertReductionLifetime(source, "ntt_reduction_0_acc0", IRHelpers.GetIdentityName(qOutput.Name));
-    }
-
-    [Fact]
-    public void TestGluReductionUsesTwoBackendPrivateAccumulators()
-    {
-        var input = CreateBufferParameter("input", DataTypes.BFloat16, [2, 4], TIR.BufferVarRole.Input);
-        var gateWeight = CreateBufferParameter("gate_weight", DataTypes.BFloat16, [4, 6], TIR.BufferVarRole.Input);
-        var upWeight = CreateBufferParameter("up_weight", DataTypes.BFloat16, [4, 6], TIR.BufferVarRole.Input);
-        var output = CreateBufferParameter("output", DataTypes.BFloat16, [2, 6], TIR.BufferVarRole.Output);
-        var source = GenerateReductionDeviceSource(
-            TIR.F.NTT.MatMulGlu(
-                input,
-                gateWeight,
-                upWeight,
-                None.Default,
-                None.Default,
-                None.Default,
-                None.Default,
-                None.Default,
-                None.Default,
-                output,
-                IR.NN.GluType.SwiGLU),
-            input,
-            gateWeight,
-            upWeight,
-            output);
-
-        Assert.Contains("ntt_reduction_0_acc0", source, StringComparison.Ordinal);
-        Assert.Contains("ntt_reduction_0_acc1", source, StringComparison.Ordinal);
-        Assert.Equal(2, CountOccurrences(source, "matmul<false, false, false>"));
-        Assert.Equal(2, CountOccurrences(source, "matmul<true, false, false>"));
-        Assert.Contains("unary<ops::swish>(ntt_reduction_0_acc0", source, StringComparison.Ordinal);
-        Assert.Contains("binary<ops::mul>(ntt_reduction_0_acc0, ntt_reduction_0_acc1", source, StringComparison.Ordinal);
-        AssertReductionLifetime(source, "ntt_reduction_0_acc0", IRHelpers.GetIdentityName(output.Name));
-    }
-
-    [Fact]
-    public void TestReduceReductionUsesBackendPrivateAccumulator()
-    {
-        var input = CreateBufferParameter("input", DataTypes.BFloat16, [2, 4], TIR.BufferVarRole.Input);
-        var output = CreateBufferParameter("output", DataTypes.BFloat16, [2], TIR.BufferVarRole.Output);
-        var source = GenerateReductionDeviceSource(
-            TIR.F.NTT.Reduce(input, output, false, [], [], [1], false, ReduceOp.Sum),
-            input,
-            output);
-
-        Assert.Contains("replace_element_t<typename std::decay_t<decltype(", source, StringComparison.Ordinal);
-        Assert.Contains("::element_type, float>", source, StringComparison.Ordinal);
-        Assert.Contains("reduce_sum<false>", source, StringComparison.Ordinal);
-        Assert.Contains("reduce_sum<true>", source, StringComparison.Ordinal);
-        AssertReductionLifetime(source, "ntt_reduction_0_acc0", IRHelpers.GetIdentityName(output.Name));
-    }
-
-    [Fact]
-    public void TestReduceMeanReductionTracksDynamicElementCount()
-    {
-        var input = CreateBufferParameter("input", DataTypes.BFloat16, [2, 4], TIR.BufferVarRole.Input);
-        var output = CreateBufferParameter("output", DataTypes.BFloat16, [2], TIR.BufferVarRole.Output);
-        var source = GenerateReductionDeviceSource(
-            TIR.F.NTT.Reduce(input, output, false, [], [], [1], false, ReduceOp.Mean),
-            input,
-            output);
-
-        Assert.Contains("reduce_sum<false>", source, StringComparison.Ordinal);
-        Assert.Contains("reduce_sum<true>", source, StringComparison.Ordinal);
-        Assert.Contains("size_t ntt_reduction_0_element_count = 0", source, StringComparison.Ordinal);
-        Assert.Contains("ntt_reduction_0_element_count += reduction_element_count", source, StringComparison.Ordinal);
-        Assert.Contains("finalize_reduction_mean(ntt_reduction_0_acc0, ntt_reduction_0_element_count)", source, StringComparison.Ordinal);
-        AssertReductionLifetime(source, "ntt_reduction_0_acc0", IRHelpers.GetIdentityName(output.Name));
-    }
-
-    [Fact]
-    public void TestPartitionedReductionSharesBackendPrivateAccumulator()
-    {
-        var input = CreateBufferParameter("input", DataTypes.BFloat16, [2, 5], TIR.BufferVarRole.Input);
-        var output = CreateBufferParameter("output", DataTypes.BFloat16, [2], TIR.BufferVarRole.Output);
-        var fullUpdate = TIR.F.NTT.Reduce(input, output, false, [], [], [1], false, ReduceOp.Sum);
-        var tailUpdate = TIR.F.NTT.Reduce(input, output, false, [], [], [1], false, ReduceOp.Sum);
-        var fullLoop = new TIR.For(
-            new DimVar("reduction_tile"),
-            new TIR.Range(0, 4, 4),
-            TIR.LoopMode.Reduction,
-            new TIR.Sequential(fullUpdate),
-            TIR.LoopPartition.Full);
-        var tailLoop = new TIR.For(
-            new DimVar("reduction_tile_tail"),
-            new TIR.Range(4, 5, 4),
-            TIR.LoopMode.Reduction,
-            new TIR.Sequential(tailUpdate),
-            TIR.LoopPartition.Tail);
-        var function = new TIR.PrimFunction(
-            "device_func_partitioned_reduction_test",
-            CPUTarget.Kind,
-            new TIR.Sequential(fullLoop, tailLoop),
-            new IVar[] { input, output });
-
-        Assert.True(function.InferenceType());
-        var visitor = new DeviceCSourceConvertVisitor(new NTTTargetOptions());
-        visitor.Visit(function);
-        var source = visitor.GetHeader();
-
-        var storageCount = CountOccurrences(source, "auto ntt_reduction_0_acc0_storage");
-        var firstUpdateCount = CountOccurrences(source, "reduce_sum<false>");
-        var subsequentUpdateCount = CountOccurrences(source, "reduce_sum<true>");
-        var commitCount = CountOccurrences(
-            source,
-            $"cast(ntt_reduction_0_acc0, {IRHelpers.GetIdentityName(output.Name)}");
-        Assert.Equal(1, storageCount);
-        Assert.Equal(2, firstUpdateCount);
-        Assert.Equal(2, subsequentUpdateCount);
-        Assert.Equal(1, commitCount);
-        AssertReductionLifetime(source, "ntt_reduction_0_acc0", IRHelpers.GetIdentityName(output.Name));
+        Assert.Contains("packed_matmul_swiglu", kernelSource, StringComparison.Ordinal);
+        Assert.DoesNotContain("packed_matmul<false>", kernelSource, StringComparison.Ordinal);
+        Assert.DoesNotContain("unary<ops::swish>", kernelSource, StringComparison.Ordinal);
+        Assert.DoesNotContain("binary<ops::mul>", kernelSource, StringComparison.Ordinal);
     }
 
     [Fact]
@@ -622,7 +831,9 @@ public class UnitTestCPUTarget : TestClassBase
         var module = new IRModule(main);
         var pmgr = CompileSession.CreatePassManager("pmgr");
         var compiler = (Nncase.Compiler.Compiler)CompileSession.Compiler;
-        compiler.TIRPass(pmgr);
+        compiler.TIRSelectionPass(pmgr);
+        compiler.FinalizeTIRCallGraphPass(pmgr);
+        compiler.TIRLoweringPass(pmgr);
         module = pmgr.RunAsync(module).GetAwaiter().GetResult();
 
         var modelBuilder = CompileSession.GetRequiredService<IModelBuilder>();
@@ -723,58 +934,5 @@ public class UnitTestCPUTarget : TestClassBase
             strides.Select(stride => (Dimension)stride).ToArray(),
             null);
         return (parameter, buffer);
-    }
-
-    private TIR.BufferVar CreateBufferParameter(
-        string name,
-        DataType elemType,
-        long[] dimensions,
-        TIR.BufferVarRole role) =>
-        new(
-            name,
-            new TensorType(elemType, dimensions),
-            role,
-            role == TIR.BufferVarRole.Output ? TIR.MemoryLocation.Output : TIR.MemoryLocation.Input);
-
-    private string GenerateReductionDeviceSource(Expr reductionCall, params TIR.BufferVar[] parameters)
-    {
-        var loopVar = new DimVar("reduction_tile");
-        var loop = new TIR.For(
-            loopVar,
-            new TIR.Range(0, 8, 4),
-            TIR.LoopMode.Reduction,
-            new TIR.Sequential(reductionCall));
-        var function = new TIR.PrimFunction(
-            "device_func_reduction_test",
-            CPUTarget.Kind,
-            new TIR.Sequential(loop),
-            parameters);
-        Assert.True(function.InferenceType());
-        var visitor = new DeviceCSourceConvertVisitor(new NTTTargetOptions());
-        visitor.Visit(function);
-        return visitor.GetHeader();
-    }
-
-    private void AssertReductionLifetime(string source, string accumulator, string output)
-    {
-        var initializerIndex = source.IndexOf($"auto {accumulator}_storage", StringComparison.Ordinal);
-        var loopIndex = source.IndexOf("for (", StringComparison.Ordinal);
-        var finalizerIndex = source.LastIndexOf($"cast({accumulator}, {output}", StringComparison.Ordinal);
-        Assert.True(initializerIndex >= 0, $"Missing initializer for {accumulator}.\n{source}");
-        Assert.True(loopIndex > initializerIndex, $"Reduction loop must follow {accumulator} initialization.\n{source}");
-        Assert.True(finalizerIndex > loopIndex, $"{accumulator} must be committed after the reduction loop.\n{source}");
-    }
-
-    private int CountOccurrences(string text, string value)
-    {
-        var count = 0;
-        var index = 0;
-        while ((index = text.IndexOf(value, index, StringComparison.Ordinal)) >= 0)
-        {
-            count++;
-            index += value.Length;
-        }
-
-        return count;
     }
 }

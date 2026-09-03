@@ -30,7 +30,9 @@ public sealed partial class PagedAttention : NTTKernelOp
 
     public static readonly ParameterInfo LayerId = new(typeof(PagedAttention), 4, "layerId", IsDimensionType(), memoryEffect: MemoryEffect.None);
 
-    public static readonly ParameterInfo Output = new(typeof(PagedAttention), 5, "Output", memoryEffect: MemoryEffect.Write);
+    public static readonly ParameterInfo OutputGate = new(typeof(PagedAttention), 5, "outputGate", memoryEffect: MemoryEffect.Read);
+
+    public static readonly ParameterInfo Output = new(typeof(PagedAttention), 6, "Output", memoryEffect: MemoryEffect.Write);
 
     public IRArray<AttentionDimKind> Layout { get; }
 

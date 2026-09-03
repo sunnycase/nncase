@@ -304,6 +304,47 @@ public class TieredAdjacencyGraph<TVertex, TEdge> : IVertexAndEdgeListGraph<TVer
     }
 
     /// <summary>
+    /// Removes a set of vertices from the complete graph hierarchy in one
+    /// adjacency rebuild. This avoids repeatedly scanning every in-edge when a
+    /// transformation removes many vertices at once.
+    /// </summary>
+    /// <param name="vertices">Vertices to remove.</param>
+    /// <returns>The number of vertices removed from this graph.</returns>
+    /// <exception cref="T:System.ArgumentNullException">
+    /// <paramref name="vertices"/> is <see langword="null"/> or contains a null vertex.
+    /// </exception>
+    public int RemoveVertexRange([NotNull] IEnumerable<TVertex> vertices)
+    {
+        if (vertices is null)
+        {
+            throw new ArgumentNullException(nameof(vertices));
+        }
+
+        var verticesArray = vertices.ToArray();
+        if (verticesArray.Any(vertex => vertex == null))
+        {
+            throw new ArgumentNullException(nameof(vertices), "At least one vertex is null.");
+        }
+
+        var verticesToRemove = verticesArray
+            .Where(ContainsVertex)
+            .ToHashSet();
+        if (verticesToRemove.Count == 0)
+        {
+            return 0;
+        }
+
+        var root = this;
+        while (root.Parent is not null)
+        {
+            root = root.Parent;
+        }
+
+        root.RebuildWithoutVertices(verticesToRemove);
+        return verticesToRemove.Count;
+    }
+
+    /// <summary>
     /// Adds <paramref name="edge"/> and its vertices to this graph.
     /// </summary>
     /// <param name="edge">The edge to add.</param>
@@ -516,6 +557,32 @@ public class TieredAdjacencyGraph<TVertex, TEdge> : IVertexAndEdgeListGraph<TVer
         RemoveChildVertex(vertex);
         Wrapped.RemoveVertex(vertex);
         Parent?.RemoveVertex(vertex);
+    }
+
+    private void RebuildWithoutVertices(IReadOnlySet<TVertex> verticesToRemove)
+    {
+        foreach (TieredAdjacencyGraph<TVertex, TEdge> cluster in Clusters)
+        {
+            cluster.RebuildWithoutVertices(verticesToRemove);
+        }
+
+        var retainedVertices = Wrapped.Vertices
+            .Where(vertex => !verticesToRemove.Contains(vertex))
+            .ToArray();
+        var retainedEdges = Wrapped.Edges
+            .Where(edge => !verticesToRemove.Contains(edge.Source) &&
+                !verticesToRemove.Contains(edge.Target))
+            .ToArray();
+        Wrapped.Clear();
+        foreach (var vertex in retainedVertices)
+        {
+            Wrapped.AddVertex(vertex);
+        }
+
+        foreach (var edge in retainedEdges)
+        {
+            Wrapped.AddEdge(edge);
+        }
     }
 
     private void RemoveChildEdge([NotNull] TEdge edge)

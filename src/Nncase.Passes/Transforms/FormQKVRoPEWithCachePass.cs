@@ -54,7 +54,9 @@ public sealed class FormQKVRoPEWithCachePass : FunctionPass
             }
 
             var qOutput = IR.F.Tensors.GetItem(fusedCall, 0).InheritMetaData(queryView);
-            var cacheOutput = IR.F.Tensors.GetItem(fusedCall, 1).InheritMetaData(valueUpdate);
+            qOutput.Metadata.SemanticRegion = fusedCall.Metadata.SemanticRegion;
+            var cacheOutput = IR.F.Tensors.GetItem(fusedCall, 1);
+            cacheOutput.Metadata = valueUpdate.Metadata.Clone();
             if (!CompilerServices.InferenceType(qOutput) ||
                 !CompilerServices.InferenceType(cacheOutput) ||
                 qOutput.CheckedType != queryView.CheckedType ||
@@ -189,6 +191,25 @@ public sealed class FormQKVRoPEWithCachePass : FunctionPass
             return false;
         }
 
+        var absorbedCalls = queryLayoutView.Nodes
+            .Concat(keyLayoutView.Nodes)
+            .Concat(valueLayoutView.Nodes)
+            .Concat(
+            [
+                qRoPE,
+                qNormCall,
+                (Call)qNormCall[NormApply.Stats],
+                kRoPE,
+                kNormCall,
+                (Call)kNormCall[NormApply.Stats],
+                keyUpdateCall,
+                valueUpdateCandidate,
+            ]);
+        if (!SemanticRegionUtility.HaveUniformRegion(absorbedCalls))
+        {
+            return false;
+        }
+
         var qkv = new IR.Tuple(
             (Expr)qNormCall[NormApply.Input],
             (Expr)kNormCall[NormApply.Input],
@@ -210,8 +231,8 @@ public sealed class FormQKVRoPEWithCachePass : FunctionPass
                 kNorm.Epsilon,
                 kNorm.UseMean,
                 queryLayoutView.InputLayout,
-                pagedAttention.Layout)
-            .InheritMetaData(valueUpdateCandidate);
+                pagedAttention.Layout);
+        fusedCall.Metadata = valueUpdateCandidate.Metadata.Clone();
         queryView = queryLayoutView.Root;
         valueUpdateCall = valueUpdateCandidate;
         return true;

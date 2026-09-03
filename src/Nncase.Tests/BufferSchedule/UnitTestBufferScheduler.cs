@@ -2,6 +2,7 @@
 // Licensed under the Apache license. See LICENSE file in the project root for full license information.
 
 using System;
+using System.Collections.Generic;
 using System.Linq;
 using System.Threading.Tasks;
 using Google.OrTools.Sat;
@@ -11,8 +12,10 @@ using Nncase.Passes;
 using Nncase.Passes.BufferSchedule;
 using Nncase.Passes.Rules.ShapeBucket;
 using Nncase.Passes.Transforms;
+using Nncase.Schedule;
 using Nncase.Schedule.Bufferize;
 using Nncase.Tests.TestFixture;
+using Nncase.Utilities;
 using Xunit;
 
 namespace Nncase.Tests.BufferScheduleTest;
@@ -78,6 +81,30 @@ public sealed class UnitTestBufferScheduler : TestClassBase
         CpSolverStatus solve_status = solver.Solve(model);
         Assert.Equal(CpSolverStatus.Optimal, solve_status);
         System.Console.WriteLine(solver.Value(by_start));
+    }
+
+    [Fact]
+    public void TestLinearSchedulerHonorsTargetMinimumAlignment()
+    {
+        var first = new TIR.PhysicalBuffer(4, 12, TIR.MemoryLocation.Rdata);
+        var second = new TIR.PhysicalBuffer(4, 12, TIR.MemoryLocation.Rdata);
+        var firstLifetime = new BufferLifetime(first) { Memory = new(0, 12) };
+        var secondLifetime = new BufferLifetime(second) { Memory = new(0, 12) };
+        var lifetimes = new Dictionary<TIR.PhysicalBuffer, BufferLifetime>(ReferenceEqualityComparer.Instance)
+        {
+            [first] = firstLifetime,
+            [second] = secondLifetime,
+        };
+
+        var result = Nncase.Schedule.Bufferize.BufferScheduler.Schedule(
+            TIR.MemoryLocation.Rdata,
+            lifetimes,
+            new BufferScheduleOptions(StartAddress: 12, MinimumAlignment: 128));
+
+        Assert.Equal(128, result.Alignment);
+        Assert.Equal(128, firstLifetime.Memory.Start);
+        Assert.Equal(256, secondLifetime.Memory.Start);
+        Assert.Equal(268, result.MemoryPoolEnd);
     }
 
     [Fact]

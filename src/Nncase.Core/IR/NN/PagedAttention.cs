@@ -32,6 +32,8 @@ public sealed partial class PagedAttention : Op
 
     public static readonly ParameterInfo LayerId = new(typeof(PagedAttention), 4, "layerId", IsDimensionType(), ParameterKind.Attribute);
 
+    public static readonly ParameterInfo OutputGate = new(typeof(PagedAttention), 5, "outputGate", IsNoneType() | IsTensor(), ParameterKind.Input);
+
     public IRArray<AttentionDimKind> Layout { get; }
 
     public int HiddenSize { get; }

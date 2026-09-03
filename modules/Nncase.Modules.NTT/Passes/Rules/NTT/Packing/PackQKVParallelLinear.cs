@@ -4,6 +4,7 @@
 using System;
 using System.Linq;
 using Nncase.IR;
+using Nncase.IR.Math;
 using Nncase.IR.NN;
 using Nncase.PatternMatch;
 using Nncase.Utilities;
@@ -61,7 +62,8 @@ public sealed partial class PackQKVParallelLinearByN : RewriteRule<Pattern>
         Expr kWeightScale,
         Expr vWeightScale)
     {
-        if (input.CheckedDataType is VectorType ||
+        if (qkv.QuantizationMode != MatMulQuantizationMode.None ||
+            input.CheckedDataType is VectorType ||
             input.CheckedDataType == DataTypes.Float8E4M3 ||
             input.CheckedDataType == DataTypes.Float8E5M2 ||
             !IsNone(qInputScale) ||
@@ -192,12 +194,12 @@ public sealed partial class PackQKVParallelLinearByN : RewriteRule<Pattern>
 }
 
 [RuleGenerator]
-public sealed partial class PackQKVParallelLinearRhsKMajor : RewriteRule<Pattern>
+public sealed partial class PackQKVParallelLinearRhsForGpu : RewriteRule<Pattern>
 {
     private readonly int _vectorBytes;
     private readonly int _kPack;
 
-    public PackQKVParallelLinearRhsKMajor(int vectorBytes, int kPack)
+    public PackQKVParallelLinearRhsForGpu(int vectorBytes, int kPack)
     {
         if (vectorBytes <= 0)
         {
@@ -256,13 +258,20 @@ public sealed partial class PackQKVParallelLinearRhsKMajor : RewriteRule<Pattern
             return null;
         }
 
-        var scales = new[]
+        var inputScales = new[] { qInputScale, kInputScale, vInputScale };
+        var weightScales = new[] { qWeightScale, kWeightScale, vWeightScale };
+        var hasInputScales = inputScales.All(scale => !IsNone(scale));
+        var hasWeightScales = weightScales.All(scale => !IsNone(scale));
+        var scaleContractValid = qkv.QuantizationMode switch
         {
-            qInputScale, kInputScale, vInputScale,
-            qWeightScale, kWeightScale, vWeightScale,
+            MatMulQuantizationMode.None =>
+                inputScales.All(IsNone) && weightScales.All(IsNone),
+            MatMulQuantizationMode.StaticTensor => hasInputScales && hasWeightScales,
+            MatMulQuantizationMode.DynamicTensor =>
+                inputScales.All(IsNone) && hasWeightScales,
+            _ => false,
         };
-        var hasScales = scales.All(scale => !IsNone(scale));
-        if (!hasScales && scales.Any(scale => !IsNone(scale)))
+        if (!scaleContractValid)
         {
             return null;
         }
@@ -271,7 +280,7 @@ public sealed partial class PackQKVParallelLinearRhsKMajor : RewriteRule<Pattern
         if (weightType is null ||
             weightType != kWeight.CheckedDataType ||
             weightType != vWeight.CheckedDataType ||
-            (hasScales
+            (qkv.QuantizationMode != MatMulQuantizationMode.None
                 ? weightType != DataTypes.Float8E4M3
                 : weightType != inputType) ||
             _vectorBytes % weightType.SizeInBytes != 0)
@@ -281,13 +290,23 @@ public sealed partial class PackQKVParallelLinearRhsKMajor : RewriteRule<Pattern
 
         var nVectorLanes = _vectorBytes / outputType.SizeInBytes;
         var kVectorLanes = _vectorBytes / weightType.SizeInBytes;
+        var rhsLayout = qkv.QuantizationMode == MatMulQuantizationMode.DynamicTensor
+            ? IR.NTT.PackedMatMulRhsLayout.NMajorKPacked
+            : IR.NTT.PackedMatMulRhsLayout.KMajor;
+        var packedQWeightScale = qWeightScale;
+        var packedKWeightScale = kWeightScale;
+        var packedVWeightScale = vWeightScale;
         if (nVectorLanes <= 0 || kVectorLanes <= 0 ||
-            !TryPackWeight(qWeight, weightType, nVectorLanes, kVectorLanes, out var packedQWeight) ||
-            !TryPackWeight(kWeight, weightType, nVectorLanes, kVectorLanes, out var packedKWeight) ||
-            !TryPackWeight(vWeight, weightType, nVectorLanes, kVectorLanes, out var packedVWeight) ||
+            !TryPackWeight(qWeight, weightType, rhsLayout, nVectorLanes, kVectorLanes, out var packedQWeight) ||
+            !TryPackWeight(kWeight, weightType, rhsLayout, nVectorLanes, kVectorLanes, out var packedKWeight) ||
+            !TryPackWeight(vWeight, weightType, rhsLayout, nVectorLanes, kVectorLanes, out var packedVWeight) ||
             !TryPackBias(qBias, outputType, nVectorLanes, out var packedQBias) ||
             !TryPackBias(kBias, outputType, nVectorLanes, out var packedKBias) ||
             !TryPackBias(vBias, outputType, nVectorLanes, out var packedVBias) ||
+            (qkv.QuantizationMode == MatMulQuantizationMode.DynamicTensor &&
+                (!TryPackDynamicTensorWeightScale(qWeightScale, qWeight.CheckedShape[^1], nVectorLanes, out packedQWeightScale) ||
+                 !TryPackDynamicTensorWeightScale(kWeightScale, kWeight.CheckedShape[^1], nVectorLanes, out packedKWeightScale) ||
+                 !TryPackDynamicTensorWeightScale(vWeightScale, vWeight.CheckedShape[^1], nVectorLanes, out packedVWeightScale))) ||
             caller.CheckedType is not TupleType { Fields.Count: 3 } tupleType)
         {
             return null;
@@ -304,13 +323,15 @@ public sealed partial class PackQKVParallelLinearRhsKMajor : RewriteRule<Pattern
             qInputScale,
             kInputScale,
             vInputScale,
-            qWeightScale,
-            kWeightScale,
-            vWeightScale,
+            packedQWeightScale,
+            packedKWeightScale,
+            packedVWeightScale,
             qkv.NumHeads,
             qkv.NumKvHeads,
             qkv.OutputDataType,
-            rhsLayout: IR.NTT.PackedMatMulRhsLayout.KMajor);
+            rhsLayout: rhsLayout,
+            outputNVectorLaneCount: nVectorLanes,
+            quantizationMode: qkv.QuantizationMode);
         if (projection.CheckedType is not TupleType { Count: 3 } packedType)
         {
             return null;
@@ -329,6 +350,7 @@ public sealed partial class PackQKVParallelLinearRhsKMajor : RewriteRule<Pattern
     private bool TryPackWeight(
         Expr weight,
         PrimType weightType,
+        IR.NTT.PackedMatMulRhsLayout rhsLayout,
         int nVectorLanes,
         int kVectorLanes,
         out Expr packedWeight)
@@ -347,14 +369,18 @@ public sealed partial class PackQKVParallelLinearRhsKMajor : RewriteRule<Pattern
         var permutation = Enumerable.Range(0, rank).ToArray();
         (permutation[^2], permutation[^1]) = (permutation[^1], permutation[^2]);
 
-        // [K,N] -> [N,K]
-        // -> [N/NVector,K/(KPack*KVector)]<NVector,KPack,KVector>
-        // -> [K/(KPack*KVector),N/NVector]<NVector,KPack,KVector>.
+        // Both GPU layouts start from scalar [N,K] and pack K into one
+        // 32-element atom. SIMT additionally packs N and transposes the outer
+        // axes; MMA keeps scalar row-major [N,K] storage.
         packedWeight = IR.F.Tensors.Transpose(weight, permutation);
         packedWeight = IR.F.Tensors.Pack(packedWeight, [kVectorLanes], [rank - 1]);
         packedWeight = IR.F.Tensors.Pack(packedWeight, [_kPack], [rank - 1]);
-        packedWeight = IR.F.Tensors.Pack(packedWeight, [nVectorLanes], [rank - 2]);
-        packedWeight = IR.F.Tensors.Transpose(packedWeight, permutation);
+        if (rhsLayout == IR.NTT.PackedMatMulRhsLayout.KMajor)
+        {
+            packedWeight = IR.F.Tensors.Pack(packedWeight, [nVectorLanes], [rank - 2]);
+            packedWeight = IR.F.Tensors.Transpose(packedWeight, permutation);
+        }
+
         return packedWeight.CheckedType is not InvalidType;
     }
 
@@ -380,6 +406,25 @@ public sealed partial class PackQKVParallelLinearRhsKMajor : RewriteRule<Pattern
 
         packedBias = IR.F.Tensors.Pack(bias, [vectorLanes], [0]);
         return packedBias.CheckedType is not InvalidType;
+    }
+
+    private static bool TryPackDynamicTensorWeightScale(
+        Expr scale,
+        Dimension outputChannels,
+        int vectorLanes,
+        out Expr packedScale)
+    {
+        packedScale = scale;
+        if (scale.CheckedDataType is not PrimType scaleType || !scaleType.IsFloat() ||
+            scale.CheckedShape is not { IsUnranked: false, Rank: 1 } ||
+            scale.CheckedShape[0] != outputChannels ||
+            !Dimension.TryDivExactly(scale.CheckedShape[0], vectorLanes, out _))
+        {
+            return false;
+        }
+
+        packedScale = IR.F.Tensors.Pack(scale, [vectorLanes], [0]);
+        return packedScale.CheckedType is not InvalidType;
     }
 
     private static Expr UnpackOutput(Expr packed, int index, int rank, int vectorLanes)

@@ -121,6 +121,12 @@ def {{ model["FunctionName"] }}__consumer(reader, {{ helper_parameters(model) }}
         local_k_vector[None, :],
         {{ ctx["consumer_weight_layout_name"] }},
     )
+{% if ctx["scale_group_spans_stages"] %}
+    scale_group_local_k_vector = tle.encoding(
+        tl.arange(0, {{ ctx["scale_group_k"] }}),
+        {{ ctx["consumer_lhs_layout_name"] }},
+    )
+{% endif %}
     active_n = {{ dim(ctx["n"]) }}
     for n_tile in tl.range(0, {{ ctx["runtime_num_n_tiles"] }}):
         n_start = n_tile * {{ ctx["block_n"] }}
@@ -137,6 +143,89 @@ def {{ model["FunctionName"] }}__consumer(reader, {{ helper_parameters(model) }}
             ),
             {{ ctx["consumer_weight_layout_name"] }},
         )
+{% if ctx["scale_group_spans_stages"] %}
+        for scale_group in tl.range(0, {{ ctx["num_scale_groups"] }}):
+            scale_group_offs_k = (
+                scale_group * {{ ctx["scale_group_k"] }}
+                + scale_group_local_k_vector
+            )
+            scale_group_lhs_value = tle.encoding(
+                tl.load(
+                    {{ access_pointer(model, "Lhs", "lhs", ctx["scale_group_lhs_access"]) }}
+                ),
+                {{ ctx["consumer_lhs_layout_name"] }},
+            ).to(tl.float32)
+            lhs_group_scale = tl.maximum(
+                tl.max(tl.abs(scale_group_lhs_value[None, :]), axis=1) / 448.0,
+                1.0e-12,
+            )
+            for stage_in_scale_group in tl.static_range(0, {{ ctx["stages_per_scale_group"] }}):
+                k_tile = (
+                    scale_group * {{ ctx["stages_per_scale_group"] }}
+                    + stage_in_scale_group
+                )
+                sequence = (
+                    n_tile * {{ ctx["num_k_tiles"] }} + k_tile
+                ).to(tl.int32)
+                ready = reader.wait(sequence)
+                k_group = 0
+                shared_k = local_k
+                shared_payload = (
+                    local_n % {{ model["RhsNVectorLaneCount"] }}
+                    * {{ ctx["k_atom"] }}
+                    + shared_k % {{ ctx["k_atom"] }}
+                )
+                weight_ptr = tle.gpu.local_ptr(
+                    ready.slot.weight,
+                    (
+{% for index in ctx["shared_weight_indices"] %}
+                        tle.encoding(
+                            {{ index }},
+                            {{ ctx["consumer_weight_layout_name"] }},
+                        ),
+{% endfor %}
+                    ),
+                    shape=({{ ctx["block_n"] }}, {{ ctx["reduction_group"] }}),
+                )
+                weight_ptr = tl.max_contiguous(weight_ptr, [1, 16])
+                weight_ptr = tl.multiple_of(weight_ptr, [1, 16])
+                pipeline_offs_k = (
+                    k_tile * {{ ctx["block_k"] }} + local_k_vector
+                )
+                lhs_value = tle.encoding(
+                    tl.load(
+                        {{ access_pointer(model, "Lhs", "lhs", ctx["pipeline_lhs_access"]) }}
+                    ),
+                    {{ ctx["consumer_lhs_layout_name"] }},
+                ).to(tl.float32)
+                lhs_quantized = (
+                    lhs_value[None, :] / lhs_group_scale[:, None]
+                ).to(tl.float8e4nv).to(tl.float32)
+                lhs_quantized = tle.encoding(
+                    lhs_quantized,
+                    {{ ctx["consumer_weight_layout_name"] }},
+                )
+                global_k_start = {{ ctx["global_k_start"] }}
+                weight_scale_k = global_k_start // {{ ctx["weight_block_k"] }}
+                weight_scale_value = tl.load(
+                    {{ access_pointer(model, "RhsScale", "rhs_scale", ctx["rhs_scale_access"]) }}
+                ).to(tl.float32)
+                weight_scale_value = tle.encoding(
+                    weight_scale_value[:, None],
+                    {{ ctx["consumer_weight_layout_name"] }},
+                )
+                weight_value = tle.encoding(
+                    tl.load(weight_ptr),
+                    {{ ctx["consumer_weight_layout_name"] }},
+                ).to(tl.float32)
+                partial += (
+                    weight_value
+                    * lhs_quantized
+                    * lhs_group_scale[:, None]
+                    * weight_scale_value
+                )
+                reader.release(sequence)
+{% else %}
         for k_tile in tl.range(0, {{ ctx["num_k_tiles"] }}):
             sequence = (
                 n_tile * {{ ctx["num_k_tiles"] }} + k_tile
@@ -207,6 +296,7 @@ def {{ model["FunctionName"] }}__consumer(reader, {{ helper_parameters(model) }}
                     * weight_scale_value
                 )
             reader.release(sequence)
+{% endif %}
 
         result = (tl.sum(partial, axis=1) * {{ model["Scale"] }}).to({{ model["OutputTritonDType"] }})
         pipeline_output_n = output_n

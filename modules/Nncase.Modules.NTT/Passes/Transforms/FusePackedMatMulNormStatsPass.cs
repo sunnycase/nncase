@@ -8,8 +8,10 @@ using System.Reactive;
 using System.Threading.Tasks;
 using Nncase.IR;
 using Nncase.IR.Distributed;
+using Nncase.IR.Heterogeneous;
 using Nncase.IR.NN;
 using Nncase.IR.NTT;
+using Nncase.IR.Tensors;
 using Nncase.Utilities;
 
 namespace Nncase.Passes.Transforms;
@@ -23,18 +25,16 @@ public sealed class FusePackedMatMulNormStatsPass : FunctionPass
 {
     private readonly bool _enablePackedMatMul;
     private readonly bool _enableBlockScaledMatMul;
-
-    public FusePackedMatMulNormStatsPass(bool enableBlockScaledMatMul)
-        : this(true, enableBlockScaledMatMul)
-    {
-    }
+    private readonly bool _enableNVFP4MatMul;
 
     public FusePackedMatMulNormStatsPass(
         bool enablePackedMatMul,
-        bool enableBlockScaledMatMul)
+        bool enableBlockScaledMatMul,
+        bool enableNVFP4MatMul)
     {
         _enablePackedMatMul = enablePackedMatMul;
         _enableBlockScaledMatMul = enableBlockScaledMatMul;
+        _enableNVFP4MatMul = enableNVFP4MatMul;
     }
 
     protected override Task<BaseFunction> RunCoreAsync(BaseFunction input, RunPassContext context)
@@ -83,6 +83,13 @@ public sealed class FusePackedMatMulNormStatsPass : FunctionPass
             foreach (var candidate in candidates)
             {
                 Expr replacement = localStats;
+                foreach (var dependency in candidate.OrderingDependencies.Reverse())
+                {
+                    replacement = AssertValidCall(
+                        IR.F.Heterogeneous.PipelineYield(replacement, dependency),
+                        $"preserving packed matmul normalization-statistics ordering in {function.Name}");
+                }
+
                 if (!Equals(localStats.CheckedType, candidate.NormStats.CheckedType))
                 {
                     replacement = AssertValidCall(
@@ -134,7 +141,8 @@ public sealed class FusePackedMatMulNormStatsPass : FunctionPass
             var normStats = (NormStats)normStatsCall.Target;
             if (!TryGetPackedMatMul(
                     normStatsCall[NormStats.Input],
-                    out var packedCall) ||
+                    out var packedCall,
+                    out var orderingDependencies) ||
                 packedCall.Target is not Op packedTarget ||
                 !CanFuseProducer(packedTarget) ||
                 packedCall.CheckedType is DistributedType { Partial: not null } ||
@@ -151,7 +159,11 @@ public sealed class FusePackedMatMulNormStatsPass : FunctionPass
                 result.Add(packedCall, candidates);
             }
 
-            candidates.Add(new Candidate(normStatsCall, axis, normStats.UseMean));
+            candidates.Add(new Candidate(
+                normStatsCall,
+                axis,
+                normStats.UseMean,
+                orderingDependencies));
         }
 
         return result;
@@ -159,43 +171,88 @@ public sealed class FusePackedMatMulNormStatsPass : FunctionPass
 
     private static bool TryGetPackedMatMul(
         BaseExpr input,
-        out Call packedCall)
+        out Call packedCall,
+        out IReadOnlyList<Expr> orderingDependencies)
     {
-        if (input is Call { Target: PackedMatMul } directCall)
+        var dependencies = new List<Expr>();
+        var current = input;
+        while (current is Call call)
         {
-            packedCall = directCall;
-            return true;
-        }
+            if (call.Target is PackedMatMul or PackedBlockScaledMatMul or PackedNVFP4MatMul)
+            {
+                if (!HaveSameLogicalTensorType(input.CheckedType, call.CheckedType))
+                {
+                    break;
+                }
 
-        if (input is Call { Target: PackedBlockScaledMatMul } directBlockScaledCall)
-        {
-            packedCall = directBlockScaledCall;
-            return true;
-        }
+                packedCall = call;
+                orderingDependencies = dependencies;
+                return true;
+            }
 
-        if (input is Call { Target: ShardedView } viewCall &&
-            viewCall[ShardedView.Input] is Call { Target: PackedMatMul } viewedCall)
-        {
-            packedCall = viewedCall;
-            return true;
-        }
+            switch (call.Target)
+            {
+                case ShardedView:
+                    current = call[ShardedView.Input];
+                    break;
+                case PipelineYield:
+                    if (call[PipelineYield.Dependency] is not Expr dependency)
+                    {
+                        packedCall = null!;
+                        orderingDependencies = Array.Empty<Expr>();
+                        return false;
+                    }
 
-        if (input is Call { Target: ShardedView } blockScaledViewCall &&
-            blockScaledViewCall[ShardedView.Input] is Call
-            { Target: PackedBlockScaledMatMul } viewedBlockScaledCall)
-        {
-            packedCall = viewedBlockScaledCall;
-            return true;
+                    dependencies.Add(dependency);
+                    current = call[PipelineYield.Value];
+                    break;
+                case Pack:
+                    current = call[Pack.Input];
+                    break;
+                case Unpack:
+                    current = call[Unpack.Input];
+                    break;
+                case Bitcast:
+                    current = call[Bitcast.Input];
+                    break;
+                case Reshape:
+                    current = call[Reshape.Input];
+                    break;
+                default:
+                    packedCall = null!;
+                    orderingDependencies = Array.Empty<Expr>();
+                    return false;
+            }
         }
 
         packedCall = null!;
+        orderingDependencies = Array.Empty<Expr>();
         return false;
+    }
+
+    private static bool HaveSameLogicalTensorType(IRType lhs, IRType rhs)
+    {
+        var lhsTensor = lhs switch
+        {
+            TensorType tensor => tensor,
+            DistributedType distributed => distributed.TensorType,
+            _ => null,
+        };
+        var rhsTensor = rhs switch
+        {
+            TensorType tensor => tensor,
+            DistributedType distributed => distributed.TensorType,
+            _ => null,
+        };
+
+        return lhsTensor is not null && Equals(lhsTensor, rhsTensor);
     }
 
     private bool CanFuseProducer(Op target) => target switch
     {
         PackedMatMul { FusedReduce: false } => _enablePackedMatMul,
         PackedBlockScaledMatMul => _enableBlockScaledMatMul,
+        PackedNVFP4MatMul => _enableNVFP4MatMul,
         _ => false,
     };
 
@@ -223,6 +280,21 @@ public sealed class FusePackedMatMulNormStatsPass : FunctionPass
                 axis,
                 useMean,
                 (Expr)producer[PackedBlockScaledMatMul.Addend]),
+            PackedNVFP4MatMul packed => IR.F.NTT.PackedNVFP4MatMulNormStats(
+                (Expr)producer[PackedNVFP4MatMul.Lhs],
+                (Expr)producer[PackedNVFP4MatMul.RhsPacked],
+                (Expr)producer[PackedNVFP4MatMul.RhsScale],
+                (Expr)producer[PackedNVFP4MatMul.LhsGlobalScale],
+                (Expr)producer[PackedNVFP4MatMul.RhsGlobalScale],
+                packed.OutputDataType,
+                packed.GroupSize,
+                packed.InputKVectorLaneCount,
+                packed.RhsKPackLaneCount,
+                packed.RhsKVectorLaneCount,
+                packed.OutputNVectorLaneCount,
+                axis,
+                useMean,
+                (Expr)producer[PackedNVFP4MatMul.Addend]),
             _ => throw new InvalidOperationException(
                 $"Unsupported packed matmul normalization-statistics producer {producer.Target.GetType().Name}."),
         };
@@ -251,7 +323,11 @@ public sealed class FusePackedMatMulNormStatsPass : FunctionPass
         return expression;
     }
 
-    private sealed record Candidate(Call NormStats, int Axis, bool UseMean);
+    private sealed record Candidate(
+        Call NormStats,
+        int Axis,
+        bool UseMean,
+        IReadOnlyList<Expr> OrderingDependencies);
 
     private sealed class ReplacementRewriter : ExprRewriter
     {

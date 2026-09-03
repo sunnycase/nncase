@@ -233,6 +233,8 @@ internal sealed class PackedScaledMatMulCandidateProvider :
 internal sealed class PackedBlockScaledMatMulCandidateProvider :
     DistributedCandidateProvider<PackedBlockScaledMatMul>
 {
+    public override bool IsExhaustive => true;
+
     public override IReadOnlyList<IRType> GetReturnCandidateTypes(
         DistributedCandidateContext context,
         PackedBlockScaledMatMul target,
@@ -248,9 +250,11 @@ internal sealed class PackedBlockScaledMatMulCandidateProvider :
         IRType returnType,
         out IReadOnlyList<DistributedCandidateTuple> tuples)
     {
-        tuples = EnumerateCandidates(context, target)
-            .Where(candidate => candidate.OutputType == returnType)
-            .Concat(EnumerateFromOutput(context, target, returnType))
+        var candidates = target.RhsLayout == PackedMatMulRhsLayout.NMajorKPacked
+            ? EnumerateFromOutput(context, target, returnType)
+            : EnumerateCandidates(context, target)
+                .Where(candidate => candidate.OutputType == returnType);
+        tuples = candidates
             .Select(candidate => new DistributedCandidateTuple(
                 [candidate.Lhs, candidate.Rhs, candidate.RhsScale, candidate.Addend],
                 "packed-block-scaled-matmul-reduction-sbp"))
@@ -458,6 +462,8 @@ internal sealed class PackedBlockScaledMatMulCandidateProvider :
 internal sealed class PackedBlockScaledMatMulNormStatsCandidateProvider :
     DistributedCandidateProvider<PackedBlockScaledMatMulNormStats>
 {
+    public override bool IsExhaustive => true;
+
     public override IReadOnlyList<IRType> GetReturnCandidateTypes(
         DistributedCandidateContext context,
         PackedBlockScaledMatMulNormStats target,
@@ -480,7 +486,7 @@ internal sealed class PackedBlockScaledMatMulNormStatsCandidateProvider :
         var valueOutput = returnType is TupleType { Count: 2 } tupleType
             ? tupleType.Fields[0]
             : null;
-        tuples = EnumerateCandidates(
+        tuples = EnumerateCandidatesFromValueOutputs(
                 context,
                 target,
                 valueOutput is null ? [] : [valueOutput])
@@ -518,6 +524,31 @@ internal sealed class PackedBlockScaledMatMulNormStatsCandidateProvider :
             {
                 yield return candidate with { OutputType = outputType };
             }
+        }
+
+        foreach (var candidate in EnumerateCandidatesFromValueOutputs(
+                     context,
+                     target,
+                     valueOutputCandidates))
+        {
+            yield return candidate;
+        }
+    }
+
+    private static IEnumerable<PackedBlockScaledMatMulDistributedCandidate> EnumerateCandidatesFromValueOutputs(
+        DistributedCandidateContext context,
+        PackedBlockScaledMatMulNormStats target,
+        IEnumerable<IRType> valueOutputCandidates)
+    {
+        var packedTarget = new PackedBlockScaledMatMul(
+            target.OutputDataType,
+            target.RhsLayout,
+            target.OutputNVectorLaneCount,
+            target.WeightBlockN,
+            target.WeightBlockK);
+        if (target.RhsLayout != PackedMatMulRhsLayout.NMajorKPacked)
+        {
+            yield break;
         }
 
         foreach (var valueOutput in valueOutputCandidates)

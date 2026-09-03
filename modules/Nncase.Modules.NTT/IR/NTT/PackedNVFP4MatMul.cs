@@ -26,6 +26,8 @@ public sealed partial class PackedNVFP4MatMul : Op
 
     public static readonly ParameterInfo RhsGlobalScale = new(typeof(PackedNVFP4MatMul), 4, "rhs_global_scale", ParameterKind.Input);
 
+    public static readonly ParameterInfo Addend = new(typeof(PackedNVFP4MatMul), 5, "addend", ParameterKind.Input);
+
     public DataType OutputDataType { get; }
 
     public long GroupSize { get; }

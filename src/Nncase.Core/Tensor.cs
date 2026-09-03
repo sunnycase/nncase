@@ -76,6 +76,9 @@ public abstract partial class Tensor : IStructuralComparable, IStructuralEquatab
 
     private static readonly MethodInfo _tensorCreateOnesFunc = typeof(Tensor).GetMethod(nameof(CreateTensorOnesImpl), BindingFlags.Static | BindingFlags.NonPublic)!;
 
+    private static readonly MethodInfo _tensorReinterpretFunc =
+        typeof(Tensor).GetMethod(nameof(CreateReinterpretedTensorImpl), BindingFlags.Static | BindingFlags.NonPublic)!;
+
     private readonly long[] _dimensions;
     private readonly long[] _strides;
 
@@ -561,6 +564,31 @@ public abstract partial class Tensor : IStructuralComparable, IStructuralEquatab
     }
 
     /// <summary>
+    /// Creates a contiguous tensor view with a different data type and shape.
+    /// </summary>
+    /// <param name="type">Destination data type.</param>
+    /// <param name="dimensions">Destination dimensions.</param>
+    /// <returns>A tensor sharing this tensor's backing memory.</returns>
+    public Tensor Reinterpret(DataType type, ReadOnlySpan<long> dimensions)
+    {
+        if (!IsContiguous)
+        {
+            throw new InvalidOperationException("Only contiguous tensors can be reinterpreted.");
+        }
+
+        var expectedBytes = checked(TensorUtilities.GetProduct(dimensions) * type.SizeInBytes);
+        if (expectedBytes != ByteLength)
+        {
+            throw new ArgumentException(
+                $"Reinterpreted tensor requires {expectedBytes} bytes, but the backing memory contains {ByteLength} bytes.",
+                nameof(dimensions));
+        }
+
+        return (Tensor)_tensorReinterpretFunc.MakeGenericMethod(ElementType.CLRType, type.CLRType)
+            .Invoke(null, new object[] { this, type, dimensions.ToArray() })!;
+    }
+
+    /// <summary>
     /// Pin buffer.
     /// </summary>
     /// <returns>Memory handle.</returns>
@@ -667,6 +695,23 @@ public abstract partial class Tensor : IStructuralComparable, IStructuralEquatab
         where T : unmanaged, IEquatable<T>
     {
         return new Tensor<T>(buffer.Cast<byte, T>(), dimensions);
+    }
+
+    private static Tensor CreateReinterpretedTensorImpl<TFrom, TTo>(Tensor source, DataType type, long[] dimensions)
+        where TFrom : unmanaged, IEquatable<TFrom>
+        where TTo : unmanaged, IEquatable<TTo>
+    {
+        if (DataType.FromType<TTo>() != type)
+        {
+            throw new InvalidOperationException(
+                $"Data type {type} does not match its CLR representation {typeof(TTo)}.");
+        }
+
+        var sourceBuffer = ((Tensor<TFrom>)source).Buffer;
+        var destinationBuffer = typeof(TFrom) == typeof(TTo)
+            ? (Memory<TTo>)(object)sourceBuffer
+            : new ReinterpretedMemoryManager<TFrom, TTo>(sourceBuffer).Memory;
+        return new Tensor<TTo>(destinationBuffer, dimensions);
     }
 
     private static Tensor CreateTensorFromArrayImpl<T>(Array array, long[] dimensions)

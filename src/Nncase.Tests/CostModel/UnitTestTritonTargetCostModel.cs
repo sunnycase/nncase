@@ -8,6 +8,7 @@ using System.Linq;
 using System.Threading.Tasks;
 using Nncase.CostModel;
 using Nncase.IR;
+using Nncase.IR.Heterogeneous;
 using Nncase.IR.NN;
 using Nncase.Passes;
 using Nncase.Schedule;
@@ -21,6 +22,49 @@ namespace Nncase.Tests.CostModelTest;
 [AutoSetupTestMethod(InitSession = true)]
 public sealed class UnitTestTritonTargetCostModel : TestClassBase
 {
+    [Fact]
+    public void TestPipelineChannelConsumeCostsOneLocalShardTransfer()
+    {
+        CompileOptions.TargetOptions = CreateOptions(CreateGpuMachine());
+        var placement = new Placement([4, 8], "yx", "bb");
+        var payloadType = new TensorType(
+            new VectorType(DataTypes.BFloat16, [8]),
+            new RankedShape(24, 32, 1));
+        var broadcastType = new DistributedType(
+            payloadType,
+            [SBP.B, SBP.B, SBP.B],
+            placement);
+        var splitType = new DistributedType(
+            payloadType,
+            [SBP.B, SBP.SBlockCyclic([0, 1], 1), SBP.B],
+            placement);
+        var channelType = TensorType.Scalar(new ReferenceType(new PipelineChannelType()));
+        var channel = new Var("channel", channelType);
+
+        var broadcast = IR.F.Heterogeneous.Consume(
+            channel,
+            None.Default,
+            "cpu_to_pyntt",
+            0,
+            broadcastType);
+        var split = IR.F.Heterogeneous.Consume(
+            channel,
+            None.Default,
+            "cpu_to_pyntt",
+            0,
+            splitType);
+        CompilerServices.InferenceType(broadcast);
+        CompilerServices.InferenceType(split);
+
+        var broadcastCost = CompilerServices.EvaluateCost(broadcast, CompileOptions);
+        var splitCost = CompilerServices.EvaluateCost(split, CompileOptions);
+
+        Assert.Equal((UInt128)12_288, broadcastCost[CostFactorNames.BlockLocalMemoryLoadBytes]);
+        Assert.Equal((UInt128)12_288, broadcastCost[CostFactorNames.BlockLocalMemoryStoreBytes]);
+        Assert.Equal((UInt128)384, splitCost[CostFactorNames.BlockLocalMemoryLoadBytes]);
+        Assert.Equal((UInt128)384, splitCost[CostFactorNames.BlockLocalMemoryStoreBytes]);
+    }
+
     [Fact]
     public void TestDynamicMatMulCostUsesMaxShape()
     {
@@ -1192,6 +1236,7 @@ public sealed class UnitTestTritonTargetCostModel : TestClassBase
             extra,
             scale,
             0,
+            None.Default,
             [AttentionDimKind.Seq, AttentionDimKind.Head, AttentionDimKind.Dim],
             2048);
         CompilerServices.InferenceType(pagedAttention);

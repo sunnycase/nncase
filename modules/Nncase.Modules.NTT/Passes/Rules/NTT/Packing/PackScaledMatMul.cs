@@ -6,6 +6,7 @@ using System.Linq;
 using Nncase.IR;
 using Nncase.IR.Math;
 using Nncase.PatternMatch;
+using Nncase.Utilities;
 
 using static Nncase.PatternMatch.F.Math;
 using static Nncase.PatternMatch.Utility;
@@ -84,7 +85,7 @@ public sealed partial class PackScaledMatMulRhsKMajor : RewriteRule<Pattern>
             packedRhs,
             lhsScale,
             rhsScale,
-            scaledMatMul.OutputDataType);
+            scaledMatMul.OutputDataType).InheritMetaData(caller);
         return IR.F.Tensors.Unpack(
             packed,
             [nVectorLanes],
@@ -164,7 +165,7 @@ public sealed partial class PackBlockScaledMatMulRhsNMajorKPacked : RewriteRule<
             blockScaledMatMul.WeightBlockN,
             blockScaledMatMul.WeightBlockK,
             IR.NTT.PackedMatMulRhsLayout.NMajorKPacked,
-            nVectorLanes);
+            nVectorLanes).InheritMetaData(caller);
         return IR.F.Tensors.Unpack(
             packed,
             [nVectorLanes],

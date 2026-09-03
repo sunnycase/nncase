@@ -92,6 +92,8 @@ public sealed class Function : BaseFunction
         return new Function(name ?? Name, moduleKind ?? ModuleKind, Body, Parameters, VarMap)
         {
             Role = Role,
+            IsEntry = IsEntry,
+            Metadata = Metadata.Clone(),
         };
     }
 
@@ -99,5 +101,7 @@ public sealed class Function : BaseFunction
         => new Function(name ?? Name, moduleKind ?? ModuleKind, body ?? Body, parameters ?? Parameters, VarMap)
         {
             Role = role ?? Role,
+            IsEntry = IsEntry,
+            Metadata = Metadata.Clone(),
         };
 }

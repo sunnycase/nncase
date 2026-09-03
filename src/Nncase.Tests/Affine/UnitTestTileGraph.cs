@@ -222,6 +222,66 @@ public sealed class UnitTestTileGraph : TestClassBase
     }
 
     [Fact]
+    public void TestSingletonReshapePreservesBlockCyclicDistributedStorage()
+    {
+        var placement = new Placement([4, 8], "yx", "bb");
+        var dataType = new VectorType(DataTypes.BFloat16, [8]);
+        var source = new DistributedType(
+            new TensorType(dataType, new[] { 1, 24, 1, 32 }),
+            new SBP[] { SBP.B, SBP.SBlockCyclic([1], 2), SBP.B, SBP.B },
+            placement);
+        var result = new DistributedType(
+            new TensorType(dataType, new[] { 1, 24, 32 }),
+            new SBP[] { SBP.B, SBP.SBlockCyclic([1], 2), SBP.B },
+            placement);
+
+        Assert.True(IR.Affine.BufferViewUtility.TryCreate(source, result, out _));
+    }
+
+    [Fact]
+    public void TestMovedSingletonReshapePreservesCanonicalShardedStrides()
+    {
+        var placement = new Placement([4, 8], "yx", "bb");
+        var dataType = new VectorType(DataTypes.BFloat16, [8]);
+        var sourceType = new DistributedType(
+            new TensorType(dataType, new[] { 1, 24, 32 }),
+            new SBP[]
+            {
+                SBP.B,
+                SBP.SBlockCyclic([1], 2),
+                SBP.SBlockCyclic([0], 8),
+            },
+            placement);
+        var resultType = new DistributedType(
+            new TensorType(dataType, new[] { 24, 32, 1 }),
+            new SBP[]
+            {
+                SBP.SBlockCyclic([1], 2),
+                SBP.SBlockCyclic([0], 8),
+                SBP.B,
+            },
+            placement);
+        Assert.True(IR.Affine.BufferViewUtility.TryCreate(sourceType, resultType, out var transform));
+        var source = new Nncase.TIR.Buffer(
+            "canonical_shard",
+            dataType,
+            new MemSpan(new PhysicalBuffer(dataType.SizeInBytes, 1664, MemoryLocation.Data)),
+            new Dimension[] { 1, 4, 8 },
+            new Dimension[] { 768, 32, 1 },
+            sourceType,
+            distributedStorageKind: DistributedBufferStorageKind.CanonicalGlobal);
+
+        var view = IR.Affine.BufferViewUtility.CreateLogicalBufferView(
+            source,
+            resultType,
+            transform,
+            "moved_singleton_view");
+
+        Assert.Equal(new long[] { 32, 1, 0 }, view.Strides.ToArray().Select(stride => stride.FixedValue));
+        Assert.Same(source.MemSpan.Buffer, view.MemSpan.Buffer);
+    }
+
+    [Fact]
     public void TestPackedReshapePreservesDistributedShardRegions()
     {
         var placement = new Placement([4, 8], "yx", "bb");
@@ -387,6 +447,51 @@ public sealed class UnitTestTileGraph : TestClassBase
         var strides = IR.Affine.BufferViewUtility.CreateBufferViewStrides(source, resultType.TensorType, transform);
 
         Assert.Equal(new long[] { 0, 1 }, strides.Select(stride => stride.FixedValue));
+    }
+
+    [Fact]
+    public void TestCanonicalGlobalVectorBitcastPreservesLogicalPrefixStrides()
+    {
+        var placement = new Placement([4, 9], "yx", "bb");
+        var sourceDataType = new VectorType(DataTypes.BFloat16, [8]);
+        var sourceType = new DistributedType(
+            new TensorType(sourceDataType, new[] { 1, 24, 2, 32 }),
+            new SBP[]
+            {
+                SBP.B,
+                SBP.SBlockCyclic([0], 2),
+                SBP.B,
+                SBP.SBlockCyclic([1], 2),
+            },
+            placement);
+        var resultType = new DistributedType(
+            new TensorType(DataTypes.BFloat16, new[] { 1, 24, 2, 256 }),
+            new SBP[]
+            {
+                SBP.B,
+                SBP.SBlockCyclic([0], 2),
+                SBP.B,
+                SBP.SBlockCyclic([1], 16),
+            },
+            placement);
+        Assert.True(IR.Affine.BufferViewUtility.TryCreate(sourceType, resultType, out var transform));
+        var source = new Nncase.TIR.Buffer(
+            "canonical_shard",
+            sourceDataType,
+            new MemSpan(new PhysicalBuffer(sourceDataType.SizeInBytes, 24 * 2 * 32 * sourceDataType.SizeInBytes, MemoryLocation.Data)),
+            new Dimension[] { 1, 6, 2, 4 },
+            new Dimension[] { 0, 64, 32, 1 },
+            sourceType,
+            distributedStorageKind: DistributedBufferStorageKind.CanonicalGlobal);
+
+        var view = IR.Affine.BufferViewUtility.CreateLogicalBufferView(
+            source,
+            resultType,
+            transform,
+            "scalar_view");
+
+        Assert.Equal(new long[] { 0, 512, 256, 1 }, view.Strides.ToArray().Select(stride => stride.FixedValue));
+        Assert.Same(source.MemSpan.Buffer, view.MemSpan.Buffer);
     }
 
     [Fact]

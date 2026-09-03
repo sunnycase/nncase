@@ -6,6 +6,7 @@ using System.CommandLine;
 using System.CommandLine.Invocation;
 using Microsoft.Extensions.Configuration;
 using Nncase.CodeGen;
+using Nncase.IR;
 using Nncase.Passes;
 using Nncase.Quantization;
 
@@ -24,6 +25,18 @@ public abstract class Target : ITarget
         return ModuleCompilers.FirstOrDefault(m => m.ModuleKind == moduleKind) ??
             throw new NotSupportedException($"Module compiler for {moduleKind} is not found.");
     }
+
+    public virtual ITarget GetModuleTarget(string moduleKind) => this;
+
+    public virtual CompileOptions GetModuleCompileOptions(string moduleKind, CompileOptions options)
+        => options;
+
+    public virtual string GetPreferredModuleKind(BaseFunction owner, Call call, CompileOptions options)
+        => ModuleCompilers.Count == 1
+            ? ModuleCompilers[0].ModuleKind
+            : throw new InvalidOperationException(
+                $"Composite target {Name} must define operation placement across " +
+                $"[{string.Join(", ", ModuleCompilers.Select(compiler => compiler.ModuleKind))}].");
 
     public virtual Task AdaRoundWeights(ICalibrationDatasetProvider calibrationDataset, List<ENode> rangeOfs, List<ENode> childrenOfRangeOfs, QuantizeOptions quantizeOptions)
     {

@@ -18,7 +18,13 @@ internal static class FunctionCallGraphUtility
         {
             foreach (var call in ExprCollector.Collect(function.Body).OfType<Call>())
             {
-                if (call.Target is not Function target)
+                var target = call.Target switch
+                {
+                    Function direct => direct,
+                    FunctionWrapper wrapper when wrapper.Target is Function wrapped => wrapped,
+                    _ => null,
+                };
+                if (target is null)
                 {
                     continue;
                 }

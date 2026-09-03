@@ -17,7 +17,9 @@ public sealed partial class PagedAttentionMerge : NTTKernelOp
 
     public static readonly ParameterInfo AccState = new(typeof(PagedAttentionMerge), 2, "accState", memoryEffect: MemoryEffect.Read);
 
-    public static readonly ParameterInfo Output = new(typeof(PagedAttentionMerge), 3, "output", memoryEffect: MemoryEffect.Write);
+    public static readonly ParameterInfo OutputGate = new(typeof(PagedAttentionMerge), 3, "outputGate", memoryEffect: MemoryEffect.Read);
+
+    public static readonly ParameterInfo Output = new(typeof(PagedAttentionMerge), 4, "output", memoryEffect: MemoryEffect.Write);
 
     public IRArray<AttentionDimKind> Layout { get; }
 
